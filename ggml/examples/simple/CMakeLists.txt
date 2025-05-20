@@ -3,14 +3,14 @@
 
 set(TEST_TARGET simple-ctx)
 add_executable(${TEST_TARGET} simple-ctx.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS})
 
 #
 #
 # simple-backend
 set(TEST_TARGET simple-backend)
 add_executable(${TEST_TARGET} simple-backend.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS})
 
 if (GGML_TSAVORITE)
     #
@@ -18,19 +18,19 @@ if (GGML_TSAVORITE)
     if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
         file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
     else()
-	file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
+        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
     endif()
     #
     # add
-    set(TEST_TARGET add)
-    add_executable(${TEST_TARGET} add.cpp)
-    target_link_libraries(${TEST_TARGET} PRIVATE  ${TLIBS}  dl rt)
+    #set(TEST_TARGET add)
+    #add_executable(${TEST_TARGET} add.cpp)
+    #target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS} dl rt)
 
     #
     # mult
-    set(TEST_TARGET mult)
-    add_executable(${TEST_TARGET} mult.cpp)
-    target_link_libraries(${TEST_TARGET} PRIVATE  ${TLIBS}  dl rt)
+    #set(TEST_TARGET mult)
+    #add_executable(${TEST_TARGET} mult.cpp)
+    #target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS} dl rt)
     #
     #
     # simple-backend-tsi

@@ -29,6 +29,8 @@ endif()
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "^(aarch64|arm.*|ARM64)$")
     message(STATUS "ARM detected")
     #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m1")
+elseif (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    message(STATUS "TSavorite CPU detected")
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64le" OR ${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
     message(STATUS "PPC64 detected")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mpower9-vector")
@@ -161,14 +163,14 @@ add_definitions(-UNDEBUG)
 
 set(TEST_TARGET test-vec0)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 
 #
 # test-vec1 (x86)
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86" AND "${CMAKE_C_FLAGS}" MATCHES "avx")
     set(TEST_TARGET test-vec1)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml) 
 endif()
 
 #
@@ -176,7 +178,7 @@ endif()
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")
     set(TEST_TARGET test-vec2)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 endif()
 
 #
@@ -184,7 +186,7 @@ endif()
 
 set(TEST_TARGET test-opt)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -193,7 +195,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-quantize-fns)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -202,7 +204,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-quantize-perf)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -211,7 +213,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-mul-mat0)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml ${GGML_EXTRA_LIBS})
+target_link_libraries(${TEST_TARGET} PRIVATE ggml ${GGML_EXTRA_LIBS} ${TLIBS})
 if (MSVC)
     target_link_options(${TEST_TARGET} PRIVATE "/STACK: 8388608") # 8MB
 endif()
@@ -225,7 +227,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm" AND NOT GGML_NO_ACCELERATE)
     set(TEST_TARGET test-mul-mat1)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml ${GGML_EXTRA_LIBS})
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml ${GGML_EXTRA_LIBS} ${TLIBS})
     target_compile_options(${TEST_TARGET} PRIVATE ${GGML_EXTRA_FLAGS})
 endif()
 
@@ -251,7 +253,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
 if (MATH_LIBRARY)
-    target_link_libraries(test-mul-mat2 PRIVATE ${MATH_LIBRARY})
+	target_link_libraries(test-mul-mat2 PRIVATE ${TLIBS} ${MATH_LIBRARY})
 endif()
 
 #
@@ -259,7 +261,7 @@ endif()
 
 set(TEST_TARGET test0)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -268,7 +270,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-pool)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 if (MSVC)
     target_link_options(${TEST_TARGET} PRIVATE "/STACK: 8388608") # 8MB
 endif()
@@ -280,7 +282,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-arange)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml Threads::Threads)
 if (MSVC)
     target_link_options(${TEST_TARGET} PRIVATE "/STACK: 8388608") # 8MB
 endif()
@@ -292,7 +294,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-timestep_embedding)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 if (MSVC)
     target_link_options(${TEST_TARGET} PRIVATE "/STACK: 8388608") # 8MB
 endif()
@@ -304,7 +306,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-pad-reflect-1d)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 #
@@ -312,14 +314,14 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-conv-transpose)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 # test-conv-transpose-1d
 
 set(TEST_TARGET test-conv-transpose-1d)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 
@@ -328,7 +330,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-dup)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 #
@@ -336,7 +338,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 set(TEST_TARGET test-rel-pos)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
 #
@@ -345,7 +347,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86" AND GGML_OPENBLAS)
     set(TEST_TARGET test-svd0)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-    target_link_libraries(${TEST_TARGET} PRIVATE ggml ${GGML_EXTRA_LIBS})
+    target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml ${GGML_EXTRA_LIBS})
     target_compile_options(${TEST_TARGET} PRIVATE ${GGML_EXTRA_FLAGS})
 endif()
 
@@ -354,7 +356,7 @@ endif()
 
 set(TEST_TARGET test-customop)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 if (MSVC)
     target_link_options(${TEST_TARGET} PRIVATE "/STACK: 8388608") # 8MB
 endif()
@@ -366,7 +368,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-conv1d)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -376,7 +378,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-conv2d)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -386,7 +388,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-mul-mat)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -396,7 +398,7 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-backend-ops)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
@@ -406,6 +408,6 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 set(TEST_TARGET test-cont)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+target_link_libraries(${TEST_TARGET} PRIVATE ${TLIBS} ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")

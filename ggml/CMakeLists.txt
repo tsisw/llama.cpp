@@ -48,6 +48,15 @@ if (GGML_TSAVORITE)
     include_directories(${TSAVORITE_INCLUDE_DIR})
     include_directories(${MLIR_COMPILER_DIR}/include/runtime/shim)
     include_directories(${RUNTIME_DIR}/include)
+
+    #
+    # tsavorite backend test cases
+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
+    else()
+        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
+    endif()
+    #
 endif()
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
