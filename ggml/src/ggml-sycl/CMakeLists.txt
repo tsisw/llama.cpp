@@ -1,5 +1,3 @@
-message(STATUS  "GGML_SYCL_TARGET=${GGML_SYCL_TARGET}")
-
 if (NOT GGML_SYCL_TARGET MATCHES "^(INTEL|NVIDIA|AMD)$")
     message(FATAL_ERROR "Invalid backend chosen, supported options are INTEL, NVIDIA, or AMD")
 endif()

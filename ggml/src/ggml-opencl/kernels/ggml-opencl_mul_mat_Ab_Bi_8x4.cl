@@ -7,16 +7,7 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
 
-#ifdef cl_qcom_reqd_sub_group_size
-#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
-#define ADRENO_GPU 1
-#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
-#endif
-
-#ifdef ADRENO_GPU
-REQD_SUBGROUP_SIZE_128
-#endif
-
+__attribute__((qcom_reqd_sub_group_size("full")))
 kernel void kernel_mul_mat_Ab_Bi_8x4(
         global const ushort * src0_q,       // quantized A
         global const half  * src0_d,        // A scales

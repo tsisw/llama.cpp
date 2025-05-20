@@ -1,0 +1,106 @@
+#
+###################
+#latest sync from OPEN SOURCE GGML
+commit d633684e9bae012b68045936320c14e1466d693f (HEAD -> master, origin/master, origin/HEAD)
+Author: Shawn yang <137684499+Yangxiaoz@users.noreply.github.com>
+Date:   Sat Feb 8 01:10:21 2025 +0800
+
+
+########################
+Steps to compile add, mult unit test cases with integration of RUntime.
+Currently this is getting compiled for POSIX
+
+Step 1: 
+module load tsi4 gcc/13.3.0
+
+###################
+For posix
+rm -rf build-posix
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
+If we nant to use your own kernel & library then give your own path for TSAVORITE_PLATFORM_BASE_DIR
+cmake -B build-posix -DGGML_TSAVORITE=ON -DTSAVORITE_PLATFORM_BASE_DIR="/proj/rel/sw/ggml/vendor/tsavorite/release-version/0.3.5"
+cmake --build build-posix --config Release --target simple-backend-tsi
+or 
+
+###################
+For fpga
+rm -rf build-fpga
+cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
+If we nant to use your own kernel, blobs  & library then give your own path for TSAVORITE_PLATFORM_BASE_DIR
+cmake -B build-fpga -DGGML_TSAVORITE=ON -DTSAVORITE_PLATFORM_BASE_DIR="/proj/rel/sw/ggml/vendor/tsavorite/release-version/0.3.5"
+
+
+cmake --build build-fpga --config Release --target simple-backend-tsi
+or
+
+###Below command will set GGML_TSAVORITE_TARGET to posix which is dafult value if we dont find target
+rm -rf build*
+cmake -B build -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=unknown
+cmake --build build --config Release --target simple-backend-tsi
+###Below command will set GGML_TSAVORITE_TARGET to posix which is dafult value if we dont find target
+
+run test cases
+input value can be
+"add" | "sub" | "mult" | "div" | "sqrt" | "neg" | "abs" | "sin
+
+example
+./build-posix/bin/simple-backend-tsi "add"
+
+run test cases when kernel size small than tensor data size, in this case kernel will be called multiple times
+input value can be
+"add scale" | "sub scale" | "mult scale" | "div scale" | "sqrt scale" | "neg scale" | "abs scale" | "sin scale"
+
+example
+./build-posix/bin/simple-backend-tsi "add" "scale"
+
+
+// when we dont match test case it will run default test case  which is "add"
+./build-posix/bin/simple-backend-tsi "unknown"
+or 
+./build-posix/bin/simple-backend-tsi
+##
+Cscope build
+find . -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" > cscope.files
+###########
+#it is a compiler C interface to the runtime -- so built by the compiler. can also import the cmake config for the compiler and build your own
+#/proj/rel/sw/mlir-compiler/lib/libTsavRTPosixShimCAPI.so
+#
+#RUN TIME API Defintion
+#libTSIRTMemory.so & libTSIRTMemory.so
+######
+#Runtime Library to be copied from
+#/proj/rel/sw/mlir-compiler and /proj/rel/sw/runtime -- for the runtime, you specify the path to the version you want, e.g., /proj/rel/sw/runtime/posix is without debug prints, while /proj/rel/sw/runtime/posix-debug has debug enabled (equivalently for FPGA versions). These were compiled with gcc 14.2.0.
+#
+#Running llama.cpp for tiny llama model example
+#It seems some issue with llama-simle, hence for now we wil use llama-cli
+#
+#./build/bin/llama-cli -m ./models/tinyllama-vo-5m-para.gguf -cnv --chat-template chatml
+#Run Micro Lamma
+#./build/bin/llama-cli -p "my cat is" -m ./models/tmpo/models/pretrained_300M_515000-305M-F16.gguf  --device Tsavorite
+#
+#Run Tiny Lamma of 1 Build Paramater with tuning other options of llama-cli matching with aot paramters
+#./build/bin/llama-cli -p "my cat is" -m ./models/tinylama/Tinylama-1.1B-F16.gguf  --device tSavorite  -c 12288 --temp 0.4 --n-predict 152 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --prompt-cache-all
+#
+#run model in gdb
+#gdb --args  ./build/bin/llama-simple -m ./models/tinyllama-vo-5m-para.gguf
+#then do run if running under gdb, we can do b(break to function), c(continue), bt 10 (get stack trace)
+#
+#Following command can run at llama.cpp to find shape and other paramter to particular model. Following is tiny-llama example
+#./build/bin/llama-eval-callback -m ./models/tinyllama-vo-5m-para.gguf -n 1 | grep ggml_debug
+#
+#
+#mlir library
+#/proj/rel/sw/mlir-compiler/lib/libTsavRTPosixShimCAPI.so
+#run time path
+#/proj/rel/sw/runtime
+#
+#huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v0.3 --local-dir "./models" --include "*"
+#./convert_hf_to_gguf.py ./models/Tiny-llama-v0.3-FP32 --outtype f32
+#
+#
+#for indentation fix
+#clang-format -i filename.c
+#run cpplint after that
+#cpplint filename.c
+
+

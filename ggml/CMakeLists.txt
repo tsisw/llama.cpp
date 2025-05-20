@@ -2,7 +2,53 @@ cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target 
 project("ggml" C CXX)
 include(CheckIncludeFileCXX)
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if  (NOT DEFINED GGML_TSAVORITE_TARGET)
+    set(GGML_TSAVORITE_TARGET "posix")
+endif()
+if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    set(CMAKE_C_COMPILER /proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc)
+    set(CMAKE_CXX_COMPILER /proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++)
+    set(ARCH_FLAGS -march=armv8-a)
+    message("Setting target as fpga")
+endif()
+
+if (GGML_TSAVORITE)
+    if  (NOT DEFINED GGML_TSAVORITE_TARGET)
+        set(GGML_TSAVORITE_TARGET "posix")
+    endif()
+    set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
+    set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/src/ggml-tsavorite/include)
+    if (NOT DEFINED TSAVORITE_PLATFORM_BASE_DIR)
+        set (TSAVORITE_PLATFORM_BASE_DIR /proj/rel/sw/ggml/vendor/tsavorite/release-version/0.3.5)
+    endif()
+    if (NOT DEFINED MLIR_COMPILER_DIR)
+       set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.0/compiler)
+    endif()
+    if (NOT DEFINED RUNTIME_DIR)
+       set (RUNTIME_DIR /proj/work/rel/sw/sdk-r.0.1.0/${GGML_TSAVORITE_TARGET}/runtime)
+    endif()
+
+    if (NOT DEFINED GGML_TSI_KERNEL_DIR)
+       set (GGML_TSI_KERNEL_DIR ../ggml-tsi-kernel/${GGML_TSAVORITE_TARGET})
+    endif()
+
+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        set(CMAKE_CROSSCOMPILING ON)
+        set(CMAKE_C_COMPILER /proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc)
+        set(CMAKE_CXX_COMPILER /proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++)
+        set(ARCH_FLAGS -march=armv8-a)
+        message("Setting target as fpga for tsavorite")
+    elseif (${GGML_TSAVORITE_TARGET} STREQUAL "posix")
+        message("Setting target as posix for tsavorite")
+    else()
+	set (GGML_TSAVORITE_TARGET "posix")
+        message("Setting default target as posix for tsavorite")
+    endif()
+    message("tsavorite backend is enabled")
+    include_directories(${TSAVORITE_INCLUDE_DIR})
+    include_directories(${MLIR_COMPILER_DIR}/include/runtime/shim)
+    include_directories(${RUNTIME_DIR}/include)
+endif()
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -102,7 +148,6 @@ endif()
 
 option(GGML_CPU_HBM          "ggml: use memkind for CPU HBM" OFF)
 option(GGML_CPU_AARCH64      "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" ON)
-option(GGML_CPU_KLEIDIAI     "ggml: use KleidiAI optimized kernels if applicable" OFF)
 option(GGML_AVX              "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX_VNNI         "ggml: enable AVX-VNNI"         OFF)
 option(GGML_AVX2             "ggml: enable AVX2"             ${INS_ENB})
@@ -122,7 +167,6 @@ endif()
 option(GGML_LASX             "ggml: enable lasx"             ON)
 option(GGML_LSX              "ggml: enable lsx"              ON)
 option(GGML_RVV              "ggml: enable rvv"              ON)
-option(GGML_VXE              "ggml: enable vxe"              ON)
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
 set(GGML_CPU_ARM_ARCH "" CACHE STRING "ggml: CPU architecture for ARM")
@@ -152,12 +196,8 @@ set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
                                             "ggml: max. batch size for using peer access")
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
-option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
-set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
-                                            "ggml: cuda link binary compression mode; requires cuda 12.8+")
-set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph, experimental, slow"         OFF)
@@ -180,6 +220,7 @@ option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"         
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
+option(GGML_TSAVORITE                       "ggml: use tsavorite"                             OFF)
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
@@ -215,8 +256,6 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 
 find_package(Threads REQUIRED)
 
-include(GNUInstallDirs)
-
 #
 # build the library
 #
@@ -240,6 +279,7 @@ endif ()
 # install
 #
 
+include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # all public headers
@@ -250,11 +290,11 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-backend.h
     include/ggml-blas.h
     include/ggml-cann.h
-    include/ggml-cpp.h
     include/ggml-cuda.h
     include/ggml-kompute.h
     include/ggml-opt.h
     include/ggml-metal.h
+    include/ggml-tsavorite.h
     include/ggml-rpc.h
     include/ggml-sycl.h
     include/ggml-vulkan.h

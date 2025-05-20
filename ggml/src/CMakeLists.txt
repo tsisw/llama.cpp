@@ -226,9 +226,6 @@ add_library(ggml-base
             gguf.cpp)
 
 target_include_directories(ggml-base PRIVATE .)
-if (GGML_BACKEND_DL)
-    target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
-endif()
 
 add_library(ggml
             ggml-backend-reg.cpp)
@@ -327,6 +324,7 @@ ggml_add_backend(CUDA)
 ggml_add_backend(HIP)
 ggml_add_backend(Kompute)
 ggml_add_backend(METAL)
+ggml_add_backend(TSAVORITE)
 ggml_add_backend(MUSA)
 ggml_add_backend(RPC)
 ggml_add_backend(SYCL)
