@@ -1,17 +1,12 @@
 #
 # simple-ctx
-
-set(TEST_TARGET simple-ctx)
-add_executable(${TEST_TARGET} simple-ctx.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS})
+set(TARGET llama-simple)
+add_executable(${TARGET} simple.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 #
-#
-# simple-backend
-set(TEST_TARGET simple-backend)
-add_executable(${TEST_TARGET} simple-backend.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS})
-
 if (GGML_TSAVORITE)
     #
     # tsavorite backend test cases
