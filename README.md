@@ -542,10 +542,10 @@ $ echo "source ~/.llama-completion.bash" >> ~/.bashrc
 
 #### TSI compilation steps
 ```bash
-Pull the repo frim tsisw as follows
+#Pull the repo frim tsisw as follows
 git clone git@github.com:tsisw/llama.cpp.git -b FIR-699
 
-Ensure prerequisites are met as follows
+#Ensure prerequisites are met as follows
 cd llama.cpp/
 git submodule update --recursive --init
 cd ggml-tsi-kernel/
@@ -556,27 +556,31 @@ pip install -r /proj/rel/sw/mlir-compiler/python/requirements-common.txt
 pip install /proj/rel/sw/mlir-compiler/python/mlir_external_packages-1.2.1-py3-none-any.whl
 pip install onnxruntime-training
 
-build TSI kernels for the Tsavorite backend
-First for FPGA
+#build TSI kernels for the Tsavorite backend
+#First for FPGA
 cd fpga-kernel
 cmake -B build-fpga
 ./create-all-kernels.sh
-The for Posix Use cases 
+#The for Posix Use cases
 cd ../posix-kernel/
 ./create-all-kernels.sh
 
-Change directory to top level llama.cpp  
+#Change directory to top level llama.cpp
 cd ../../
 
-Compile for posix with build-posix as a target folder
+#Compile for posix with build-posix as a target folder
 
 cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
 cmake --build build-posix --config Release
 
-Compile for fpga with build-fpga as a target folder
+#Compile for fpga with build-fpga as a target folder
 
 cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
+
+#For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.gz
+
+./tsi-pkg-build.sh
 ```
 
 ## References

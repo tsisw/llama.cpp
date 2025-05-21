@@ -467,4 +467,9 @@ Compile for fpga with build-fpga as a target folder
 cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
 ```
+For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.gz
+
+```bash
+./tsi-pkg-build.sh
+```
 
