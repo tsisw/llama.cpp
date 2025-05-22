@@ -33,23 +33,25 @@ cmake --build build-posix --config Release
 
 #Compile for fpga with build-fpga as a target folder
 
-cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DCMAKE_C_COMPILER="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc" -DCMAKE_CXX_COMPILER="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++"
+export CC="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc"
+export CXX="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++"
+cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
 
 
-TSI_BNDL_INSTALL_DIR=tsi-ggml-bndl
+TSI_GGML_BUNDLE_INSTALL_DIR=tsi-ggml
 GGML_TSI_INSTALL_DIR=ggml-tsi-kernel
-if [ -e ${TSI_BNDL_INSTALL_DIR} ]; then
-   echo "tsi-ggml-bndl exist"
+if [ -e ${TSI_GGML_BUNDLE_INSTALL_DIR} ]; then
+   echo "${TSI_GGML_BUNDLE_INSTALL_DIR} exist"
 else
-   echo "creating tsi-ggml-bndl"
-   mkdir tsi-ggml-bndl
+   echo "creating ${TSI_GGML_BUNDLE_INSTALL_DIR}"
+   mkdir ${TSI_GGML_BUNDLE_INSTALL_DIR}
 fi
 
-cp ${GGML_TSI_INSTALL_DIR}/fpga/blobs ${TSI_BNDL_INSTALL_DIR}/ -r
-cp build-fpga/bin/llama-cli ${TSI_BNDL_INSTALL_DIR}/ 
-cp build-fpga/bin/libggml*.so ${TSI_BNDL_INSTALL_DIR}/ 
-cp build-fpga/bin/libllama*.so ${TSI_BNDL_INSTALL_DIR}/ 
-cp build-fpga/bin/simple-backend-tsi ${TSI_BNDL_INSTALL_DIR}/
+cp ${GGML_TSI_INSTALL_DIR}/fpga/blobs ${TSI_GGML_BUNDLE_INSTALL_DIR}/ -r
+cp build-fpga/bin/llama-cli ${TSI_GGML_BUNDLE_INSTALL_DIR}/
+cp build-fpga/bin/libggml*.so ${TSI_GGML_BUNDLE_INSTALL_DIR}/
+cp build-fpga/bin/libllama*.so ${TSI_GGML_BUNDLE_INSTALL_DIR}/
+cp build-fpga/bin/simple-backend-tsi ${TSI_GGML_BUNDLE_INSTALL_DIR}/
 
-tar -cvzf tsi-ggml.gz ${TSI_BNDL_INSTALL_DIR}
+tar -cvzf tsi-ggml.tz ${TSI_GGML_BUNDLE_INSTALL_DIR}/*

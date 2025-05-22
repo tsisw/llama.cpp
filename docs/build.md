@@ -464,10 +464,12 @@ cmake --build build-posix --config Release
 
 Compile for fpga with build-fpga as a target folder
 ```bash
+export CC="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc"
+export CXX="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++"
 cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
 ```
-For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.gz
+For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.tz
 
 ```bash
 ./tsi-pkg-build.sh
