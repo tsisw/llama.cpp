@@ -26,6 +26,7 @@ cd ../posix-kernel/
 
 cd ../../
 
+export MLIR_SDK_VERSION=/proj/work/rel/sw/sdk-r.0.1.0
 #Compile for posix with build-posix as a target folder
 
 cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix

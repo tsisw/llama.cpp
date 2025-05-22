@@ -17,8 +17,6 @@ module load tsi4 gcc/13.3.0
 For posix
 rm -rf build-posix
 cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
-If we nant to use your own kernel & library then give your own path for TSAVORITE_PLATFORM_BASE_DIR
-cmake -B build-posix -DGGML_TSAVORITE=ON -DTSAVORITE_PLATFORM_BASE_DIR="/proj/rel/sw/ggml/vendor/tsavorite/release-version/0.3.5"
 cmake --build build-posix --config Release --target simple-backend-tsi
 or 
 
@@ -26,8 +24,6 @@ or
 For fpga
 rm -rf build-fpga
 cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
-If we nant to use your own kernel, blobs  & library then give your own path for TSAVORITE_PLATFORM_BASE_DIR
-cmake -B build-fpga -DGGML_TSAVORITE=ON -DTSAVORITE_PLATFORM_BASE_DIR="/proj/rel/sw/ggml/vendor/tsavorite/release-version/0.3.5"
 
 
 cmake --build build-fpga --config Release --target simple-backend-tsi
