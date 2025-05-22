@@ -580,8 +580,11 @@ cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
 
 #For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.tz
-
+#If you want to release the build update the TSI-VERSION in the file tsi-pkg-build.sh and add Release as parameter
+#when running ./tsi-pkg-build.sh (Note it will overwrite what exists in /proj/rel/sw/ggml so be sure you want to do
+#it. Example ./tsi-pkg-build.sh release
 ./tsi-pkg-build.sh
+
 ```
 
 ## References
