@@ -1,5 +1,6 @@
 set(TARGET llama-gguf-hash)
 add_executable(${TARGET} gguf-hash.cpp)
+target_link_libraries(${TARGET} PRIVATE ${TLIBS})
 install(TARGETS ${TARGET} RUNTIME)
 
 # clibs dependencies

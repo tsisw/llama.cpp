@@ -5,10 +5,59 @@ include(CheckIncludeFileCXX)
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
 
+if (GGML_TSAVORITE)
+    if  (NOT DEFINED GGML_TSAVORITE_TARGET)
+        set(GGML_TSAVORITE_TARGET "posix")
+    endif()
+    if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        set(GGML_TSAVORITE_TARGET "posix")
+    endif()
+
+    if (NOT DEFINED MLIR_COMPILER_DIR)
+        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
+            set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.0/compiler)
+        else()
+            set (MLIR_COMPILER_DIR $ENV{MLIR_SDK_VERSION}/compiler)
+        endif()
+    endif()
+
+    if (NOT DEFINED RUNTIME_DIR)
+        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
+            set (RUNTIME_DIR /proj/work/rel/sw/sdk-r.0.1.0/${GGML_TSAVORITE_TARGET}/runtime)
+        else()
+            set (RUNTIME_DIR $ENV{MLIR_SDK_VERSION}/${GGML_TSAVORITE_TARGET}/runtime)
+        endif()
+    endif()
+
+    if (NOT DEFINED GGML_TSI_KERNEL_DIR)
+       set (GGML_TSI_KERNEL_DIR ${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/${GGML_TSAVORITE_TARGET})
+    endif()
+
+    file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o")
+
+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        set(CMAKE_CROSSCOMPILING ON)
+        set(ARCH_FLAGS -march=armv8-a)
+        message("Setting target as fpga")
+    elseif (${GGML_TSAVORITE_TARGET} STREQUAL "posix")
+	list(APPEND TLIBS "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so")
+        message("Setting target as posix for tsavorite")
+    endif()
+
+    set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
+    set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
+
+    include_directories(${TSAVORITE_INCLUDE_DIR})
+    include_directories(${MLIR_COMPILER_DIR}/include/runtime/shim)
+    include_directories(${RUNTIME_DIR}/include)
+    message("tsavorite backend is enabled")
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    #set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
@@ -82,8 +131,17 @@ option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 
 # 3rd party libs
-option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+
+if (GGML_TSAVORITE)
+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        option(LLAMA_CURL       "llama: use libcurl to download model from an URL" OFF)
+    else()
+        option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
+    endif()
+else()
+    option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
+endif()
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
