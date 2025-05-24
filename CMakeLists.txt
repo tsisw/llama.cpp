@@ -15,7 +15,7 @@ if (GGML_TSAVORITE)
 
     if (NOT DEFINED MLIR_COMPILER_DIR)
         if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
-            set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.0/compiler)
+            set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.1/compiler)
         else()
             set (MLIR_COMPILER_DIR $ENV{MLIR_SDK_VERSION}/compiler)
         endif()
