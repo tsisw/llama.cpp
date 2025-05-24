@@ -145,8 +145,16 @@ endif ()
 
 target_include_directories(${TARGET} PUBLIC .)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
-target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
 
+if (GGML_TSAVORITE)
+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} ${TLIBS} PUBLIC llama Threads::Threads)
+    else()
+        target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+    endif()
+else()
+    target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+endif()
 
 #
 # copy the license files

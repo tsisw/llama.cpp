@@ -267,6 +267,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-kompute.h
     include/ggml-opt.h
     include/ggml-metal.h
+    include/ggml-tsavorite.h
     include/ggml-rpc.h
     include/ggml-sycl.h
     include/ggml-vulkan.h
