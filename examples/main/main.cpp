@@ -26,11 +26,6 @@
 #include <windows.h>
 #include <signal.h>
 #endif
-#define GGML_TSAVORITE_TARGET 1
-#if defined (GGML_TSAVORITE_TARGET)
-#include "HostShimCAPI.h"
-#include "tsi-rt/utils/Profiler.h"
-#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -46,8 +41,6 @@ static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
-using namespace std;
-namespace tsirt = ::tsi::runtime;
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -99,13 +92,6 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
-
-#if defined (GGML_TSAVORITE_TARGET)
-    std::string mainProfilerName = "LLAMA SP Main ";
-    tsirt::utils::TSIProfiler::initialize();
-
-    tsirt::utils::TSIScopedProfiler mainProfiler(mainProfilerName);
-#endif
 
     auto & sparams = params.sampling;
 
@@ -948,20 +934,10 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-#if defined (GGML_TSAVORITE_TARGET)
-  tsirt::utils::TSIProfiler::finalize();
-  std::cout << "\nLLAMA SP Profiling Results:" << std::endl;
-  std::cout << tsirt::utils::TSIProfiler::getFormattedResults(
-                   /*truncateFuncNames*/ true)
-            << std::endl;
-#endif
-
     llama_backend_free();
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
-
-
 
     return 0;
 }
