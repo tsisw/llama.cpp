@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.21) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
@@ -21,14 +21,14 @@ if (GGML_TSAVORITE)
     set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
     if (NOT DEFINED MLIR_COMPILER_DIR)
         if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
-            set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.0/compiler)
+            set (MLIR_COMPILER_DIR /proj/work/rel/sw/sdk-r.0.1.2/compiler)
         else()
             set (MLIR_COMPILER_DIR $ENV{MLIR_SDK_VERSION}/compiler)
         endif()
     endif()
     if (NOT DEFINED RUNTIME_DIR)
         if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
-            set (RUNTIME_DIR /proj/work/rel/sw/sdk-r.0.1.0/${GGML_TSAVORITE_TARGET}/runtime)
+            set (RUNTIME_DIR /proj/work/rel/sw/sdk-r.0.1.2/${GGML_TSAVORITE_TARGET}/runtime)
         else()
             set (RUNTIME_DIR $ENV{MLIR_SDK_VERSION}/${GGML_TSAVORITE_TARGET}/runtime)
         endif()
