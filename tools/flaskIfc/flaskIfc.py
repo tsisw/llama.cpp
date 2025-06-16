@@ -7,20 +7,17 @@ job_status = {"running": False, "result": "", "thread": None}
 
 app = Flask(__name__)
 
+port = '/dev/ttyUSB3'
+baudrate = '921600'
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/llama-cli', methods=['GET'])
-def serial_command():
-    # Currently the port is hard coded to /dev/ttyUSB3 but can be parameterized
-    port = '/dev/ttyUSB3'
-    #port = request.args.get('port')
+def llama_cli_serial_command():
 
-    # Currently the baudrate is hard coded to 921600 but can be parameterized
-    #baudrate = request.args.get('baudrate')
-    baudrate = '921600'
-    #./run_platform_test.sh "my cat's name" "10" "tinyllama-vo-5m-para.gguf" "none"
+    #./run_llama_cli.sh "my cat's name" "10" "tinyllama-vo-5m-para.gguf" "none"
     model = request.args.get('model')
     backend = request.args.get('backend')
     tokens = request.args.get('tokens')
@@ -59,7 +56,58 @@ def serial_command():
     except subprocess.CalledProcessError as e:
         return f"Error executing script: {e.stderr}", 500
 
+@app.route('/upload-gguf', methods=['POST', 'GET'])
+def upload_serial_command():
+    file = request.form.get('file')
 
+    command = f"upload file"
+
+    try:
+        result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        return result.stdout, 200
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
+
+@app.route('/restart-txe', methods=['GET'])
+def restart_txe_serial_command():
+    command = f"telnet localhost 8000; close all"
+
+    try:
+        result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        return result.stdout, 200
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
+
+@app.route('/health-check', methods=['GET'])
+def health_check_serial_command():
+    command = f"free -h"
+
+    try:
+        result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        return result.stdout, 200
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
+
+@app.route('/test', methods=['GET'])
+def test_serial_command():
+    command = f"test"
+
+    try:
+        result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        return result.stdout, 200
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
+
+@app.route('/system-info', methods=['GET'])
+def system_info_serial_command():
+
+    command = f"lscpu"
+
+    try:
+        result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        return result.stdout, 200
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
 
 @app.route('/submit', methods=['POST'])
 def submit():
@@ -68,7 +116,7 @@ def submit():
     if job_status["running"]:
         return "<h2>A model is already running. Please wait or abort.</h2>"
 
-    #./run_platform_test.sh "my cat's name" "10" "tinyllama-vo-5m-para.gguf" "none"
+    #./run_llama_cli.sh "my cat's name" "10" "tinyllama-vo-5m-para.gguf" "none"
     model = request.form.get('model')
     backend = request.form.get('backend')
     tokens = request.form.get('tokens')
@@ -96,11 +144,7 @@ def submit():
     #    "--top-k", "0",
     #    "--top-p", "1"
     #]
-    # Currently the port is hard coded to /dev/ttyUSB3 but can be parameterized
-    port = '/dev/ttyUSB3'
 
-    # Currently the baudrate is hard coded to 921600 but can be parameterized
-    baudrate = '921600'
     script_path = "/usr/bin/tsi/v0.1.1.tsv31_06_06_2025/bin/run_llama_cli.sh"
     command = f"{script_path} \"{prompt}\" {tokens} {model_path} {backend}"
 
