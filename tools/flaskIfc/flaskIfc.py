@@ -10,7 +10,9 @@ job_status = {"running": False, "result": "", "thread": None}
 app = Flask(__name__)
 
 port = '/dev/ttyUSB3'
+#port = '/dev/ttyUSB2'
 baudrate = '921600'
+#baudrate = '115200'
 exe_path = "/usr/bin/tsi/v0.1.1.tsv31_06_06_2025/bin/"
 
 @app.route('/')
@@ -25,6 +27,28 @@ def llama_cli_serial_command():
     backend = request.args.get('backend')
     tokens = request.args.get('tokens')
     prompt = request.args.get('prompt')
+    repeat_penalty = request.args.get('repeat-penalty')
+    if not repeat_penalty:
+        repeat_penalty = 1.5
+    batch_size = request.args.get('batch-size')
+    if not batch_size:
+        batch_size = 1024
+    top_k = request.args.get('top-k')
+    if not top_k:
+        top_k = 50
+    top_p = request.args.get('top-p')
+    if not top_p:
+        top_p = 0.9
+    last_n = request.args.get('last-n')
+    if not last_n:
+        last_n = 5
+    context_length = request.args.get('context-length')
+    if not context_length:
+        context_length = 12288
+    temp = request.args.get('temp')
+    if not temp:
+        temp = 0.0
+
 
     # Define the model path (update with actual paths)
     model_paths = {
@@ -51,7 +75,7 @@ def llama_cli_serial_command():
     # URL to Test this end point is as follows
     # http://10.50.30.167:5001/llama-cli?model=tiny-llama&backend=tSavorite&tokens=5&prompt=Hello+How+are+you
     script_path = "./run_llama_cli.sh"
-    command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend}"
+    command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend} {repeat_penalty} {batch_size} {top_k} {top_p} {last_n} {context_length} {temp}"
 
     try:
         result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
@@ -167,6 +191,27 @@ def submit():
     backend = request.form.get('backend')
     tokens = request.form.get('tokens')
     prompt = request.form.get('prompt')
+    repeat_penalty = request.form.get('repeat-penalty')
+    if not repeat_penalty:
+        repeat_penalty = 1.5
+    batch_size = request.form.get('batch-size')
+    if not batch_size:
+        batch_size = 1024
+    top_k = request.form.get('top-k')
+    if not top_k:
+        top_k = 50
+    top_p = request.form.get('top-p')
+    if not top_p:
+        top_p = 0.9
+    last_n = request.form.get('last-n')
+    if not last_n:
+        last_n = 5
+    context_length = request.form.get('context-length')
+    if not context_length:
+        context_length = 12288
+    temp = request.form.get('temp')
+    if not temp:
+        temp = 0.0
 
     # Define the model path (update with actual paths)
     model_paths = {
@@ -192,7 +237,7 @@ def submit():
     #]
 
     script_path = "./run_llama_cli.sh"
-    command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend}"
+    command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend} {repeat_penalty} {batch_size} {top_k} {top_p} {last_n} {context_length} {temp}"
 
 
     def run_script():
