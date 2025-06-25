@@ -6,6 +6,8 @@ from werkzeug.utils import secure_filename
 import os
 import subprocess
 import mmap
+import signal
+import serial
 
 
 job_status = {"running": False, "result": "", "thread": None}
@@ -176,6 +178,8 @@ def upload_file():
 
 @app.route('/restart-txe', methods=['GET'])
 def restart_txe_serial_command():
+    '''
+    #THIS IS ASHISH'S OLD CODE
     command = f"telnet localhost 8000\r\nclose all\r\n"
 
     try:
@@ -189,6 +193,81 @@ def restart_txe_serial_command():
             return f"Error executing script: {e.stderr}", 500
     except subprocess.CalledProcessError as e:
         return f"Error executing script: {e.stderr}", 500
+    #THIS IS ASHISH'S OLD CODE
+    '''
+    '''
+    #THIS IS MY CODE BUT IT'S INCONSISTENT BECAUSE OF SERVER BUG!
+    command = f"telnet localhost 8000\r\n"
+    try:
+        result = subprocess.run(['python3','serial_script.py',port,baudrate,command],capture_output=True,text=True,check=True)
+        time.sleep(10)
+        command = f"close all\r\n"
+        try:
+            result = subprocess.run(['python3','serial_script.py',port,baudrate,command],capture_output=True,text=True,check=True)
+            time.sleep(5)
+            command = f"{exe_path}/../install/tsi-start\n"
+            try:
+                result = subprocess.run(['python3','serial_script.py',port,baudrate,command],capture_output=True,text=True,check=True)
+                time.sleep(15) #Changed to 15 just to be safe!
+                #command = f"yes\n" Ashish said default was yes so just timeout is needed!
+                try:
+                    result = subprocess.run(['python3','serial_script.py',port,baudrate,command],capture_output=True,text=True,check=True)
+                    return result.stdout, 200
+                except subprocess.CalledProcessError as e:
+                    return f"Error executing script: {e.stderr}", 500
+            except subprocess.CalledProcessError as e:
+                return f"Error executing script: {e.stderr}", 500
+        except subprocess.CalledProcessError as e:
+            return f"Error executing script: {e.stderr}", 500
+    except subprocess.CalledProcessError as e:
+        return f"Error executing script: {e.stderr}", 500
+    #THIS IS MY CODE BUT IT'S INCONSISTENT BECAUSE OF SERVER BUG!
+    '''
+    #THIS WILL BE THE CODE FOR FULL REBOOT!
+    #BY DEFAULT WE ALWAYS START IN SERIAL/PICOCOM
+    #1. WE NEED TO BACK TO THE SHELL AND DO cd /tsi/fpga_card/fpga4/SKYLP_G0221/rev4; sudo make all; make juart
+    #2. IN SERIAL/PICOCOM, WE NEED TO DO boot
+    #UNLESS CALLED WE ARE ARE ALWAYS RUNNING IN CURRENT SHELL CONTEXT, WE ONLY WRITE TO SERIAL USING SUBPROCESS.RUN USING PORT AND BAUDRATE
+    print("alskdjflskjfdlsadkdjf")
+    command = f"cd /tsi/fpga_card/fpga4/SKYLP_G0221/rev4; sudo make all; make juart"
+    
+    
+    process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid)#This isn't finishing because its stuck on the juart terminal!
+    try:
+        process.wait(timeout=100)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        process.wait(timeout=5)  # Optionally wait a bit more for clean exit
+
+
+
+    #EVERYTHING ABOVE THIS WORKS! THE JUART TERMINAL AUTO EXITS AND IT REACHES THE PRINT STATEMENT BELOW!!!!!!!!!
+
+
+    #time.sleep(100) #Give Popen time to set up everything and 
+    
+    print("reached here")
+    
+    #render_template("processing.html")
+    
+    #time.sleep(150)
+    
+    # These 2 things work; the big problem is both parts work separately but not together!
+    ser = serial.Serial(port, baudrate)
+    
+    ser.write(b'boot\n')
+
+    time.sleep(50)
+
+    ser.write(b'root\n')
+
+    time.sleep(5)
+
+    ser.write(b'cd /usr/bin/tsi/v0.1.1.tsv31_06_06_2025/bin\n')
+
+    ser.close()
+
+    #EVERYTHING WORKS NOW!! EVERYTHING WORKS NOW!!
 
 @app.route('/health-check', methods=['GET'])
 def health_check_serial_command():
@@ -275,6 +354,7 @@ def submit():
         except subprocess.CalledProcessError as e:
             job_status["result"] = f"Error: {e.stderr}"
         finally:
+            time.sleep(int(tokens)/5)
             job_status["running"] = False
 
     thread = threading.Thread(target=run_script)
@@ -296,11 +376,52 @@ def result():
 
 @app.route('/abort')
 def abort():
+    #restart_txe_serial_command() #Put out here to avoid if loops and help testing!
     global job_status
+    print(job_status["running"],job_status["thread"].is_alive())
     if job_status["running"] and job_status["thread"].is_alive():
         # Use subprocess.Popen + pid handling instead for real process termination
         job_status["running"] = False
         job_status["result"] = "Aborted by user."
+        
+        '''
+        #THIS AUTOMATES CONTROL C OF THE SERVER BUT DOESN'T KILL THE ./LLAMA-CLI PROCESS THATS RUNNING ON PICOCOM!
+        experiment = os.getpid()
+        os.kill(experiment-1, signal.SIGINT)
+        '''
+        ser = serial.Serial(port, baudrate)
+
+        
+
+        ser.write(b'\x03')    # UNCOMMENT LATER BECAUSE RIGHT NOW WE HAVE TO MANUALLY REBOOT ALL THE TIME BUT THIS WORKS!
+        
+        ser.close()
+        
+        restart_txe_serial_command()
+        
+        #THIS WORKS NOW COMPLETLY BUT THE ONLY PROBLEM IS THAT THE WINDOW TO ABORT IS VERY INCONSISTENT
+        '''
+        ##################################################### EXPERIMENTAL!!!
+        script_path = "./cleanup_script.sh"
+        command = f"cd {exe_path}; {script_path}"
+
+        flag =["Boo"]
+        def run_script():
+            try:
+                flag[0] = "We went in here!"
+                result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command],capture_output=True,text=True)
+                flag[0] = "This worked!"
+                job_status["result"] = result.stdout
+            except subprocess.CalledProcessError as e:
+                job_status["result"] = f"Error: {e.stderr}"
+            finally:
+                job_status["running"] = False
+
+        thread = threading.Thread(target=run_script)
+        job_status = {"running": True, "result": "", "thread": thread}
+        thread.start()
+        ##################################################### EXPERIMENTAL!!!
+        '''
         return "<h2>Job aborted.</h2><a href='/'>Home</a>"
     return "<h2>No job running.</h2><a href='/'>Home</a>"
 
