@@ -185,37 +185,15 @@ def restart_txe_serial_command():
     process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
     try:
         for line in process.stdout:
-            #print(line, end="")  # Or process the line however you want
             if "release chip from reset called" in line:
                 time.sleep(2)
-                #print(f"Keyword '{keyword}' found. Terminating process...")
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 break
     except KeyboardInterrupt:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
 
 
-    ser = serial.Serial(port, baudrate)
-    
-    ser.write(b'boot\n')
-
-    
-    while True:
-        line = ser.readline().decode('utf-8', errors='ignore').strip()
-        #print(f"Received: {line}")
-        if line:
-            #print(f"Received: {line}")
-            if '(Yocto Project Reference Distro) 5.2.1 agilex7_dk_si_agf014ea' in line:
-                time.sleep(3)
-                ser.write(b'root\n')
-                break
-    
-
-    time.sleep(3)
-    
-    ser.write(b'cd /usr/bin/tsi/v0.1.1*/bin\n')
-
-    ser.close()
+    subprocess.run(['python3','serial_script.py', port, baudrate,'restart'])
 
     print("Finished Everything Hooray")
 
@@ -306,7 +284,7 @@ def submit():
         except subprocess.CalledProcessError as e:
             job_status["result"] = f"Error: {e.stderr}"
         finally:
-            time.sleep(int(tokens)/5)
+            time.sleep(max(10,int(tokens)/5))
             job_status["running"] = False
 
     thread = threading.Thread(target=run_script)
@@ -337,13 +315,7 @@ def abort():
         job_status["result"] = "Aborted by user."
         
         
-        ser = serial.Serial(port, baudrate)
-
-        
-
-        ser.write(b'\x03')  
-        
-        ser.close()
+        subprocess.run(['python3','serial_script.py', port, baudrate, 'abort'])
         
         restart_txe_serial_command()
         
