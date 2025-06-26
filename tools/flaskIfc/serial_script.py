@@ -6,13 +6,13 @@ import time
 def abort_serial_portion(port,baudrate):
     ser = serial.Serial(port, baudrate)
 
-    ser.write(b'\x03')
+    ser.write(b'\x03') # b'\x03' is Ctrl-C! 
 
     ser.close()
 
     
 
-def restart_txe_serial_portion(port, baudrate):
+def restart_txe_serial_portion(port, baudrate, path):
     ser = serial.Serial(port, baudrate)
 
     ser.write(b'boot\n')
@@ -31,7 +31,7 @@ def restart_txe_serial_portion(port, baudrate):
 
     time.sleep(3)
 
-    ser.write(b'cd /usr/bin/tsi/v0.1.1*/bin\n')
+    ser.write(('cd ' + path + '\n').encode())
     
     time.sleep(3)
 
@@ -86,10 +86,11 @@ if __name__ == "__main__":
         baudrate = int(sys.argv[2])
         abort_serial_portion(port,baudrate)
         sys.exit(1)
-    if len(sys.argv) == 4 and sys.argv[3] == 'restart':
+    if len(sys.argv) == 5 and sys.argv[3] == 'restart':
         port = sys.argv[1]
         baudrate = int(sys.argv[2])
-        restart_txe_serial_portion(port, baudrate)
+        path = sys.argv[4]
+        restart_txe_serial_portion(port, baudrate,path)
         sys.exit(1)
     if len(sys.argv) < 4:
         print("Usage: python script.py <port> <baudrate> <command>")

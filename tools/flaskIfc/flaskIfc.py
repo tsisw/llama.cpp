@@ -183,17 +183,21 @@ def restart_txe_serial_command():
     command = f"cd /tsi/fpga_card/fpga4/SKYLP_G0221/rev4; sudo make all; make juart"
     
     process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    start = time.time()
     try:
         for line in process.stdout:
             if "release chip from reset called" in line:
                 time.sleep(2)
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 break
+            current = time.time()
+            if current - start >= 1000:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
     except KeyboardInterrupt:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
 
 
-    subprocess.run(['python3','serial_script.py', port, baudrate,'restart'])
+    subprocess.run(['python3','serial_script.py', port, baudrate,'restart', exe_path])
 
     print("Finished Everything Hooray")
 
@@ -313,14 +317,8 @@ def abort():
         # Use subprocess.Popen + pid handling instead for real process termination
         job_status["running"] = False
         job_status["result"] = "Aborted by user."
-        
-        
         subprocess.run(['python3','serial_script.py', port, baudrate, 'abort'])
-        
         restart_txe_serial_command()
-        
-        
-        
         return "<h2>Job aborted.</h2><a href='/'>Home</a>"
     return "<h2>No job running.</h2><a href='/'>Home</a>"
 
