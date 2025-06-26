@@ -291,8 +291,8 @@ def restart_txe_serial_command():
     #ser.write(b'root\n')
 
     time.sleep(3)
-
-    ser.write(b'cd /usr/bin/tsi/v0.1.1.tsv32_06_20_2025/bin\n')
+    
+    ser.write(b'cd /usr/bin/tsi/v0.1.1*/bin\n')
 
     ser.close()
 
