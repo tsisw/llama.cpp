@@ -272,26 +272,31 @@ def restart_txe_serial_command():
     
     ser.write(b'boot\n')
 
-    time.sleep(50)
-    '''
+    #time.sleep(50)
+
+    #For this part to work you can't be in serial because multiple people can write, but only 1 person can read at a time!
     while True:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
-        print(f"Received: {line}")
+        #print(f"Received: {line}")
         if line:
             #print(f"Received: {line}")
-            if 'Poky (Yocto Project Reference Distro) 5.2.1 agilex7_dk_si_agf014ea' in line:
+            if '(Yocto Project Reference Distro) 5.2.1 agilex7_dk_si_agf014ea' in line:
                 time.sleep(3)
                 ser.write(b'root\n')
                 break
-    '''
+    #For this part to work you can't be in serial because multiple people can write, but only 1 person can read at a time!
+    
+    print("Lemonade")
 
-    ser.write(b'root\n')
+    #ser.write(b'root\n')
 
-    time.sleep(5)
+    time.sleep(3)
 
-    ser.write(b'cd /usr/bin/tsi/v0.1.1.tsv31_06_06_2025/bin\n')
+    ser.write(b'cd /usr/bin/tsi/v0.1.1.tsv32_06_20_2025/bin\n')
 
     ser.close()
+
+    print("Finished Everything Hooray")
 
     #EVERYTHING WORKS NOW!! EVERYTHING WORKS NOW!!
 
