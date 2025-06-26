@@ -231,13 +231,28 @@ def restart_txe_serial_command():
     print("alskdjflskjfdlsadkdjf")
     command = f"cd /tsi/fpga_card/fpga4/SKYLP_G0221/rev4; sudo make all; make juart"
     
-    
+    '''
     process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid)#This isn't finishing because its stuck on the juart terminal!
     try:
         process.wait(timeout=100)
     except subprocess.TimeoutExpired:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         process.wait(timeout=5)  # Optionally wait a bit more for clean exit
+    '''
+    process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    try:
+        for line in process.stdout:
+            #print(line, end="")  # Or process the line however you want
+            if "release chip from reset called" in line:
+                time.sleep(2)
+                #print(f"Keyword '{keyword}' found. Terminating process...")
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                break
+    except KeyboardInterrupt:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+
+
+
 
 
 
@@ -258,6 +273,17 @@ def restart_txe_serial_command():
     ser.write(b'boot\n')
 
     time.sleep(50)
+    '''
+    while True:
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        print(f"Received: {line}")
+        if line:
+            #print(f"Received: {line}")
+            if 'Poky (Yocto Project Reference Distro) 5.2.1 agilex7_dk_si_agf014ea' in line:
+                time.sleep(3)
+                ser.write(b'root\n')
+                break
+    '''
 
     ser.write(b'root\n')
 
