@@ -322,6 +322,7 @@ def result():
 Need to revert to an older version of Werkzeug to work!:
 
 sudo python3 -m venv flasktest
+source flasktest/bin/activate
 sudo pip install "Werkzeug<3.0"
 
 MISC. INFORMATION:
