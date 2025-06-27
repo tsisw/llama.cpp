@@ -39,9 +39,6 @@ def explicit_root_command(port,baudrate,path):
 
 
 def restart_txe_serial_portion(port, baudrate, path):
-    #ser = serial.Serial(port, baudrate)
-
-    #ser.write(b'boot\n')
 
     explicit_boot_command(port,baudrate)
 
