@@ -10,7 +10,7 @@ def abort_serial_portion(port,baudrate):
 
     ser.close()
 
-    
+
 
 def restart_txe_serial_portion(port, baudrate, path):
     ser = serial.Serial(port, baudrate)
@@ -32,7 +32,7 @@ def restart_txe_serial_portion(port, baudrate, path):
     time.sleep(3)
 
     ser.write(('cd ' + path + '\n').encode())
-    
+
     time.sleep(3)
 
     ser.close()
@@ -104,4 +104,5 @@ if __name__ == "__main__":
     baudrate = int(sys.argv[2])
     command = sys.argv[3]
     response = send_serial_command(port, baudrate, command)
+
         

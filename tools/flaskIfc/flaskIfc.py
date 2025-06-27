@@ -1,3 +1,4 @@
+from urllib.parse import quote as url_quote
 from flask import Flask, render_template, request
 import subprocess
 import threading
@@ -8,7 +9,6 @@ import subprocess
 import mmap
 import signal
 import serial
-
 
 job_status = {"running": False, "result": "", "thread": None}
 
@@ -86,6 +86,7 @@ destn_path='/tsi/proj/model-cache/gguf/' # Destination Directory in FPGA where u
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Create the upload folder if it doesn't exist
 
+
 @app.route('/upload-gguf', methods=['POST', 'GET'])
 def upload_serial_command():
     if request.method == 'POST':
@@ -134,6 +135,7 @@ def upload_serial_command():
 #    except subprocess.CalledProcessError as e:
 #        return f"Error executing script: {e.stderr}", 500
 
+
 @app.route('/upload-file', methods=['GET', 'POST'])
 def upload_file():
 
@@ -171,17 +173,14 @@ def upload_file():
             thread = threading.Thread(target=scriptRecvFromHost)
             job_status = {"running": True, "result": "", "thread": thread}
             thread.start()
- 
+
             stdout, stderr = process.communicate()
         return render_template('uploadtofpga.html', apple = process, recvoutput=f"On FPGA Target, recvFromHost completed ; transf    ered file:{filename} received")
     return render_template('upload.html') # Display the upload form
 
-@app.route('/restart-txe', methods=['GET'])
-def restart_txe_serial_command():
-    
-    
+def internal_restart_txe():
     command = f"cd /tsi/fpga_card/latest_sof_release; sudo make all; make juart"
-    
+
     process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
     start = time.time()
     try:
@@ -200,6 +199,14 @@ def restart_txe_serial_command():
     subprocess.run(['python3','serial_script.py', port, baudrate,'restart', exe_path])
 
     print("Finished Everything Hooray")
+
+@app.route('/restart-txe', methods=['GET'])
+def restart_txe_serial_command():
+
+    internal_restart_txe()
+
+    
+
 
     
 
@@ -233,6 +240,7 @@ def system_info_serial_command():
         return result.stdout, 200
     except subprocess.CalledProcessError as e:
         return f"Error executing script: {e.stderr}", 500
+
 
 @app.route('/submit', methods=['POST'])
 def submit():
@@ -297,6 +305,7 @@ def submit():
 
     return render_template("processing.html")
 
+
 @app.route('/status')
 def status():
     if job_status["running"]:
@@ -308,19 +317,33 @@ def status():
 def result():
     return render_template("result.html", output=job_status["result"])
 
+
+'''
+Need to revert to an older version of Werkzeug to work!:
+
+sudo python3 -m venv flasktest
+sudo pip install "Werkzeug<3.0"
+
+MISC. INFORMATION:
+
+Takes around 2 minutes and 10 seconds to fully complete
+At the end you should see the message: Finished Everything Hooray
+
+'''
 @app.route('/abort')
 def abort():
-    
+
     global job_status
-    
+
     if job_status["running"] and job_status["thread"].is_alive():
         # Use subprocess.Popen + pid handling instead for real process termination
         job_status["running"] = False
         job_status["result"] = "Aborted by user."
         subprocess.run(['python3','serial_script.py', port, baudrate, 'abort'])
-        restart_txe_serial_command()
+        internal_restart_txe()
         return "<h2>Job aborted.</h2><a href='/'>Home</a>"
     return "<h2>No job running.</h2><a href='/'>Home</a>"
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
