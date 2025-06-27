@@ -180,7 +180,7 @@ def upload_file():
 def restart_txe_serial_command():
     
     
-    command = f"cd /tsi/fpga_card/fpga4/SKYLP_G0221/rev4; sudo make all; make juart"
+    command = f"cd /tsi/fpga_card/latest_sof_release; sudo make all; make juart"
     
     process = subprocess.Popen([command],shell=True,preexec_fn=os.setsid,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
     start = time.time()
