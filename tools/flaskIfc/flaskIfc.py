@@ -76,7 +76,10 @@ def llama_cli_serial_command():
     command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend} {repeat_penalty} {batch_size} {top_k} {top_p} {last_n} {context_length} {temp}"
 
     try:
+        job_status['running'] = True
+        time.sleep(5) #Testing purposes!
         result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        job_status['running'] = False
         return result.stdout, 200
     except subprocess.CalledProcessError as e:
         return f"Error executing script: {e.stderr}", 500
