@@ -104,5 +104,4 @@ if __name__ == "__main__":
     baudrate = int(sys.argv[2])
     command = sys.argv[3]
     response = send_serial_command(port, baudrate, command)
-
-        
+    
