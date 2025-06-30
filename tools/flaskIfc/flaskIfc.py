@@ -77,7 +77,6 @@ def llama_cli_serial_command():
     try:
         job_status['running'] = True
         result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
-        print(result.stdout)
         job_status['running'] = False
         return result.stdout, 200
     except subprocess.CalledProcessError as e:
