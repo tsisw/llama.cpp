@@ -74,11 +74,10 @@ def llama_cli_serial_command():
     # http://10.50.30.167:5001/llama-cli?model=tiny-llama&backend=tSavorite&tokens=5&prompt=Hello+How+are+you
     script_path = "./run_llama_cli.sh"
     command = f"cd {exe_path}; {script_path} \"{prompt}\" {tokens} {model_path} {backend} {repeat_penalty} {batch_size} {top_k} {top_p} {last_n} {context_length} {temp}"
-
     try:
         job_status['running'] = True
-        time.sleep(5) #To give Karrar some time to actually see a different message!
         result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
+        print(result.stdout)
         job_status['running'] = False
         return result.stdout, 200
     except subprocess.CalledProcessError as e:
