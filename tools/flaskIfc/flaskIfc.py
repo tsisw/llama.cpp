@@ -177,7 +177,7 @@ def upload_file():
                      result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True,     check=True)
                      job_status["result"] = result.stdout
                      
-                     #print(result.stdout)
+                     print(result.stdout)
                      
                      recv_output = result.stdout
                  except subprocess.CalledProcessError as e:
