@@ -88,7 +88,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Create the upload folder if it doesn't exist
 
 def read_files_from_serial(port,baudrate,path):
-    command = f"cd {path}; ls -l"
+    command = f"cd {path}; ls -lt"
     job_status['running'] = True
     temp = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
     print(temp.stdout)
@@ -129,7 +129,7 @@ def upload_serial_command():
             thread = threading.Thread(target=scriptRecvFromHost)
             job_status = {"running": True, "result": "", "thread": thread}
             thread.start()
-
+            thread.join()
             stdout, stderr = process.communicate()
         
         read_files_from_serial(port,baudrate,destn_path)
@@ -171,7 +171,7 @@ def upload_file():
 
             script_path = "./recvFromHost "
             temporary_destination_path = request.form.get("destination_file_path") # I've tested this on fpga4 and it correctly gets the user-inputted file path
-            command = f"cd {exe_path}; {script_path} {temporary_destination_path}{filename}" #+ f"; cd {temporary_destination_path}; ls -l"
+            command = f"cd {exe_path}; {script_path} {temporary_destination_path}{filename}" 
             def scriptRecvFromHost():
                  try:
                      result = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True,     check=True)
