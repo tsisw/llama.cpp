@@ -87,8 +87,7 @@ destn_path='/tsi/proj/model-cache/gguf/' # Destination Directory in FPGA where u
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Create the upload folder if it doesn't exist
 
-def read_files_from_serial(port,baudrate,path):
-    command = f"cd {path}; ls -lt"
+def read_cmd_from_serial(port,baudrate,command):
     job_status['running'] = True
     temp = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
     print(temp.stdout)
@@ -132,7 +131,7 @@ def upload_serial_command():
             thread.join()
             stdout, stderr = process.communicate()
         
-        read_files_from_serial(port,baudrate,destn_path)
+        read_cmd_from_serial(port,baudrate,f"cd {destn_path}; ls -lt")
 
         return render_template('uploadtofpga.html', apple = process, recvoutput=f"On FPGA Target, recvFromHost completed ; transfered file:{filename} received")
     return render_template('upload.html') # Display the upload form
@@ -190,7 +189,7 @@ def upload_file():
             thread.join()
             stdout, stderr = process.communicate()
         
-        read_files_from_serial(port,baudrate,temporary_destination_path)
+        read_cmd_from_serial(port,baudrate,f"cd {temporary_destination_path}; ls -lt")
         
         return render_template('uploadtofpga.html', apple = process, recvoutput=f'On FPGA Target, recvFromHost completed ; transfered file:{filename} received ')
     return render_template('upload.html') # Display the upload form
