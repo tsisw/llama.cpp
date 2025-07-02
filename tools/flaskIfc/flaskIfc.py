@@ -87,11 +87,23 @@ destn_path='/tsi/proj/model-cache/gguf/' # Destination Directory in FPGA where u
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True) # Create the upload folder if it doesn't exist
 
+
 def read_cmd_from_serial(port,baudrate,command):
     job_status['running'] = True
     temp = subprocess.run(['python3', 'serial_script.py', port, baudrate, command], capture_output=True, text=True, check=True)
     print(temp.stdout)
     job_status['running'] = False
+
+@app.route('/delete-file', methods=['POST', 'GET'])
+def delete_file():
+    if request.method == 'POST':
+        
+        d_path = request.form.get("deletion_file_path")
+        filename = request.form.get("file_name")
+        command = f"cd {d_path}; rm {filename}"
+        read_cmd_from_serial(port,baudrate,command)
+        return 'Done'
+    return render_template('delete.html')
 
 @app.route('/upload-gguf', methods=['POST', 'GET'])
 def upload_serial_command():
