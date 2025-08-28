@@ -473,7 +473,7 @@ static struct ggml_cgraph * build_graph(const simple_model& model, enum ggml_tsa
                 result = ggml_sin(ctx0, model.a);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_SGN:
-		result = ggml_sgn(ctx0, model.a);
+                result = ggml_sgn(ctx0, model.a);
 		break;
 	     default:
     		ggml_free(ctx0);
