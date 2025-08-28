@@ -431,6 +431,11 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
           kernel_pipeline->kernel_name = "TXE_SIN";
           flag = true;
           break;
+      case GGML_TSAVORITE_KERNEL_TYPE_SGN:
+          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sgn_host;
+          kernel_pipeline->kernel_name = "TXE_SGN";
+          flag = true;
+          break;
       case GGML_TSAVORITE_KERNEL_TYPE_SIGMOID:
           kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sigmoid_host;
           kernel_pipeline->kernel_name = "TXE_SIGMOID";
@@ -592,6 +597,7 @@ static struct ggml_backend_tsavorite_context *ggml_tsavorite_init(ggml_backend_d
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_NEG,                true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_ABS,                true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SIN,                true);
+    GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SGN,                true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SIGMOID,            true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SILU,               true);
   }
@@ -701,6 +707,7 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
     case GGML_UNARY_OP_ABS:
     case GGML_UNARY_OP_SIGMOID:
     case GGML_UNARY_OP_SILU:
+    case GGML_UNARY_OP_SGN:
       break;
     default:
       return false;
@@ -863,6 +870,10 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
         break;
       case GGML_UNARY_OP_SILU:
         kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SILU;
+        num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
+        break;
+      case GGML_UNARY_OP_SGN:
+        kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SGN;
         num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
         break;
       default:
@@ -1830,6 +1841,7 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
     case GGML_UNARY_OP_ABS:
     case GGML_UNARY_OP_SIGMOID:
     case GGML_UNARY_OP_SILU:
+    case GGML_UNARY_OP_SGN:
       break;
     default:
       return false;
