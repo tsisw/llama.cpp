@@ -39,6 +39,8 @@ float test_input_1[GGML_TSAVORITE_KERNEL_TYPE_COUNT][NUM_ELEMENTS] = {
 	{1.1,  -4.4,  10,  -5,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, -23, 24, 25, -26, 27, -28, 29, -30, 31, -32.6},
 	//SIN Kernel
 	{1.1,  4.4,  10,  5,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32.6},
+	//RMS_NORM Kernel
+	{1,  4,  10,  5,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
 	//SIGMOID Kernel need to fix not tested
 	{1.1,  4.4,  10,  5,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 20, 20, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32.6},
 	//SILU  Kernel
@@ -89,6 +91,8 @@ float test_result[GGML_TSAVORITE_KERNEL_TYPE_COUNT][NUM_ELEMENTS] = {
 	{1.1,  4.4,  10,  5,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32.6},
 	//SIN Kernel
 	{0.891207,  -0.951602,  -0.544021,  -0.958924,  -0.958924,  -0.279416,  0.656987,  0.989358,  0.412118,  -0.544021, -0.999990, -0.536573, 0.420167, 0.990607, 0.650288, -0.287903, -0.961398, -0.750987, 0.149877, 0.912945, 0.912945, 0.912945, -0.846220, -0.905578, -0.132352, 0.762559, 0.956376, 0.270906, -0.663634, -0.988032, -0.404039, 0.926149},
+	//RMS_NORM Kernel
+	{0.0529, 0.1058, 0.1587, 0.2116, 0.2644, 0.3173, 0.3702, 0.4231, 0.476, 0.5289, 0.5818, 0.6347, 0.6876, 0.7404, 0.7933, 0.8462, 0.8991, 0.952, 1.0049, 1.0578, 1.1107, 1.1635, 1.2164, 1.2693, 1.3222, 1.3751, 1.428, 1.4809, 1.5338, 1.5867, 1.6395, 1.6924},
 	//SIGMOID  Kernel not tested
 	{0.891207,  -0.951602,  -0.544021,  -0.958924,  -0.958924,  -0.279416,  0.656987,  0.989358,  0.412118,  -0.544021, -0.999990, -0.536573, 0.420167, 0.990607, 0.650288, -0.287903, -0.961398, -0.750987, 0.149877, 0.912945, 0.912945, 0.912945, -0.846220, -0.905578, -0.132352, 0.762559, 0.956376, 0.270906, -0.663634, -0.988032, -0.404039, 0.926149},
 	// SILU Kernel
@@ -475,6 +479,9 @@ static struct ggml_cgraph * build_graph(const simple_model& model, enum ggml_tsa
 	    case GGML_TSAVORITE_KERNEL_TYPE_SIN:
                 result = ggml_sin(ctx0, model.a);
 		break;
+		case GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM:
+                result = ggml_rms_norm(ctx0, model.a, 1e-6f);
+		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_SIGMOID:
                 result = ggml_sigmoid(ctx0, model.a);
 		break;
@@ -533,6 +540,8 @@ enum ggml_tsavorite_kernel_type convert_testcase_to_ops_type (const char *testCa
             return GGML_TSAVORITE_KERNEL_TYPE_ABS;
         else if (!strcmp(testCase,"sin"))
             return GGML_TSAVORITE_KERNEL_TYPE_SIN;
+        else if (!strcmp(testCase,"rms_norm"))
+            return GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM;
         else if (!strcmp(testCase,"sigmoid"))
             return GGML_TSAVORITE_KERNEL_TYPE_SIGMOID;
         else if (!strcmp(testCase,"silu"))
@@ -561,7 +570,10 @@ const char* convert_ops_type_to_testcase(enum ggml_tsavorite_kernel_type ops_typ
             return "neg";
         case GGML_TSAVORITE_KERNEL_TYPE_ABS:
             return "abs";
-        case GGML_TSAVORITE_KERNEL_TYPE_SIN:
+		case GGML_TSAVORITE_KERNEL_TYPE_SIN:
+            return "sin";
+        case GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM:
+            return "rms_norm";
             return "sin";
         case GGML_TSAVORITE_KERNEL_TYPE_SIGMOID:
             return "sigmoid";
@@ -601,6 +613,7 @@ int main(int argc, char *argv[]) {
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_NEG ||
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_ABS ||
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_SIN ||
+			ops_type == GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM ||
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_SIGMOID ||
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_SILU)
 	    num_of_input_tensors = NUM_INPUT_URINARY_TENSORS;
