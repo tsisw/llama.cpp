@@ -62,7 +62,10 @@ struct _txe_device_t {
 };
 
 struct _txe_compute_pipeline_state_t {
+  void (*_mlir_fptr_3_input)(void *, void *, void *, void *);
   void (*_mlir_fptr_2_input)(void *, void *, void *);
+  void (*_mlir_fptr_2_input_6)(void *, void *, void *);
+  void (*_mlir_fptr_2_input_512)(void *, void *, void *);
   void (*_mlir_fptr_1_input)(void *, void *);
   std::string kernel_name;
   int reserved;
@@ -402,6 +405,11 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
           kernel_pipeline->kernel_name = "TXE_MULT";
           flag = true;
           break;
+      case GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT:
+          kernel_pipeline->_mlir_fptr_3_input = &_mlir_ciface_txe_mul_mat_host;
+          kernel_pipeline->kernel_name = "TXE_MUL_MAT";
+          flag = true;
+          break;
       case GGML_TSAVORITE_KERNEL_TYPE_DIV:
           kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_div_host;
           kernel_pipeline->kernel_name = "TXE_DIV";
@@ -440,6 +448,13 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
       case GGML_TSAVORITE_KERNEL_TYPE_SILU:
           kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_silu_host;
           kernel_pipeline->kernel_name = "TXE_SILU";
+          flag = true;
+          break;
+      case GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM:
+          kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_rms_norm_host;
+          kernel_pipeline->_mlir_fptr_2_input_6 = &_mlir_ciface_txe_rms_norm_6_host;
+          kernel_pipeline->_mlir_fptr_2_input_512 = &_mlir_ciface_txe_rms_norm_512_host;
+          kernel_pipeline->kernel_name = "TXE_RMS_NORM";
           flag = true;
           break;
       default:
@@ -595,6 +610,8 @@ static struct ggml_backend_tsavorite_context *ggml_tsavorite_init(ggml_backend_d
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SIN,                true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SIGMOID,            true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SILU,               true);
+    GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT,            true);
+    GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM,           true);
   }
 
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
@@ -692,10 +709,12 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
   case GGML_OP_ADD:
   case GGML_OP_SUB:
   case GGML_OP_MUL:
+  //case GGML_OP_MUL_MAT:
   case GGML_OP_DIV:
   case GGML_OP_SQRT:
   case GGML_OP_SQR:
   case GGML_OP_SIN:
+  case GGML_OP_RMS_NORM:
     break;
   case GGML_OP_UNARY:
     switch (ggml_get_unary_op(op)) {
@@ -742,6 +761,35 @@ static void ggml_tsavorite_decompose_unary_kernel(uint32_t num_elem, ggml_tensor
     break;
   }
   return;
+}
+
+static void anoop() {
+	return;
+}
+
+template<int Rank>
+// Assumes tsi_alloc is available and returns a pointer to allocated memory
+static MemRefDescriptor<Rank>* create_pred_mask(int K) {
+    // TVU load size (e.g., 32 for 1024-bit vector with 32-bit elements)
+    const int32_t tvu_size = TSI_TVU_LOAD_SIZE;
+    //printf("\n ANOOP Print Rank %d and K %d \n", Rank, K);
+
+    // Round up K to the next multiple of tvu_size
+    int32_t num_of_elem = ((K % tvu_size) != 0) ? ((K / tvu_size) + 1) * tvu_size : K;
+
+    // Allocate memory dynamically: space for header + data
+    MemRefDescriptor<Rank>* header = (MemRefDescriptor<Rank>*) tsi_alloc(
+        sizeof(MemRefDescriptor<Rank>) + num_of_elem * sizeof(float)
+    );
+
+    // Advance pointer to skip header and get to data
+    int32_t* pred_mask_data = (int32_t*)(header + 1);
+
+    // Fill the mask: 1 for indices < K, 0 otherwise
+    for (int32_t i = 0; i < num_of_elem; ++i) {
+        pred_mask_data[i] = (i < K) ? 1 : 0;
+    }
+    return header;
 }
 
 // nodes are intermediate which has multiple src tensors & operation
@@ -837,6 +885,11 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_MULT;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
       break;
+    case GGML_OP_MUL_MAT:
+          printf("\n AT COMPUTE OF  MUL_MAT\n");
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT;
+      num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      break;
     case GGML_OP_DIV:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_DIV;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
@@ -851,6 +904,11 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
       break;
     case GGML_OP_SIN:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SIN;
+      num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
+      break;
+    case GGML_OP_RMS_NORM:
+          //printf("\n AT COMPUTE OF  RMS_NORM\n");
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM;
       num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
       break;
     case GGML_OP_UNARY:
@@ -884,7 +942,8 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
     }
 
     if (!ctx->kernels[kernel_type].pipeline ||
-        (!ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input &&
+        (!ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input &&
+        !ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input &&
          !ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input)) {
       GGML_TSAVORITE_LOG_ERROR("Kernel Type %d, not supported \n", kernel_type);
       return GGML_STATUS_ABORTED;
@@ -965,6 +1024,38 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
           log_data.tensor = src1;
           ggml_tsi_log_tensor_data(log_data);
         }
+	if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT) {
+            printf("\n ANOOP I am calling MUL_MAT KERNEL\n");
+	    int K = src0->ne[0];
+	    // tsi_alloc inside below function
+	    anoop();
+            MemRefDescriptor<Rank>* pred_mask = create_pred_mask<Rank>(K);
+
+	    if (!pred_mask) {
+                    GGML_TSAVORITE_LOG_ERROR("tsi_alloc failied for creating memory for pred_mask \n");
+                    return GGML_STATUS_ABORTED;
+	    }
+	    pred_mask->offset = 0;
+	    pred_mask->data = (void *)(pred_mask+1);
+
+            for(int i=0; i < 4; ++i) {
+                srcP0->shape[i]     = src0->ne[i];
+                srcP1->shape[i]     = src1->ne[i];
+                nodeP->shape[i]     = node->ne[i];
+		pred_mask->shape[i] = 0;
+                printf("\n ANOOP src0 ne size %d for index %d nb %d\n", src0->ne[i], i, src0->nb[i]);
+                printf("\n ANOOP src1 ne size %d for index %d nb %d\n", src1->ne[i], i, src1->nb[i]);
+                printf("\n ANOOP node ne size %d for index %d nb %d\n", node->ne[i], i, node->nb[i]);
+            }
+            // kernel call
+	    printf("\n ANOOP Before MUL MAT done checking contigious src0 %d src1 %d node %d \n",ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(node));
+	    anoop();
+            ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input(srcP0, srcP1, nodeP, pred_mask);
+	    printf("\n ANOOP After MUL MAT done\n");
+	    anoop();
+            ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
+	    //tsi_free(pred_mask);
+        } else {
 
         ggml_tensor *dst = node;
         const int nr = ggml_nrows(src0);
@@ -986,9 +1077,13 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
           float *src1_ptr = (float *)((char *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11);
 
           for (int64_t r = 0; r < nr0; ++r) {
-              srcP0->shape[Rank - 1]   = ne10;
-              srcP1->shape[Rank - 1]   = ne10;
-              nodeP->shape[Rank - 1]   = ne10;
+              //srcP0->shape[Rank - 1]   = ne10;
+              //srcP1->shape[Rank - 1]   = ne10;
+              //nodeP->shape[Rank - 1]   = ne10;
+              srcP0->shape[0]   = ne10;
+              srcP1->shape[0]   = ne10;
+              nodeP->shape[0]   = ne10;
+
               srcP1->data =  srcP1->base = (void *)(src1_ptr);
               srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
               nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
@@ -996,6 +1091,7 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
               ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input(srcP0, srcP1, nodeP);
               ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
           }
+        }
         }
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
@@ -1020,6 +1116,7 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
               (struct ggml_backend_tsavorite_device_context *)backend->device->context);
           return GGML_STATUS_ABORTED;
         }
+	//printf("\n op type %d and ne size %d %d %d %d",node->op, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
         srcP0 = (MemRefDescriptor<Rank> *)src0->data;
         nodeP = (MemRefDescriptor<Rank> *)node->data;
         // This is for tsavorite MemRef Header hence getting header
@@ -1058,12 +1155,66 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
 
         srcP0->data = srcP0->base = (void *)((float *)src0->data);
         nodeP->data = nodeP->base = (void *)((float *)node->data);
-        srcP0->shape[Rank - 1]    = num_elem_src0;
-        nodeP->shape[Rank - 1]    = num_elem_src0;
-        srcP0->strides[Rank - 1]  = 0;
-        nodeP->strides[Rank - 1]  = 0;
-        // kernel call
-        ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input(srcP0, nodeP);
+        //srcP0->shape[Rank - 1]    = num_elem_src0;
+        //nodeP->shape[Rank - 1]    = num_elem_src0;
+        //srcP0->strides[Rank - 1]  = 0;
+        //nodeP->strides[Rank - 1]  = 0;
+        srcP0->shape[0]    = num_elem_src0;
+        nodeP->shape[0]    = num_elem_src0;
+        srcP0->strides[0]  = 0;
+        nodeP->strides[0]  = 0;
+
+	if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM) {
+	    int K = 96;
+	    // tsi_alloc inside below function
+            MemRefDescriptor<Rank>* buf = create_pred_mask<Rank>(K);
+
+	    if (!buf) {
+                    GGML_TSAVORITE_LOG_ERROR("tsi_alloc failied for creating memory for buf \n");
+                    return GGML_STATUS_ABORTED;
+	    }
+	    buf->offset = 0;
+	    buf->data   = buf->base = (void *)(buf+1);
+	    float *val = (float *)buf->data;
+	    int i =64;
+	    for(; i <= 95; ++i)
+		    val[i] = node->ne[0];
+
+
+            for ( i = 0; i < GGML_MAX_DIMS && src0->nb[i] != 0; ++i) {
+		if (src0->ne[i] == 0) {
+                    srcP0->shape[i]    = 1;
+                    nodeP->shape[i]    = 1;
+	        }
+	        else  {
+                    srcP0->shape[i]    = src0->ne[i];
+                    nodeP->shape[i]    = node->ne[i];
+		}
+                srcP0->strides[i]  = 0;
+                nodeP->strides[i]  = 0;
+            }
+	    anoop();
+
+	    //printf("\n size of tensor for RMS_NORM %d", num_elem_src0);
+            //ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input(srcP0, nodeP, buf);
+	    //printf("\n RSM SIZE ne0 %d ne1 %d ne2 %d ne3 %d ", src0->ne[0], src0->ne1[1], src0->ne[2], src0->ne[3]);
+	    if(src0->ne[1] == 512) {
+                ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input_512(srcP0, nodeP, buf);
+		printf("\n ANOOP TSAVORITE COMPUTE RSM 512 ne0 %d ne2 %d ne3 %d", src0->ne[0], src0->ne[2], src0->ne[3]);
+	     }
+	    if(src0->ne[1] == 6) {
+                ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input_6(srcP0, nodeP, buf);
+		printf("\n ANOOP TSAVORITE COMPUTE RSM 6 ne0 %d ne2 %d ne3 %d", src0->ne[0], src0->ne[2], src0->ne[3]);
+	     }
+	    if(src0->ne[1] == 1) {
+                ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input(srcP0, nodeP, buf);
+		printf("\n ANOOP TSAVORITE COMPUTE RSM 1 ne0 %d ne2 %d ne3 %d", src0->ne[0], src0->ne[2], src0->ne[3]);
+	    }
+
+	    anoop();
+	}
+	else
+            ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input(srcP0, nodeP);
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
@@ -1363,7 +1514,7 @@ static size_t ggml_backend_tsavorite_buffer_type_get_alloc_size(ggml_backend_buf
       "\n\n\n\n Calculating---- Alloc ----Size header %lu  and data %lu \n\n\n\n ",
       sizeof(tensor_data_header), ggml_nbytes(tensor));
 
-  return (sizeof(tensor_data_header) + ggml_nbytes(tensor));
+  return (sizeof(tensor_data_header) + ggml_nbytes(tensor) + 1024);
 
   TSI_UNUSED(buft);
 }
@@ -1784,9 +1935,11 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
   case GGML_OP_SUB:
   case GGML_OP_DIV:
   case GGML_OP_MUL:
+  //case GGML_OP_MUL_MAT:
   case GGML_OP_SQRT:
   case GGML_OP_SQR:
   case GGML_OP_SIN:
+  case GGML_OP_RMS_NORM:
     break;
   case GGML_OP_UNARY:
     switch (ggml_get_unary_op(op)) {

@@ -3,40 +3,40 @@ set -e
 
 #Ensure prerequisites are met as follows
 echo 'updating submodule'
-git submodule update --recursive --init
-cd ggml-tsi-kernel/
+#git submodule update --recursive --init
+#cd ggml-tsi-kernel/
 module load tsi4 gcc/13.3.0
 export MLIR_SDK_VERSION=/proj/rel/sw/sdk-r.0.1.8
 echo 'creating python virtual env'
-/proj/local/Python-3.10.12/bin/python3 -m venv blob-creation
-source blob-creation/bin/activate
+#/proj/local/Python-3.10.12/bin/python3 -m venv blob-creation
+#source blob-creation/bin/activate
 echo 'installing mlir and python dependencies'
-pip install -r ${MLIR_SDK_VERSION}/compiler/python/requirements-common.txt
-pip install ${MLIR_SDK_VERSION}/compiler/python/mlir_external_packages-1.4.1-py3-none-any.whl
-pip install onnxruntime-training
+#pip install -r ${MLIR_SDK_VERSION}/compiler/python/requirements-common.txt
+#pip install ${MLIR_SDK_VERSION}/compiler/python/mlir_external_packages-1.4.1-py3-none-any.whl
+#pip install onnxruntime-training
 
 #build TSI kernels for the Tsavorite backend
 #First for FPGA
 
 echo 'creating fpga kernel'
-cd fpga-kernel
-cmake -B build-fpga
-./create-all-kernels.sh
+#cd fpga-kernel
+#cmake -B build-fpga
+#./create-all-kernels.sh
 #The for Posix Use cases 
 
 echo 'creating posix kernel'
-cd ../posix-kernel/
-./create-all-kernels.sh
+#cd ../posix-kernel/
+#./create-all-kernels.sh
 
 #Change directory to top level llama.cpp  
 
-cd ../../
+#cd ../../
 
 #Compile for posix with build-posix as a target folder
 
 echo 'building llama.cp, ggml for tsavorite  and other binary for posix'
-cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DCMAKE_C_FLAGS="-DGGML_PERF"   -DCMAKE_CXX_FLAGS="-DGGML_PERF"
-cmake --build build-posix --config Release
+#cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DCMAKE_C_FLAGS="-DGGML_PERF"   -DCMAKE_CXX_FLAGS="-DGGML_PERF"
+#cmake --build build-posix --config Release
 
 #Compile for fpga with build-fpga as a target folder
 

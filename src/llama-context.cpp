@@ -2626,34 +2626,6 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
 #ifdef GGML_PERF
 void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
     LLAMA_LOG_TSAVORITE("\n=== GGML Perf Summary ===\n");
-    LLAMA_LOG_TSAVORITE("  %-16s  %7s  %14s  %16s\n", "Op", "Runs", "Total us", "Avg us");
-
-    for (int i = 0; i < GGML_OP_COUNT; ++i) {
-        if (totals[i].runs > 0) {
-            LLAMA_LOG_TSAVORITE("  %-16s  %7ld  %14ld  %16.2f\n",
-                totals[i].op_name ? totals[i].op_name : "UNKNOWN",
-                totals[i].runs,
-                totals[i].total_us,
-                (double)totals[i].total_us / totals[i].runs);
-        }
-
-        // Unary sub-op breakdown
-        if (i == GGML_OP_UNARY) {
-            for (int j = 0; j < GGML_UNARY_OP_COUNT; ++j) {
-                if (totals[i].unary_subtotals[j].runs > 0) {
-                    LLAMA_LOG_TSAVORITE("    -> %-11s  %7ld  %14ld  %16.2f\n",
-                        ggml_unary_op_name((enum ggml_unary_op) j),
-                        totals[i].unary_subtotals[j].runs,
-                        totals[i].unary_subtotals[j].total_us,
-                        (double)totals[i].unary_subtotals[j].total_us / totals[i].unary_subtotals[j].runs);
-                }
-            }
-        }
-    }
-}
-#elif GGML_PERF_DETAIL
-void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
-    LLAMA_LOG_TSAVORITE("\n=== GGML Perf Summary ===\n");
     LLAMA_LOG_TSAVORITE("  %-16s %-8s %7s  %14s  %16s\n", "Op", "Target", "Runs", "Total us", "Avg us");
 
     for (int i = 0; i < GGML_OP_COUNT; ++i) {

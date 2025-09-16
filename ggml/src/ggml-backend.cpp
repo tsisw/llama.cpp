@@ -861,6 +861,10 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+static void anoop_backend()
+{
+	return;
+}
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -875,6 +879,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     };
 
     ggml_free(sched->ctx);
+    //printf("\n\n ANOOP ggml_backend_sched_split_graph is called\n\n");
 
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
@@ -932,6 +937,13 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+
+	    if (node && node->op == GGML_OP_RMS_NORM) {
+	       if ((node->ne[1] == 1 || node->ne[1] == 6 || node->ne[1] == 512) && node->ne[2] == 1 && (node->ne[3] == 1)) {
+                ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
+    		//anoop_backend();
+	    }
+	}
             if (*node_backend_id != -1) {
                 if (*node_backend_id == sched->n_backends - 1) {
                     // skip cpu (lowest prio backend)
@@ -942,6 +954,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
 		// Below Code is Optimization which i am disabling for now since we have not implemented other
 		// Operation at tsavorite
             } else { 
+	            //if (node && node->op == GGML_OP_RMS_NORM)
+		//	    printf("\n ANOOP RMS COUNT -First STEP");
                 ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
 	    }
         }
@@ -955,6 +969,14 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+#if 0
+	    if (node && node->op == GGML_OP_RMS_NORM) {
+	       if ((node->ne[1] == 1 || node->ne[1] == 512) && node->ne[2] == 1 && (node->ne[3] == 1)) {
+                ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
+    		//anoop_backend();
+	    }
+	}
+#endif
             if (*node_backend_id != -1) {
                 if (*node_backend_id == sched->n_backends - 1) {
                     // skip cpu (lowest prio backend)
@@ -962,7 +984,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 } else {
                     cur_backend_id = *node_backend_id;
                 }
-            } else if (cur_backend_id != -1) {
+	    } else if (cur_backend_id != -1) {
+		if (cur_backend_id != 0)
+			printf("\n AT GRAPH SPLIT expand gpu up");
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -976,9 +1000,20 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+
+#if 0
+	    if (node && node->op == GGML_OP_RMS_NORM) {
+	       if ((node->ne[1] == 1 || node->ne[1] == 512) && node->ne[2] == 1 && (node->ne[3] == 1)) {
+                ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
+    		//anoop_backend();
+	    }
+	}
+#endif
             if (*node_backend_id != -1) {
                 cur_backend_id = *node_backend_id;
             } else if (cur_backend_id != -1) {
+		//if (cur_backend_id != 0)
+		//	printf("\n AT GRAPH SPLIT expand rest down");
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -992,9 +1027,18 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 continue;
             }
             int * node_backend_id = &tensor_backend_id(node);
+
+	    if (node && node->op == GGML_OP_RMS_NORM) {
+	       if ((node->ne[1] == 1 || node->ne[1] == 512 || node->ne[1] == 6) && node->ne[2] == 1 && (node->ne[3] == 1)) {
+                ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
+    		anoop_backend();
+	    }
+	}
             if (*node_backend_id != -1) {
                 cur_backend_id = *node_backend_id;
             } else if (cur_backend_id != -1) {
+		if (cur_backend_id != 0)
+			printf("\n AT GRAPH SPLIT expand rest up");
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
