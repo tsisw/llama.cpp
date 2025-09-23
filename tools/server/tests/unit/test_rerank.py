@@ -4,7 +4,7 @@ from utils import *
 server = ServerPreset.jina_reranker_tiny()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def create_server():
     global server
     server = ServerPreset.jina_reranker_tiny()

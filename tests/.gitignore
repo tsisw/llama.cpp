@@ -2,4 +2,3 @@
 !*.*
 *.o
 ggml-common.h
-**/*.swp

@@ -13,7 +13,6 @@ import {
   SquaresPlusIcon,
 } from '@heroicons/react/24/outline';
 import { OpenInNewTab } from '../utils/common';
-import { useModals } from './ModalProvider';
 
 type SettKey = keyof typeof CONFIG_DEFAULT;
 
@@ -283,15 +282,14 @@ export default function SettingDialog({
   const [localConfig, setLocalConfig] = useState<typeof CONFIG_DEFAULT>(
     JSON.parse(JSON.stringify(config))
   );
-  const { showConfirm, showAlert } = useModals();
 
-  const resetConfig = async () => {
-    if (await showConfirm('Are you sure you want to reset all settings?')) {
+  const resetConfig = () => {
+    if (window.confirm('Are you sure you want to reset all settings?')) {
       setLocalConfig(CONFIG_DEFAULT);
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     // copy the local config to prevent direct mutation
     const newConfig: typeof CONFIG_DEFAULT = JSON.parse(
       JSON.stringify(localConfig)
@@ -304,14 +302,14 @@ export default function SettingDialog({
       const mustBeNumeric = isNumeric(CONFIG_DEFAULT[key as SettKey]);
       if (mustBeString) {
         if (!isString(value)) {
-          await showAlert(`Value for ${key} must be string`);
+          alert(`Value for ${key} must be string`);
           return;
         }
       } else if (mustBeNumeric) {
         const trimmedValue = value.toString().trim();
         const numVal = Number(trimmedValue);
         if (isNaN(numVal) || !isNumeric(numVal) || trimmedValue.length === 0) {
-          await showAlert(`Value for ${key} must be numeric`);
+          alert(`Value for ${key} must be numeric`);
           return;
         }
         // force conversion to number
@@ -319,7 +317,7 @@ export default function SettingDialog({
         newConfig[key] = numVal;
       } else if (mustBeBoolean) {
         if (!isBoolean(value)) {
-          await showAlert(`Value for ${key} must be boolean`);
+          alert(`Value for ${key} must be boolean`);
           return;
         }
       } else {

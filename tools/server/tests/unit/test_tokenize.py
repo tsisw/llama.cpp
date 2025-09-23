@@ -4,7 +4,7 @@ from utils import *
 server = ServerPreset.tinyllama2()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def create_server():
     global server
     server = ServerPreset.tinyllama2()

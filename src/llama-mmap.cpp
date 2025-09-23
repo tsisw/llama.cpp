@@ -401,7 +401,7 @@ struct llama_mmap::impl {
                 }
             }
 #else
-            LLAMA_LOG_DEBUG("skipping PrefetchVirtualMemory because _WIN32_WINNT < 0x602\n");
+            throw std::runtime_error("PrefetchVirtualMemory unavailable");
 #endif
         }
     }

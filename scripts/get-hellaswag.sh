@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 wget https://raw.githubusercontent.com/klosax/hellaswag_text_data/main/hellaswag_val_full.txt
 

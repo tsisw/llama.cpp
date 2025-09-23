@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 #  MIT license
 #  Copyright (C) 2025 Intel Corporation

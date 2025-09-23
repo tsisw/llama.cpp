@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 this=$(realpath "$0"); readonly this
 cd "$(dirname "$this")"

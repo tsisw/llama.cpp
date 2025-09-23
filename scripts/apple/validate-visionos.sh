@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # validate-visionos.sh - Validate visionOS Application with embedded llama.xcframework using SwiftUI
 
 # Authentication options (optional) (can be set via environment variables)

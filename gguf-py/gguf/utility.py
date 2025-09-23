@@ -145,11 +145,7 @@ class SafetensorRemote:
                     tensors[key] = val
             return tensors
 
-        raise ValueError(
-            f"No safetensor file has been found for model {model_id}."
-            "If the repo has safetensor files, make sure the model is public or you have a "
-            "valid Hugging Face token set in the environment variable HF_TOKEN."
-        )
+        raise ValueError(f"Model {model_id} does not have any safetensor files")
 
     @classmethod
     def get_list_tensors(cls, url: str) -> dict[str, RemoteTensor]:
@@ -235,7 +231,7 @@ class SafetensorRemote:
         response.raise_for_status()
 
         # Get raw byte data
-        return response.content[slice(size if size > -1 else None)]
+        return response.content[:size]
 
     @classmethod
     def check_file_exist(cls, url: str) -> bool:

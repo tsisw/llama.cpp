@@ -10,8 +10,6 @@
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-// TODO: currently not used
-/*
 struct sycl_hw_info {
   syclex::architecture arch;
   int32_t device_id;
@@ -20,7 +18,6 @@ struct sycl_hw_info {
 bool is_in_vector(std::vector<int> &vec, int item);
 
 sycl_hw_info get_device_hw_info(sycl::device *device_ptr);
-*/
 
 
 #endif // SYCL_HW_HPP

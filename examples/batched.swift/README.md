@@ -1,5 +1,4 @@
 This is a swift clone of `examples/batched`.
 
-```bash
-$ ./llama-batched-swift MODEL_PATH [PROMPT] [PARALLEL]
-```
+$ `make`
+$ `./llama-batched-swift MODEL_PATH [PROMPT] [PARALLEL]`

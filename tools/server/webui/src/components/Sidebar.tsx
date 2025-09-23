@@ -14,7 +14,6 @@ import {
 import { BtnWithTooltips } from '../utils/common';
 import { useAppContext } from '../utils/app.context';
 import toast from 'react-hot-toast';
-import { useModals } from './ModalProvider';
 
 export default function Sidebar() {
   const params = useParams();
@@ -39,7 +38,6 @@ export default function Sidebar() {
       StorageUtils.offConversationChanged(handleConversationChange);
     };
   }, []);
-  const { showConfirm, showPrompt } = useModals();
 
   const groupedConv = useMemo(
     () => groupConversationsByDate(conversations),
@@ -132,7 +130,7 @@ export default function Sidebar() {
                   onSelect={() => {
                     navigate(`/chat/${conv.id}`);
                   }}
-                  onDelete={async () => {
+                  onDelete={() => {
                     if (isGenerating(conv.id)) {
                       toast.error(
                         'Cannot delete conversation while generating'
@@ -140,7 +138,7 @@ export default function Sidebar() {
                       return;
                     }
                     if (
-                      await showConfirm(
+                      window.confirm(
                         'Are you sure to delete this conversation?'
                       )
                     ) {
@@ -169,14 +167,14 @@ export default function Sidebar() {
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                   }}
-                  onRename={async () => {
+                  onRename={() => {
                     if (isGenerating(conv.id)) {
                       toast.error(
                         'Cannot rename conversation while generating'
                       );
                       return;
                     }
-                    const newName = await showPrompt(
+                    const newName = window.prompt(
                       'Enter new name for the conversation',
                       conv.name
                     );
@@ -231,7 +229,7 @@ function ConversationItem({
       >
         {conv.name}
       </button>
-      <div tabIndex={0} className="dropdown dropdown-end h-5">
+      <div className="dropdown dropdown-end h-5">
         <BtnWithTooltips
           // on mobile, we always show the ellipsis icon
           // on desktop, we only show it when the user hovers over the conversation item

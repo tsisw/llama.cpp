@@ -51,7 +51,6 @@ export interface Message {
 export type MessageExtra =
   | MessageExtraTextFile
   | MessageExtraImageFile
-  | MessageExtraAudioFile
   | MessageExtraContext;
 
 export interface MessageExtraTextFile {
@@ -64,13 +63,6 @@ export interface MessageExtraImageFile {
   type: 'imageFile';
   name: string;
   base64Url: string;
-}
-
-export interface MessageExtraAudioFile {
-  type: 'audioFile';
-  name: string;
-  base64Data: string;
-  mimeType: string;
 }
 
 export interface MessageExtraContext {
@@ -87,10 +79,6 @@ export type APIMessageContentPart =
   | {
       type: 'image_url';
       image_url: { url: string };
-    }
-  | {
-      type: 'input_audio';
-      input_audio: { data: string; format: 'wav' | 'mp3' };
     };
 
 export type APIMessage = {
@@ -132,7 +120,6 @@ export interface LlamaCppServerProps {
   n_ctx: number;
   modalities?: {
     vision: boolean;
-    audio: boolean;
   };
   // TODO: support params
 }

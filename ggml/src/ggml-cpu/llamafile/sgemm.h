@@ -1,11 +1,6 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
-
-#if defined(__VXE__) || defined(__VXE2__)
-#include <vecintrin.h>
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif

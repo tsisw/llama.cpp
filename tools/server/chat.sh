@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 API_URL="${API_URL:-http://127.0.0.1:8080}"
 

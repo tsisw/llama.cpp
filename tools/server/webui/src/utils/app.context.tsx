@@ -209,7 +209,6 @@ export const AppContextProvider = ({
         messages,
         stream: true,
         cache_prompt: true,
-        reasoning_format: 'none',
         samplers: config.samplers,
         temperature: config.temperature,
         dynatemp_range: config.dynatemp_range,
@@ -255,7 +254,7 @@ export const AppContextProvider = ({
         if (chunk.error) {
           throw new Error(chunk.error?.message || 'Unknown error');
         }
-        const addedContent = chunk.choices[0]?.delta.content;
+        const addedContent = chunk.choices[0].delta.content;
         const lastContent = pendingMsg.content || '';
         if (addedContent) {
           pendingMsg = {

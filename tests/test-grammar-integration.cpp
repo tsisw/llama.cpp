@@ -7,8 +7,6 @@
 #include "../src/unicode.h"
 #include "../src/llama-grammar.h"
 
-#include <nlohmann/json.hpp>
-
 #include <cassert>
 #include <string>
 #include <vector>

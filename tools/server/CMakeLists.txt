@@ -12,6 +12,7 @@ endif()
 set(TARGET_SRCS
     server.cpp
     utils.hpp
+    httplib.h
 )
 set(PUBLIC_ASSETS
     index.html.gz
@@ -33,7 +34,7 @@ endforeach()
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
-target_include_directories(${TARGET} PRIVATE ../mtmd)
+target_include_directories(${TARGET} PRIVATE ../llava)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
