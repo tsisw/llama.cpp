@@ -72,11 +72,6 @@ struct _txe_device_t {
   } stats;
 };
 
-// data Type
-#define DATA_TYPE_F32_INDEX 0
-#define DATA_TYPE_F16_INDEX 1
-#define DATA_TYPE_MAX_INDEX 2
-
 struct _txe_compute_pipeline_state_t {
   void (*_mlir_fptr_2_input[DATA_TYPE_MAX_INDEX])(void *, void *, void *);
   void (*_mlir_fptr_1_input[DATA_TYPE_MAX_INDEX])(void *, void *);
@@ -709,15 +704,11 @@ static ggml_backend_tsavorite_buffer_s ggml_tsavorite_get_buffer(struct ggml_ten
     return tsi_nil;
 }
 #endif
-bool
-check_tensor_output_input_data_same_mode(const struct ggml_tensor *op) {
+bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
   uint32_t tensor_data_type = op->type;
   for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
     if (op->src[i] != NULL) {
-	if(op->src[i]->type == GGML_TYPE_F32 || op->src[i]->type == GGML_TYPE_F32)      {
         if(tensor_data_type != op->src[i]->type)
-		return false;
-        } else
 		return false;
     }
   }
@@ -737,7 +728,7 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
 
   if (op->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F16)
     return false;
-  if (!check_tensor_output_input_data_same_mode(op))
+  if (!is_op_dtype_consistent_with_src(op))
     return false;
   switch (op->op) {
   case GGML_OP_NONE:
@@ -906,6 +897,9 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
     max_num_of_elem = 0;
     if(node->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && (!src1 || src1->type == GGML_TYPE_F32))
 	    kernel_sub_type = DATA_TYPE_F32_INDEX;
+    /*
+     * FP16 support is being qualified and is work in progress
+     */
     if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
 	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
@@ -1924,7 +1918,7 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
                                                      const struct ggml_tensor *op) {
   if (op->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F16)
     return false;
-  if (!check_tensor_output_input_data_same_mode(op))
+  if (!is_op_dtype_consistent_with_src(op))
     return false;
   switch (op->op) {
   case GGML_OP_NONE:
