@@ -72,9 +72,14 @@ struct _txe_device_t {
   } stats;
 };
 
+// data Type
+#define DATA_TYPE_F32_INDEX 0
+#define DATA_TYPE_F16_INDEX 1
+#define DATA_TYPE_MAX_INDEX 2
+
 struct _txe_compute_pipeline_state_t {
-  void (*_mlir_fptr_2_input)(void *, void *, void *);
-  void (*_mlir_fptr_1_input)(void *, void *);
+  void (*_mlir_fptr_2_input[DATA_TYPE_MAX_INDEX])(void *, void *, void *);
+  void (*_mlir_fptr_1_input[DATA_TYPE_MAX_INDEX])(void *, void *);
   std::string kernel_name;
   int reserved;
 };
@@ -399,67 +404,81 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
   switch (kernel_type) {
       case GGML_TSAVORITE_KERNEL_TYPE_ADD:
           if (ggml_tsavorite_kernel_mode_flag == GGML_TSAVORITE_KERNEL_MODE_CPU)
-              kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_add_test;
-          else
-              kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_add_host;
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_test;
+          else {
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host;
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_add_16_host;
+	  }
           kernel_pipeline->kernel_name = "TXE_ADD";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SUB:
-          kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_sub_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_sub_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_sub_16_host;
           kernel_pipeline->kernel_name = "TXE_SUB";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_MULT:
           if (ggml_tsavorite_kernel_mode_flag == GGML_TSAVORITE_KERNEL_MODE_CPU)
-              kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_mult_test;
-          else
-              kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_mult_host;
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_mult_test;
+          else {
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_mult_host;
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_mult_16_host;
+	  }
           kernel_pipeline->kernel_name = "TXE_MULT";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_DIV:
-          kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_div_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_div_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_div_16_host;
           kernel_pipeline->kernel_name = "TXE_DIV";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SQRT:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sqrt_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_sqrt_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_sqrt_16_host;
           kernel_pipeline->kernel_name = "TXE_SQRT";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SQR:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sqr_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_sqr_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_sqr_16_host;
           kernel_pipeline->kernel_name = "TXE_SQR";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_NEG:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_neg_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_neg_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_neg_16_host;
           kernel_pipeline->kernel_name = "TXE_NEG";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_ABS:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_abs_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_abs_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_abs_16_host;
           kernel_pipeline->kernel_name = "TXE_ABS";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SIN:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sin_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_sin_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_sin_16_host;
           kernel_pipeline->kernel_name = "TXE_SIN";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SIGMOID:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_sigmoid_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_sigmoid_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_sigmoid_16_host;
           kernel_pipeline->kernel_name = "TXE_SIGMOID";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_SILU:
-          kernel_pipeline->_mlir_fptr_1_input = &_mlir_ciface_txe_silu_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_silu_host;
+          kernel_pipeline->_mlir_fptr_1_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_silu_16_host;
           kernel_pipeline->kernel_name = "TXE_SILU";
           flag = true;
           break;
       case GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM:
-          kernel_pipeline->_mlir_fptr_2_input = &_mlir_ciface_txe_rms_norm_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_rms_norm_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_rms_norm_16_host;
           kernel_pipeline->kernel_name = "TXE_RMS_NORM";
           flag = true;
           break;
@@ -690,6 +709,20 @@ static ggml_backend_tsavorite_buffer_s ggml_tsavorite_get_buffer(struct ggml_ten
     return tsi_nil;
 }
 #endif
+bool
+check_tensor_output_input_data_same_mode(const struct ggml_tensor *op) {
+  uint32_t tensor_data_type = op->type;
+  for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+    if (op->src[i] != NULL) {
+	if(op->src[i]->type == GGML_TYPE_F32 || op->src[i]->type == GGML_TYPE_F32)      {
+        if(tensor_data_type != op->src[i]->type)
+		return false;
+        } else
+		return false;
+    }
+  }
+  return true;
+}
 
 static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_device_context *ctx_dev,
                                        const struct ggml_tensor *op) {
@@ -702,7 +735,9 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
     }
   }
 
-  if (op->type != GGML_TYPE_F32)
+  if (op->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F16)
+    return false;
+  if (!check_tensor_output_input_data_same_mode(op))
     return false;
   switch (op->op) {
   case GGML_OP_NONE:
@@ -860,6 +895,7 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
   tensor_log log_data;
 
   for (int i = 0; i < cgraph->n_nodes; i++) {
+     int32_t kernel_sub_type=-1;
 #ifdef GGML_PERF
     int64_t t_start = ggml_time_us();
 #endif
@@ -868,7 +904,15 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
     src1 = node->src[1];
     min_num_of_elem = 0;
     max_num_of_elem = 0;
+    if(node->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && (!src1 || src1->type == GGML_TYPE_F32))
+	    kernel_sub_type = DATA_TYPE_F32_INDEX;
+    if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
+	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
+    if(kernel_sub_type == -1) {
+        printf("\n kernel_sub_type not suppored\n");
+        return GGML_STATUS_ABORTED;
+    }
     switch (node->op) {
     case GGML_OP_ADD:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ADD;
@@ -933,8 +977,8 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
     }
 
     if (!ctx->kernels[kernel_type].pipeline ||
-        (!ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input &&
-         !ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input)) {
+        (!ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type] &&
+         !ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input[kernel_sub_type])) {
       GGML_TSAVORITE_LOG_ERROR("Kernel Type %d, not supported \n", kernel_type);
       return GGML_STATUS_ABORTED;
     }
@@ -1045,7 +1089,7 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
               srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
               nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
               // kernel call
-              ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input(srcP0, srcP1, nodeP);
+              ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
               ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
           }
         }
@@ -1159,11 +1203,11 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
 			strides = strides * src0->ne[i];
 	    }
 
-            ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input(srcP0, nodeP, buf);
+            ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, nodeP, buf);
         }
         else {
             // kernel call
-            ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input(srcP0, nodeP);
+            ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input[kernel_sub_type](srcP0, nodeP);
 	}
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
 
@@ -1878,7 +1922,9 @@ static bool ggml_backend_tsavorite_device_supports_buft(ggml_backend_dev_t dev,
 // ggml_backend_sched_backend_id_from_cur  -> ggml_backend_offload_op ->
 static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
                                                      const struct ggml_tensor *op) {
-  if (op->type != GGML_TYPE_F32)
+  if (op->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F16)
+    return false;
+  if (!check_tensor_output_input_data_same_mode(op))
     return false;
   switch (op->op) {
   case GGML_OP_NONE:
