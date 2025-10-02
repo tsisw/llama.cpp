@@ -709,7 +709,7 @@ bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
   for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
     if (op->src[i] != NULL) {
         if(tensor_data_type != op->src[i]->type)
-		return false;
+          return false;
     }
   }
   return true;

@@ -156,7 +156,7 @@ typedef struct tensor_log_ {
  * Data Types Enum
  */
 typedef enum tsi_data_type_ {
-	DATA_TYPE_F32_INDEX,
+	DATA_TYPE_F32_INDEX = 0,
 	DATA_TYPE_F16_INDEX,
 	DATA_TYPE_MAX_INDEX
 } tsi_data_type;
