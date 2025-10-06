@@ -127,6 +127,7 @@ enum ggml_tsavorite_kernel_type {
   GGML_TSAVORITE_KERNEL_TYPE_ABS,
   GGML_TSAVORITE_KERNEL_TYPE_SIN,
   GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM,
+  GGML_TSAVORITE_KERNEL_TYPE_SOFTMAX,
   GGML_TSAVORITE_KERNEL_TYPE_SIGMOID,
   GGML_TSAVORITE_KERNEL_TYPE_SILU,
 
@@ -175,6 +176,7 @@ extern void _mlir_ciface_txe_sin_host(void *a, void *res);
 extern void _mlir_ciface_txe_sigmoid_host(void *a, void *res);
 extern void _mlir_ciface_txe_silu_host(void *a, void *res);
 extern void _mlir_ciface_txe_rms_norm_host(void *a, void *res, void *buf);
+extern void _mlir_ciface_txe_softmax_host(void *a, void *res, void *buf);
 
 /* 
  * FP16 Kernels 
@@ -191,6 +193,7 @@ extern void _mlir_ciface_txe_sin_16_host(void *a, void *res);
 extern void _mlir_ciface_txe_sigmoid_16_host(void *a, void *res);
 extern void _mlir_ciface_txe_silu_16_host(void *a, void *res);
 extern void _mlir_ciface_txe_rms_norm_16_host(void *a, void *res, void *buf);
+extern void _mlir_ciface_txe_softmax_16_host(void *a, void *res, void *buf);
 
 extern void ggml_tsi_log_tensor_data(tensor_log log_data);
 

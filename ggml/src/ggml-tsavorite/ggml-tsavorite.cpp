@@ -477,6 +477,12 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
           kernel_pipeline->kernel_name = "TXE_RMS_NORM";
           flag = true;
           break;
+      case GGML_TSAVORITE_KERNEL_TYPE_SOFTMAX:
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_softmax_host;
+          kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_softmax_16_host;
+          kernel_pipeline->kernel_name = "TXE_SOFTMAX";
+          flag = true;
+          break;
       default:
           break;
   }
@@ -625,6 +631,7 @@ static struct ggml_backend_tsavorite_context *ggml_tsavorite_init(ggml_backend_d
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SIGMOID,            true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SILU,               true);
     GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM,           true);
+    GGML_TSAVORITE_KERNEL(GGML_TSAVORITE_KERNEL_TYPE_SOFTMAX,            true);
   }
 
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
@@ -741,6 +748,7 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
   case GGML_OP_SIN:
     break;
   case GGML_OP_RMS_NORM:
+  case GGML_OP_SOFT_MAX:
     break;
   case GGML_OP_UNARY:
     switch (ggml_get_unary_op(op)) {
@@ -938,6 +946,10 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
       break;
     case GGML_OP_RMS_NORM:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM;
+      num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
+      break;
+    case GGML_OP_SOFT_MAX:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SOFTMAX;
       num_of_input_tensors = TSAVORITE_UNARY_INPUT_TENSORS;
       break;
     case GGML_OP_UNARY:
@@ -1156,7 +1168,7 @@ static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
         srcP0->strides[0]  = 0;
         nodeP->strides[0]  = 0;
 
-	if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM) {
+	if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RMS_NORM || kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SOFTMAX) {
 	// tsi_alloc is invoked within the function below.
         // We allocate 64 elements for RMS normalization used in the RMS kernel.
         // Although only 32 elements are strictly necessary, reducing this would require changes to the RMS kernel.
@@ -1930,6 +1942,7 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
   case GGML_OP_SQR:
   case GGML_OP_SIN:
   case GGML_OP_RMS_NORM:
+  case GGML_OP_SOFT_MAX:
     break;
   case GGML_OP_UNARY:
     switch (ggml_get_unary_op(op)) {
