@@ -187,7 +187,7 @@ extern void _mlir_ciface_txe_sin_host(void *a, void *res);
 extern void _mlir_ciface_txe_sigmoid_host(void *a, void *res);
 extern void _mlir_ciface_txe_silu_host(void *a, void *res);
 extern void _mlir_ciface_txe_swiglu_host(void *a, void *b, void *res);
-extern void _mlir_ciface_txe_soft_max_host(void *a, void *res);
+extern void _mlir_ciface_txe_soft_max_host(void *a, void *res, void *buf);
 extern void _mlir_ciface_txe_rms_norm_host(void *a, void *res, void *buf);
 
 /* 
