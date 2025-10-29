@@ -49,6 +49,7 @@ if (GGML_TSAVORITE)
     set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
     set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
 
+    include_directories($ENV{TSAVORITE_SYSROOT_INCLUDE_DIR})
     include_directories(${TSAVORITE_INCLUDE_DIR})
     include_directories(${MLIR_COMPILER_DIR}/include/runtime/shim)
     include_directories(${RUNTIME_DIR}/include)
