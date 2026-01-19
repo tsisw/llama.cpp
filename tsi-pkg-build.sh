@@ -16,7 +16,7 @@ TOOLBOX_DIR=${3:-${TOOLBOX_DIR:-}}
 
 # Default to SDK paths if not provided
 if [ -z "${MLIR_COMPILER_DIR}" ]; then
-  MLIR_SDK_VERSION=${MLIR_SDK_VERSION:-/proj/rel/sw/sdk-r.0.2.2}
+  MLIR_SDK_VERSION=${MLIR_SDK_VERSION:-/proj/rel/sw/sdk-r.0.2.3}
   MLIR_COMPILER_DIR=${MLIR_SDK_VERSION}/compiler
   echo "Using default MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
 fi
@@ -24,7 +24,7 @@ fi
 if [ -z "${TOOLBOX_DIR}" ]; then
   # Derive from MLIR_COMPILER_DIR parent if MLIR_SDK_VERSION exists
   MLIR_SDK_VERSION=${MLIR_SDK_VERSION:-$(dirname ${MLIR_COMPILER_DIR})}
-  TOOLBOX_DIR=${MLIR_SDK_VERSION}/toolbox/build/install
+  TOOLBOX_DIR=${MLIR_SDK_VERSION}/toolbox/build/install-fpga
   echo "Using default TOOLBOX_DIR: ${TOOLBOX_DIR}"
 fi
 
