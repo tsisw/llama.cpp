@@ -1100,7 +1100,7 @@ static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI
     }
 
     const int64_t packedHandle = tsi_shmem_handle_from_ptr(packed);
-    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_add[deviceId], packedHandle);
+    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_add[deviceId], packedHandle, kPackedArgsBytes);
 
     if (!blobExecuteCmd) {
         printf("tsi_launch_blob failed for device %lu and blobDescriptor %s\n",
@@ -1186,7 +1186,7 @@ static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TS
     }
 
     const int64_t packedHandle = tsi_shmem_handle_from_ptr(packed);
-    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_mult[deviceId], packedHandle);
+    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_mult[deviceId], packedHandle, kPackedArgsBytes);
     if (!blobExecuteCmd) {
         printf("tsi_launch_blob failed for device %lu and blobDescriptor %s\n",
                                      (unsigned long)deviceId, (char *)blobDescriptor_mult[deviceId]);
@@ -1274,7 +1274,7 @@ static void *_mlir_ciface_txe_rms_norm_host_internal(void *a, void *b, void *buf
     }
 
     const int64_t packedHandle = tsi_shmem_handle_from_ptr(packed);
-    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_rms_norm[deviceId], packedHandle);
+    void *blobExecuteCmd = tsi_launch_blob(blobDescriptor_rms_norm[deviceId], packedHandle, kPackedArgsBytes);
     if (!blobExecuteCmd) {
         printf("tsi_launch_blob failed for device %lu and blobDescriptor %s\n",
                                      (unsigned long)deviceId, (char *)blobDescriptor_rms_norm[deviceId]);
