@@ -3296,6 +3296,29 @@ static void ggml_backend_tsavorite_buffer_get_tensor(ggml_backend_buffer_t buffe
   TSI_UNUSED(buffer);
 }
 
+
+static void ggml_backend_tsavorite_buffer_set_tensor2(ggml_backend_buffer_t buffer,
+                                                     struct ggml_tensor *tensor, const void *data,
+                                                     size_t offset, size_t size, size_t n_copies,
+						     size_t stride_tensor, size_t stride_data) {
+  GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
+  memcpy((char *)tensor->data + offset, data, size);
+  GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
+
+  TSI_UNUSED(buffer);
+}
+
+static void ggml_backend_tsavorite_buffer_get_tensor2(ggml_backend_buffer_t buffer,
+                                                     const struct ggml_tensor *tensor, void *data,
+                                                     size_t offset, size_t size, size_t n_copies,
+						     size_t stride_tensor, size_t stride_data) {
+  GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
+  memcpy(data, (const char *)tensor->data + offset, size);
+  GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
+
+  TSI_UNUSED(buffer);
+}
+
 static bool ggml_backend_tsavorite_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                      const struct ggml_tensor *src,
                                                      struct ggml_tensor *dst) {
@@ -3329,6 +3352,8 @@ static struct ggml_backend_buffer_i ggml_backend_tsavorite_buffer_i = {
     /* .memset_tensor   = */ ggml_backend_tsavorite_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_tsavorite_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_tsavorite_buffer_get_tensor,
+    /* .set_tensor2      = */ ggml_backend_tsavorite_buffer_set_tensor2,
+    /* .get_tensor2      = */ ggml_backend_tsavorite_buffer_get_tensor2,
     /* .cpy_tensor      = */ ggml_backend_tsavorite_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_tsavorite_buffer_clear,
     /* .reset           = */ NULL,
@@ -3598,6 +3623,8 @@ tsi_log_profile_info() {
 static struct ggml_backend_i ggml_backend_tsavorite_i = {
     /* .get_name                = */ ggml_backend_tsavorite_name,
     /* .free                    = */ ggml_backend_tsavorite_free,
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
