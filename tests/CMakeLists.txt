@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common stdc++)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -116,6 +116,8 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+if (NOT DEFINED GGML_TSAVORITE)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -133,6 +135,7 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3             ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
+endif()
 
 if (NOT WIN32)
     llama_test_cmd(
@@ -147,6 +150,7 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+if (NOT DEFINED GGML_TSAVORITE)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
@@ -299,4 +303,5 @@ target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/s
 if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
 endif()
