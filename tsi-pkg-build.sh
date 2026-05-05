@@ -5,14 +5,24 @@
 # USAGE (source is recommended)
 # ============================
 #
-# source tsi-pkg-build.sh [build-mode] [flags...] [MLIR_COMPILER_DIR] [TOOLBOX_DIR]
+# SDK_VERSION IS MANDATORY (for EVERY invocation)
+# -----------------------------------------------
+# SDK_VERSION must be provided explicitly by the user as an environment variable.
+#
+# Correct usage:
+#   SDK_VERSION=0.4.1 source tsi-pkg-build.sh [build-mode] [flags...] [MLIR_COMPILER_DIR] [TOOLBOX_DIR]
+#
+# Positional SDK_VERSION arguments are NOT supported:
+#   source tsi-pkg-build.sh SDK_VERSION=0.4.1   # NOT supported
+#
+# If SDK_VERSION is not provided, the script will fail fast.
 #
 # ------------------------------------------------------------------------------
 # Tsavorite Deployment Configuration (llama.cpp)
 # ------------------------------------------------------------------------------
 # llama.cpp supports an deployment configuration file:
 #
-#   tsavorite-model-deployment.yaml
+# tsavorite-model-deployment.yaml
 #
 # This file controls how the Tsavorite backend uses TXEs and whether
 # multi-threaded execution is enabled at runtime.
@@ -30,17 +40,17 @@
 # -------------------------------------
 #
 # a) Multi-threading DISABLED:
-#    - llama.cpp uses host-generated code produced by mlir_compiler.
-#    - The generated host code always targets TXE0.
-#    - No dynamic TXE selection or scheduling is performed.
+# - llama.cpp uses host-generated code produced by mlir_compiler.
+# - The generated host code always targets TXE0.
+# - No dynamic TXE selection or scheduling is performed.
 #
 # b) Multi-threading ENABLED:
-#    - llama.cpp Tsavorite backend contains host-side scheduling logic.
-#    - At runtime, the backend:
-#        * Scans for a free TXE
-#        * Selects an available TXE dynamically
-#        * Creates a host thread bound to the selected TXE
-#    - This enables concurrent execution across multiple TXEs.
+# - llama.cpp Tsavorite backend contains host-side scheduling logic.
+# - At runtime, the backend:
+#   * Scans for a free TXE
+#   * Selects an available TXE dynamically
+#   * Creates a host thread bound to the selected TXE
+# - This enables concurrent execution across multiple TXEs.
 #
 # ------------------------------------------------------------------------------
 # Deployment File Location and Usage
@@ -61,8 +71,8 @@
 #   in the llama.cpp root directory (the working directory where llama.cpp
 #   is built and executed).
 #
-#   Example:
-#     /proj/work/akapoor/llama-cpp-april-16/llama.cpp/tsavorite-model-deployment.yaml
+# Example:
+#   /proj/work/akapoor/llama-cpp-april-16/llama.cpp/tsavorite-model-deployment.yaml
 #
 # - If present, the Tsavorite backend loads this file at runtime to determine
 #   TXE configuration and multi-threading behavior.
@@ -91,7 +101,7 @@
 #
 # - release : GGML_PERF_RELEASE
 # - debug : POSIX => GGML_PERF_DETAIL
-#           FPGA  => GGML_PERF (GGML_PERF_DETAIL disabled to avoid expensive file logging)
+#           FPGA => GGML_PERF (GGML_PERF_DETAIL disabled to avoid expensive file logging)
 # - debug-tmu : GGML_PERF_DETAIL + TMU_DEBUG
 # - debug-tmu-detail : GGML_PERF_DETAIL + TMU_DEBUG + TMU_DEBUG_VALIDATE
 #
@@ -109,9 +119,9 @@
 # Auto blob safeguards (ON by default):
 # - If deleted ggml-tsi-kernel (rm -rf) or host objects are missing:
 #   * POSIX build auto-builds POSIX blobs if required for link
-#   * FPGA  build auto-builds FPGA blobs if required for link
+#   * FPGA build auto-builds FPGA blobs if required for link
 # Disable both with:
-# no-auto-blobs
+#   no-auto-blobs
 #
 # Python virtual env (only used for blob generation):
 # overwrite-venv : delete blob-creation venv and recreate it (installs deps)
@@ -160,70 +170,62 @@
 #
 # Help:
 # help \
-#  -h \
-#  --help \
-#  -help
+# -h \
+# --help \
+# -help
 #
 # ==============================================================================
 #
-# EXAMPLES
-# ========
+# EXAMPLES (SDK_VERSION REQUIRED)
+# ===============================
 #
 # 1) Default (posix + fpga + package) with default build-type (debug):
-# source tsi-pkg-build.sh
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh
 #
 # 2) POSIX only:
-# source tsi-pkg-build.sh debug build-posix
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix
 #
 # 3) POSIX TMU-only:
-# source tsi-pkg-build.sh debug build-posix-tmu-only
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix-tmu-only
 #
 # 4) POSIX TMU disabled (TVU-only):
-# source tsi-pkg-build.sh debug build-posix-tmu-disable
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix-tmu-disable
 #
 # 5) FPGA only (TMU+TVU):
-# source tsi-pkg-build.sh debug build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga
 #
 # 6) FPGA TMU-only:
-# source tsi-pkg-build.sh debug build-fpga-tmu-only
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga-tmu-only
 #
 # 7) FPGA TMU disabled (TVU-only):
-# source tsi-pkg-build.sh debug build-fpga-tmu-disable
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga-tmu-disable
 #
 # 8) Debug TMU:
-# source tsi-pkg-build.sh debug-tmu build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug-tmu build-fpga
 #
 # 9) Debug TMU detail (adds TMU_DEBUG_VALIDATE):
-# source tsi-pkg-build.sh debug-tmu-detail build-posix build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug-tmu-detail build-posix build-fpga
 #
 # 10) Build blobs explicitly:
-# source tsi-pkg-build.sh build-all-blobs
-# source tsi-pkg-build.sh build-fpga-blobs
-# source tsi-pkg-build.sh build-posix-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-all-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-posix-blobs
 #
 # 11) Incremental builds (do not delete build dirs):
-# source tsi-pkg-build.sh incremental build-posix build-fpga
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh incremental build-posix build-fpga
 #
 # 12) Provide explicit paths:
-# source tsi-pkg-build.sh debug build-fpga /path/to/compiler /path/to/toolbox/install-fpga
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga /path/to/compiler /path/to/toolbox/install-fpga
 #
-# ------------------------------------------------------------------------------
-# 13 SDK_VERSION (MANDATORY)
-# ------------------------------------------------------------------------------
-# SDK_VERSION must be provided explicitly by the user as an environment variable.
+# 13) Package only (existing FPGA build dir already built):
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh package
 #
-# Correct usage:
-#   SDK_VERSION=0.4.0 source tsi-pkg-build.sh
-#
-# Positional SDK_VERSION arguments are NOT supported:
-#   source tsi-pkg-build.sh SDK_VERSION=0.4.1   # this is not supported
-#
-# If SDK_VERSION is not provided, the script will fail fast.
-# This avoids hard-coded defaults and ensures the intended SDK version
-# is always selected intentionally by the user.
-# ------------------------------------------------------------------------------
+# 14) Override tsavorite-model-deployment.yaml source for packaging:
+#     TSAVORITE_DEPLOYMENT_YAML_SRC=/abs/path/tsavorite-model-deployment.yaml \
+#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
 #
 # ==============================================================================
+
 log_error(){ echo "ERROR: $*" >&2; }
 log_info(){ echo "INFO: $*"; }
 
