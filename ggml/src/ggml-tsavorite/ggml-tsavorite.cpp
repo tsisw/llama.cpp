@@ -71,8 +71,6 @@ struct TsavoriteRuntimeState {
     std::mutex workers_mutex;
     std::mutex device_mutex;
     std::mutex tsi_pack_mutex;
-    // Global guard for TsavRT shim calls (stability for Ollama multi-threading)
-    std::mutex tsavrt_api_mutex;   // Global guard for TsavRT shim calls
     std::condition_variable device_cv;
     // blobs
     BlobDescriptor **blobDescriptor_add = nullptr;
@@ -106,7 +104,6 @@ auto &workers = g_rt.workers;
 auto &workers_mutex = g_rt.workers_mutex;
 auto &device_mutex = g_rt.device_mutex;
 auto &tsi_pack_mutex = g_rt.tsi_pack_mutex;
-auto &tsavrt_api_mutex = g_rt.tsavrt_api_mutex;
 auto &device_cv = g_rt.device_cv;
 
 auto &blobDescriptor_add      = g_rt.blobDescriptor_add;
@@ -1146,7 +1143,6 @@ static inline void join_all_workers() {
 
 static void tsi_blob_execution_internal(void *commandList) {
   // Enqueue & run
-  std::lock_guard<std::mutex> rt_lock(tsavrt_api_mutex);
   tsi_finalize_command_list(commandList);
   tsi_wait(commandList);
   return;
@@ -1161,9 +1157,7 @@ static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
     
-    // One lock to protect ALL TsavRT operations + packed_args usage
-    std::lock_guard<std::mutex> rt_lock(tsavrt_api_mutex);
-
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
@@ -1268,8 +1262,7 @@ static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TS
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
 
-    // One lock to protect ALL TsavRT operations + packed_args usage
-    std::lock_guard<std::mutex> rt_lock(tsavrt_api_mutex);
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
@@ -1367,8 +1360,7 @@ static void *_mlir_ciface_txe_rms_norm_host_internal(void *a, void *b, void *buf
     constexpr int64_t kPackedArgsI64   = 20;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
 
-    // One lock to protect ALL TsavRT operations + packed_args usage
-    std::lock_guard<std::mutex> rt_lock(tsavrt_api_mutex);
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
