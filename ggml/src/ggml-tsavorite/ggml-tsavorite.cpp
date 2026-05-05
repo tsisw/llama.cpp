@@ -1157,7 +1157,7 @@ static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
     
-    // Lock for packed_args usage
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
@@ -1262,7 +1262,7 @@ static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TS
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
 
-    // Lock for packed_args usage
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
@@ -1360,7 +1360,7 @@ static void *_mlir_ciface_txe_rms_norm_host_internal(void *a, void *b, void *buf
     constexpr int64_t kPackedArgsI64   = 20;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
 
-    // Lock for packed_args usage
+    // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
     void *commandList = tsi_create_command_list(deviceId);
