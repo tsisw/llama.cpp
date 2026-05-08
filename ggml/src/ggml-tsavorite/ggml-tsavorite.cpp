@@ -40,6 +40,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "vec.h"
+#include "ops.h"
 #include "tsi-rt/TXEDeviceConfig.h"
 #include "tsi-rt/host/BlobDescriptor.h"
 #include "tsi-rt/queues/Command.h"
@@ -1958,6 +1961,14 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
   if (!ctx_dev)
     return false;
+  if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16){
+    switch (op->op) {
+      case GGML_OP_SET_ROWS:
+        return true;
+      default:
+        break;
+    }
+  }
 
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
     return false;
@@ -2713,12 +2724,12 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     src1 = node->src[1];
     min_num_of_elem = 0;
     max_num_of_elem = 0;
-    if(node->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && (!src1 || src1->type == GGML_TYPE_F32))
+    if(node->type == GGML_TYPE_F32 /*&& src0->type == GGML_TYPE_F32 && (!src1 || src1->type == GGML_TYPE_F32)*/)
 	    kernel_sub_type = DATA_TYPE_F32_INDEX;
     /*
      * FP16 support is being qualified and is work in progress
      */
-    if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
+    if(node->type == GGML_TYPE_F16 /*&& src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16)*/)
 	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
     if(kernel_sub_type == -1) {
@@ -2739,7 +2750,18 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
         for(ii=0; ii <= 95; ++ii)
                vall[ii] = 0;
     }
+	  struct ggml_compute_params params = {
+		    .ith = 0,
+		    .nth = 1,
+		    .wsize = 0,
+		    .wdata = NULL,
+		    .threadpool = NULL,
+	    };
     switch (node->op) {
+    case GGML_OP_SET_ROWS:
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_set_rows(&params, node);
+      break;
     case GGML_OP_ADD:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ADD;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
@@ -3289,6 +3311,7 @@ static void ggml_backend_tsavorite_buffer_get_tensor(ggml_backend_buffer_t buffe
   TSI_UNUSED(buffer);
 }
 
+
 static bool ggml_backend_tsavorite_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                      const struct ggml_tensor *src,
                                                      struct ggml_tensor *dst) {
@@ -3322,6 +3345,8 @@ static struct ggml_backend_buffer_i ggml_backend_tsavorite_buffer_i = {
     /* .memset_tensor   = */ ggml_backend_tsavorite_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_tsavorite_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_tsavorite_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_tsavorite_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_tsavorite_buffer_clear,
     /* .reset           = */ NULL,
@@ -3593,6 +3618,8 @@ static struct ggml_backend_i ggml_backend_tsavorite_i = {
     /* .free                    = */ ggml_backend_tsavorite_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_tsavorite_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -3895,6 +3922,16 @@ static bool ggml_backend_tsavorite_device_supports_buft(ggml_backend_dev_t dev,
 // ggml_backend_sched_backend_id_from_cur  -> ggml_backend_offload_op ->
 static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
                                                      const struct ggml_tensor *op) {
+
+  if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16){
+    switch (op->op) {
+      case GGML_OP_SET_ROWS:
+        return true;
+      default:
+        break;
+    }
+  }
+
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
     return false;
 
