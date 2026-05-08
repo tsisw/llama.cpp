@@ -5,14 +5,24 @@
 # USAGE (source is recommended)
 # ============================
 #
-# source tsi-pkg-build.sh [build-mode] [flags...] [MLIR_COMPILER_DIR] [TOOLBOX_DIR]
+# SDK_VERSION IS MANDATORY (for EVERY invocation)
+# -----------------------------------------------
+# SDK_VERSION must be provided explicitly by the user as an environment variable.
+#
+# Correct usage:
+#   SDK_VERSION=0.4.1 source tsi-pkg-build.sh [build-mode] [flags...] [MLIR_COMPILER_DIR] [TOOLBOX_DIR]
+#
+# Positional SDK_VERSION arguments are NOT supported:
+#   source tsi-pkg-build.sh SDK_VERSION=0.4.1   # NOT supported
+#
+# If SDK_VERSION is not provided, the script will fail fast.
 #
 # ------------------------------------------------------------------------------
 # Tsavorite Deployment Configuration (llama.cpp)
 # ------------------------------------------------------------------------------
 # llama.cpp supports an deployment configuration file:
 #
-#   tsavorite-model-deployment.yaml
+# tsavorite-model-deployment.yaml
 #
 # This file controls how the Tsavorite backend uses TXEs and whether
 # multi-threaded execution is enabled at runtime.
@@ -30,17 +40,17 @@
 # -------------------------------------
 #
 # a) Multi-threading DISABLED:
-#    - llama.cpp uses host-generated code produced by mlir_compiler.
-#    - The generated host code always targets TXE0.
-#    - No dynamic TXE selection or scheduling is performed.
+# - llama.cpp uses host-generated code produced by mlir_compiler.
+# - The generated host code always targets TXE0.
+# - No dynamic TXE selection or scheduling is performed.
 #
 # b) Multi-threading ENABLED:
-#    - llama.cpp Tsavorite backend contains host-side scheduling logic.
-#    - At runtime, the backend:
-#        * Scans for a free TXE
-#        * Selects an available TXE dynamically
-#        * Creates a host thread bound to the selected TXE
-#    - This enables concurrent execution across multiple TXEs.
+# - llama.cpp Tsavorite backend contains host-side scheduling logic.
+# - At runtime, the backend:
+#   * Scans for a free TXE
+#   * Selects an available TXE dynamically
+#   * Creates a host thread bound to the selected TXE
+# - This enables concurrent execution across multiple TXEs.
 #
 # ------------------------------------------------------------------------------
 # Deployment File Location and Usage
@@ -61,8 +71,8 @@
 #   in the llama.cpp root directory (the working directory where llama.cpp
 #   is built and executed).
 #
-#   Example:
-#     /proj/work/akapoor/llama-cpp-april-16/llama.cpp/tsavorite-model-deployment.yaml
+# Example:
+#   /proj/work/akapoor/llama-cpp-april-16/llama.cpp/tsavorite-model-deployment.yaml
 #
 # - If present, the Tsavorite backend loads this file at runtime to determine
 #   TXE configuration and multi-threading behavior.
@@ -91,7 +101,7 @@
 #
 # - release : GGML_PERF_RELEASE
 # - debug : POSIX => GGML_PERF_DETAIL
-#           FPGA  => GGML_PERF (GGML_PERF_DETAIL disabled to avoid expensive file logging)
+#           FPGA => GGML_PERF (GGML_PERF_DETAIL disabled to avoid expensive file logging)
 # - debug-tmu : GGML_PERF_DETAIL + TMU_DEBUG
 # - debug-tmu-detail : GGML_PERF_DETAIL + TMU_DEBUG + TMU_DEBUG_VALIDATE
 #
@@ -109,9 +119,9 @@
 # Auto blob safeguards (ON by default):
 # - If deleted ggml-tsi-kernel (rm -rf) or host objects are missing:
 #   * POSIX build auto-builds POSIX blobs if required for link
-#   * FPGA  build auto-builds FPGA blobs if required for link
+#   * FPGA build auto-builds FPGA blobs if required for link
 # Disable both with:
-# no-auto-blobs
+#   no-auto-blobs
 #
 # Python virtual env (only used for blob generation):
 # overwrite-venv : delete blob-creation venv and recreate it (installs deps)
@@ -160,70 +170,62 @@
 #
 # Help:
 # help \
-#  -h \
-#  --help \
-#  -help
+# -h \
+# --help \
+# -help
 #
 # ==============================================================================
 #
-# EXAMPLES
-# ========
+# EXAMPLES (SDK_VERSION REQUIRED)
+# ===============================
 #
 # 1) Default (posix + fpga + package) with default build-type (debug):
-# source tsi-pkg-build.sh
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh
 #
 # 2) POSIX only:
-# source tsi-pkg-build.sh debug build-posix
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix
 #
 # 3) POSIX TMU-only:
-# source tsi-pkg-build.sh debug build-posix-tmu-only
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix-tmu-only
 #
 # 4) POSIX TMU disabled (TVU-only):
-# source tsi-pkg-build.sh debug build-posix-tmu-disable
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-posix-tmu-disable
 #
 # 5) FPGA only (TMU+TVU):
-# source tsi-pkg-build.sh debug build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga
 #
 # 6) FPGA TMU-only:
-# source tsi-pkg-build.sh debug build-fpga-tmu-only
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga-tmu-only
 #
 # 7) FPGA TMU disabled (TVU-only):
-# source tsi-pkg-build.sh debug build-fpga-tmu-disable
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga-tmu-disable
 #
 # 8) Debug TMU:
-# source tsi-pkg-build.sh debug-tmu build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug-tmu build-fpga
 #
 # 9) Debug TMU detail (adds TMU_DEBUG_VALIDATE):
-# source tsi-pkg-build.sh debug-tmu-detail build-posix build-fpga
+#    SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug-tmu-detail build-posix build-fpga
 #
 # 10) Build blobs explicitly:
-# source tsi-pkg-build.sh build-all-blobs
-# source tsi-pkg-build.sh build-fpga-blobs
-# source tsi-pkg-build.sh build-posix-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-all-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga-blobs
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-posix-blobs
 #
 # 11) Incremental builds (do not delete build dirs):
-# source tsi-pkg-build.sh incremental build-posix build-fpga
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh incremental build-posix build-fpga
 #
 # 12) Provide explicit paths:
-# source tsi-pkg-build.sh debug build-fpga /path/to/compiler /path/to/toolbox/install-fpga
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh debug build-fpga /path/to/compiler /path/to/toolbox/install-fpga
 #
-# ------------------------------------------------------------------------------
-# 13 SDK_VERSION (MANDATORY)
-# ------------------------------------------------------------------------------
-# SDK_VERSION must be provided explicitly by the user as an environment variable.
+# 13) Package only (existing FPGA build dir already built):
+#     SDK_VERSION=0.4.1 source tsi-pkg-build.sh package
 #
-# Correct usage:
-#   SDK_VERSION=0.4.0 source tsi-pkg-build.sh
-#
-# Positional SDK_VERSION arguments are NOT supported:
-#   source tsi-pkg-build.sh SDK_VERSION=0.4.1   # this is not supported
-#
-# If SDK_VERSION is not provided, the script will fail fast.
-# This avoids hard-coded defaults and ensures the intended SDK version
-# is always selected intentionally by the user.
-# ------------------------------------------------------------------------------
+# 14) Override tsavorite-model-deployment.yaml source for packaging:
+#     TSAVORITE_DEPLOYMENT_YAML_SRC=/abs/path/tsavorite-model-deployment.yaml \
+#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
 #
 # ==============================================================================
+
 log_error(){ echo "ERROR: $*" >&2; }
 log_info(){ echo "INFO: $*"; }
 
@@ -556,31 +558,39 @@ parse_args() {
 }
 
 resolve_paths() {
-  local arch="$1"
+    local arch="$1"
 
-  if [ -z "${MLIR_COMPILER_DIR_IN}" ]; then
-    # REQUIRED CHANGE: remove hardcoded 0.4.0 and use SDK_VERSION
-    MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${arch}}"
-    MLIR_COMPILER_DIR_IN="${MLIR_SDK_VERSION}/compiler"
-  fi
+    if [ -z "${MLIR_COMPILER_DIR_IN}" ]; then
+        MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${arch}}"
+        MLIR_COMPILER_DIR_IN="${MLIR_SDK_VERSION}/compiler"
+    fi
 
-  if [ -z "${TOOLBOX_DIR_IN}" ]; then
-    MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
-    TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
-  fi
+    if [ -z "${TOOLBOX_DIR_IN}" ]; then
+        MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
+        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
+    fi
 
-  MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")" || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
-  TOOLBOX_DIR="$(absdir "${TOOLBOX_DIR_IN}")" || die "TOOLBOX_DIR not found: ${TOOLBOX_DIR_IN}"
+    MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")" \
+        || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
 
-  export MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR}")}"
-  export MLIR_COMPILER_DIR
-  export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
-  export TOOLBOX_DIR
-  export FAU_LOOKUP_TABLE_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/third-party/FAU/include/"
+    TOOLBOX_DIR="$(absdir "${TOOLBOX_DIR_IN}")" \
+        || die "TOOLBOX_DIR not found: ${TOOLBOX_DIR_IN}"
 
-  log_info "SDK_VERSION: ${SDK_VERSION}"
-  log_info "MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
-  log_info "TOOLBOX_DIR: ${TOOLBOX_DIR}"
+    # Derive TSICommon_DIR from TOOLBOX_DIR (SDK 0.4.1 compatible)
+    TSICommon_DIR="${TOOLBOX_DIR}/lib/cmake/TSICommon"
+    [ -d "${TSICommon_DIR}" ] || die "TSICommon_DIR not found: ${TSICommon_DIR}"
+    export TSICommon_DIR
+
+    export MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR}")}"
+    export MLIR_COMPILER_DIR
+    export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
+    export TOOLBOX_DIR
+    export FAU_LOOKUP_TABLE_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/third-party/FAU/include/"
+
+    log_info "SDK_VERSION:        ${SDK_VERSION}"
+    log_info "MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
+    log_info "TOOLBOX_DIR:       ${TOOLBOX_DIR}"
+    log_info "TSICommon_DIR:     ${TSICommon_DIR}"
 }
 
 setup_toolchain() {
@@ -617,8 +627,29 @@ setup_python() {
 
   log_info "installing mlir and python dependencies"
   run pip install --upgrade pip || return 1
+
+  # Keep torch install as before (this is what your logs show)
   run pip install torch==2.7.0 || return 1
-  run pip install -r "${MLIR_COMPILER_DIR}/python/requirements-common.txt" || return 1
+
+  # ---- FIX for SDK 0.4.1: requirements-common.txt may include "-r /python/...."
+  local REQ_DIR="${MLIR_COMPILER_DIR}/python"
+  local REQ_MAIN="${REQ_DIR}/requirements-common.txt"
+
+  if [ ! -f "${REQ_MAIN}" ]; then
+    die "requirements-common.txt not found: ${REQ_MAIN}"
+  fi
+
+  if grep -qE '^[[:space:]]*-r[[:space:]]+/python/' "${REQ_MAIN}"; then
+    log_info "requirements-common.txt contains absolute /python includes; rewriting to ${REQ_DIR}"
+    local REQ_TMP
+    REQ_TMP="$(mktemp -t tsi-req-XXXXXX.txt)"
+    sed -E "s|(^[[:space:]]*-r[[:space:]]+)/python/|\\1${REQ_DIR}/|g" "${REQ_MAIN}" > "${REQ_TMP}"
+    run pip install -r "${REQ_TMP}" || { rm -f "${REQ_TMP}" >/dev/null 2>&1 || true; return 1; }
+    rm -f "${REQ_TMP}" >/dev/null 2>&1 || true
+  else
+    run pip install -r "${REQ_MAIN}" || return 1
+  fi
+  # ---- END FIX
 
   local MLIR_WHL
   MLIR_WHL="$(ls "${MLIR_COMPILER_DIR}/python"/mlir_external_packages-*.whl 2>/dev/null | head -1 || true)"
@@ -861,8 +892,8 @@ EOL
 
   cp "${GGML_TSI_INSTALL_DIR}/fpga/blobs" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" -r || return 1
   cp "${build_dir}/bin/llama-cli" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
-  cp "${build_dir}/bin/libggml"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
-  cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  cp "${build_dir}/bin/libggml"*.so* "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  cp "${build_dir}/bin/lib"*.so* "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
   # REQUIRED ADDITION: include tsavorite-model-deployment.yaml in same dir as .so
