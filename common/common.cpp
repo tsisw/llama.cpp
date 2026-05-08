@@ -1145,8 +1145,11 @@ common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
-
-    if (params.fit_params) {
+    /*
+     * The Tsavorite Device does not support fitting of model yet, we need to enable it
+     * This is GGML_TSAVORITE TBD 
+     */
+    if (/*params.fit_params*/ 0) {
         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
