@@ -40,6 +40,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "vec.h"
+#include "ops.h"
 #include "tsi-rt/TXEDeviceConfig.h"
 #include "tsi-rt/host/BlobDescriptor.h"
 #include "tsi-rt/queues/Command.h"
@@ -1955,6 +1958,7 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 
 static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_device_context *ctx_dev,
                                        const struct ggml_tensor *op) {
+
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
   if (!ctx_dev)
     return false;
@@ -1962,12 +1966,44 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
     return false;
 
+  switch (op->op) {
+  case GGML_OP_SET_ROWS:
+          return true;
+  case GGML_OP_GET_ROWS:
+          return true;
+#if 0
+  case GGML_OP_MUL_MAT:
+          return true;
+#endif
+  case GGML_OP_SOFT_MAX:
+          return true;
+  case GGML_OP_GET_ROWS_BACK:
+          return true;
+  case GGML_OP_ROPE:
+          return true;
+  case GGML_OP_ROPE_BACK:
+          return true;
+  case GGML_OP_RESHAPE:
+          return true;
+  case GGML_OP_VIEW:
+          return true;
+  case GGML_OP_TRANSPOSE:
+          return true;
+  case GGML_OP_CPY:
+          return true;
+  case GGML_OP_SET:
+          return true;
+  case GGML_OP_CONT:
+          return true;
+  default:
+	  break;
+	}
   if (!is_op_dtype_consistent_with_src(op))
     return false;
 
   switch (op->op) {
   case GGML_OP_NONE:
-          break;
+	  break;
 #ifdef TMU_SUPPORTED
   case GGML_OP_MUL_MAT:
 	  if (!mul_mat_supported_size(op))
@@ -2721,10 +2757,12 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
 	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
+#if 0
     if(kernel_sub_type == -1) {
         printf("\n kernel_sub_type not suppored\n");
         return GGML_STATUS_ABORTED;
     }
+#endif
 
     if (node->op == GGML_OP_RMS_NORM ||  node->op == GGML_OP_SOFT_MAX) {
         if (!glob_buf) {
@@ -2739,7 +2777,39 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
         for(ii=0; ii <= 95; ++ii)
                vall[ii] = 0;
     }
+    struct ggml_compute_params params = {
+       .ith = 0,
+       .nth = 1,
+       .wsize = 96,
+       .wdata = glob_buf->data,
+       .threadpool = NULL,
+    };
     switch (node->op) {
+    case GGML_OP_SET_ROWS:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SET_ROWS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_set_rows(&params, node);
+      break;
+    case GGML_OP_GET_ROWS:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_get_rows(&params, node);
+      break;
+    case GGML_OP_GET_ROWS_BACK:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS_BACK;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_get_rows_back(&params, node);
+      break;
+    case GGML_OP_ROPE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ROPE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_rope(&params, node);
+      break;
+    case GGML_OP_ROPE_BACK:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ROPE_BACK;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_rope_back(&params, node);
+      break;
     case GGML_OP_ADD:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ADD;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
@@ -2774,11 +2844,15 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       break;
     case GGML_OP_SOFT_MAX:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX;
-      num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      //num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_soft_max(&params, node);
       break;
     case GGML_OP_MUL_MAT:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT;
-      num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      //num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_mul_mat(&params, node);
       break;
     case GGML_OP_GLU:
       kernel_type = tsi_glu_kernel_type(node);
@@ -2791,19 +2865,41 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
       break;
     case GGML_OP_RESHAPE:
-        kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RESHAPE;
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-	break;
-    case GGML_OP_VIEW:
-        kernel_type = GGML_TSAVORITE_KERNEL_TYPE_VIEW;
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RESHAPE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_reshape(&params, node);
       break;
-  case GGML_OP_PERMUTE:
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-        break;
-  case GGML_OP_TRANSPOSE:
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-        break;
+    case GGML_OP_VIEW:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_VIEW;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_reshape(&params, node);
+      break;
+    case GGML_OP_PERMUTE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_PERMUTE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_permute(&params, node);
+      break;
+    case GGML_OP_TRANSPOSE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_TRANSPOSE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_transpose(&params, node);
+      break;
+    case GGML_OP_SET:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SET;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_set(&params, node);
+      break;
+    case GGML_OP_CPY:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_CPY;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_cpy(&params, node);
+      break;
+    case GGML_OP_CONT:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_CONT;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_cont(&params, node);
+      break;
+
     case GGML_OP_UNARY:
       switch (ggml_get_unary_op(node)) {
       case GGML_UNARY_OP_NEG:
@@ -2832,6 +2928,36 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       ggml_backend_tsavorite_device_rel(
           (struct ggml_backend_tsavorite_device_context *)backend->device->context);
       return GGML_STATUS_ABORTED;
+    }
+
+    if ((kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SET_ROWS) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS_BACK) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ROPE) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ROPE_BACK) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_TRANSPOSE) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RESHAPE) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_VIEW) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CPY) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SET) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CONT) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT) 
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX)) {
+      ++device->stats.op_run_count[kernel_type].total_tensor_count;
+
+      if (!(device->stats.op_run_count[kernel_type].min_num_of_elem) ||
+          device->stats.op_run_count[kernel_type].min_num_of_elem > min_num_of_elem)
+        device->stats.op_run_count[kernel_type].min_num_of_elem = min_num_of_elem;
+
+      if (!(device->stats.op_run_count[kernel_type].max_num_of_elem) ||
+          device->stats.op_run_count[kernel_type].max_num_of_elem < max_num_of_elem)
+        device->stats.op_run_count[kernel_type].max_num_of_elem = max_num_of_elem;
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    int64_t t_end = ggml_time_us();
+    node->perf_runs++;
+    node->ggml_compute_backend = GGML_COMPUTE_BACKEND_TSAVORITE;
+    if (t_end >= t_start) {
+        node->perf_time_us += (t_end - t_start);
+    } else {
+        // Handle wraparound by assuming timer rolls over at max int64_t value
+        node->perf_time_us += (INT64_MAX - t_start + t_end + 1);
+    }
+#endif /* GGML_PERF-related flags */
+
     }
 
     if ((num_of_input_tensors != TSAVORITE_IGNORE_TENSORS) && (!ctx->kernels[kernel_type].pipeline ||
@@ -3898,6 +4024,36 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
     return false;
 
+  switch (op->op) {
+  case GGML_OP_SET_ROWS:
+          return true;
+  case GGML_OP_GET_ROWS:
+          return true;
+  case GGML_OP_TRANSPOSE:
+          return true;
+  case GGML_OP_SOFT_MAX:
+          return true;
+  case GGML_OP_GET_ROWS_BACK:
+          return true;
+  case GGML_OP_ROPE:
+          return true;
+  case GGML_OP_ROPE_BACK:
+          return true;
+  case GGML_OP_RESHAPE:
+          return true;
+  case GGML_OP_VIEW:
+          return true;
+  case GGML_OP_MUL_MAT:
+          return true;
+  case GGML_OP_CPY:
+          return true;
+  case GGML_OP_SET:
+          return true;
+  case GGML_OP_CONT:
+          return true;
+  default:
+	  break;
+	}
   if (!is_op_dtype_consistent_with_src(op))
     return false;
 
