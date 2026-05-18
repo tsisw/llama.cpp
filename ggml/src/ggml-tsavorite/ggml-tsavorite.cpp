@@ -4233,7 +4233,103 @@ static ggml_backend_buffer_type_t * ggml_backend_tsavorite_device_get_extra_buff
 static ggml_backend_feature * ggml_backend_tsavorite_get_features(ggml_backend_reg_t reg) {
     static std::vector<ggml_backend_feature> features = []() {
         std::vector<ggml_backend_feature> features;
+        if (ggml_cpu_has_sse3()) {
+            features.push_back({ "SSE3", "1" });
+        }
+        if (ggml_cpu_has_ssse3()) {
+            features.push_back({ "SSSE3", "1" });
+        }
+        if (ggml_cpu_has_avx()) {
+            features.push_back({ "AVX", "1" });
+        }
+        if (ggml_cpu_has_avx_vnni()) {
+            features.push_back({ "AVX_VNNI", "1" });
+        }
+        if (ggml_cpu_has_avx2()) {
+            features.push_back({ "AVX2", "1" });
+        }
+        if (ggml_cpu_has_f16c()) {
+            features.push_back({ "F16C", "1" });
+        }
+        if (ggml_cpu_has_fma()) {
+            features.push_back({ "FMA", "1" });
+        }
+        if (ggml_cpu_has_bmi2()) {
+            features.push_back({ "BMI2", "1" });
+        }
+        if (ggml_cpu_has_avx512()) {
+            features.push_back({ "AVX512", "1" });
+        }
+        if (ggml_cpu_has_avx512_vbmi()) {
+            features.push_back({ "AVX512_VBMI", "1" });
+        }
+        if (ggml_cpu_has_avx512_vnni()) {
+            features.push_back({ "AVX512_VNNI", "1" });
+        }
+        if (ggml_cpu_has_avx512_bf16()) {
+            features.push_back({ "AVX512_BF16", "1" });
+        }
+        if (ggml_cpu_has_amx_int8()) {
+            features.push_back({ "AMX_INT8", "1" });
+        }
+        if (ggml_cpu_has_neon()) {
+            features.push_back({ "NEON", "1" });
+        }
+        if (ggml_cpu_has_arm_fma()) {
+            features.push_back({ "ARM_FMA", "1" });
+        }
+        if (ggml_cpu_has_fp16_va()) {
+            features.push_back({ "FP16_VA", "1" });
+        }
+        if (ggml_cpu_has_matmul_int8()) {
+            features.push_back({ "MATMUL_INT8", "1" });
+        }
+        if (ggml_cpu_has_sve()) {
+            features.push_back({ "SVE", "1" });
+        }
+        if (ggml_cpu_has_dotprod()) {
+            features.push_back({ "DOTPROD", "1" });
+        }
+        if (ggml_cpu_get_sve_cnt() > 0) {
+            static std::string sve_cnt = std::to_string(ggml_cpu_get_sve_cnt());
+            features.push_back({ "SVE_CNT", sve_cnt.c_str() });
+        }
+        if (ggml_cpu_has_sme()) {
+            features.push_back({ "SME", "1" });
+        }
+        if (ggml_cpu_has_riscv_v()) {
+            features.push_back({ "RISCV_V", "1" });
+        }
+        if (ggml_cpu_has_vsx()) {
+            features.push_back({ "VSX", "1" });
+        }
+        if (ggml_cpu_has_vxe()) {
+            features.push_back({ "VXE", "1" });
+        }
+        if (ggml_cpu_has_wasm_simd()) {
+            features.push_back({ "WASM_SIMD", "1" });
+        }
+        if (ggml_cpu_has_llamafile()) {
+            features.push_back({ "LLAMAFILE", "1" });
+        }
+    #ifdef GGML_USE_ACCELERATE
+        features.push_back({ "ACCELERATE", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_HBM
+        features.push_back({ "CPU_HBM", "1" });
+    #endif
+    #ifdef GGML_USE_OPENMP
+        features.push_back({ "OPENMP", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_KLEIDIAI
+        features.push_back({ "KLEIDIAI", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_REPACK
+        features.push_back({ "REPACK", "1" });
+    #endif
+
         features.push_back({ nullptr, nullptr });
+
         return features;
     }();
 
