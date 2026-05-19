@@ -1991,11 +1991,11 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
           return true;
   case GGML_OP_GET_ROWS:
           return true;
-  case GGML_OP_MUL_MAT:
+/*  case GGML_OP_MUL_MAT:
           if (!is_op_dtype_consistent_with_src(op))
              return false;
           return true;
-  case GGML_OP_FLASH_ATTN_EXT:
+*/  case GGML_OP_FLASH_ATTN_EXT:
 	  return false;
   case GGML_OP_SOFT_MAX:
           return true;
@@ -2802,7 +2802,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     struct ggml_compute_params params = {
        .ith = 0,
        .nth = 1,
-       .wsize = 96,
+       .wsize = 1,
        .wdata = glob_buf->data,
        //.threadpool = ctx->threadpool,
        .threadpool = global_threadpool,
@@ -4072,11 +4072,11 @@ static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
           return true;
   case GGML_OP_VIEW:
           return true;
-  case GGML_OP_MUL_MAT:
+/*  case GGML_OP_MUL_MAT:
     if (!is_op_dtype_consistent_with_src(op))
       return false;
           return true;
-  case GGML_OP_FLASH_ATTN_EXT:
+*/  case GGML_OP_FLASH_ATTN_EXT:
 	  return false;
   case GGML_OP_CPY:
           return true;
@@ -4339,6 +4339,7 @@ static ggml_backend_feature * ggml_backend_tsavorite_get_features(ggml_backend_r
 }
 
 static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if 0
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_tsavorite_set_n_threads;
         return (void *)fct;
@@ -4368,7 +4369,7 @@ static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, co
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_tsavorite_set_threadpool;
     }
-
+#endif
     return NULL;
 
     GGML_UNUSED(reg);
