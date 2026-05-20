@@ -2873,9 +2873,11 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       break;
     case GGML_OP_MUL_MAT:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT;
-      //num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
-      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-      ggml_compute_forward_mul_mat(&params, node);
+      num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      // Disabling the tensor ignore and calling CPU and use
+      // TSavorite
+      // num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      // ggml_compute_forward_mul_mat(&params, node);
       break;
     case GGML_OP_FLASH_ATTN_EXT:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_FLASH_ATTN_EXT;
