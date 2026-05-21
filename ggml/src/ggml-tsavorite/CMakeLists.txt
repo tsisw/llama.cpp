@@ -2,8 +2,9 @@ message(STATUS "Tsavorite framework is found")
 #
 # tsavorite Kernel Library
 add_compile_options(--std=c++20)
+include_directories(../ggml-cpu)
 ggml_add_backend_library(ggml-tsavorite
-                         ggml-tsavorite.cpp
+                         ggml-tsavorite.cpp vec.cpp ops.cpp
                         )
 
 # Add compiler lib directory to link path for FFM libraries

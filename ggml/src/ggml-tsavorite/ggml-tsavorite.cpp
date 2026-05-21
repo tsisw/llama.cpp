@@ -40,6 +40,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "vec.h"
+#include "ops.h"
 #include "tsi-rt/TXEDeviceConfig.h"
 #include "tsi-rt/host/BlobDescriptor.h"
 #include "tsi-rt/queues/Command.h"
@@ -842,6 +845,7 @@ struct ggml_backend_tsavorite_context {
 };
 
 // global
+ggml_threadpool_t global_threadpool = NULL;
 
 // initialized in ggml_backend_tsavorite_reg
 static struct ggml_backend_reg g_ggml_backend_tsavorite_reg;
@@ -1662,6 +1666,20 @@ static void *ggml_tsavorite_host_malloc(size_t n) {
   return data;
 }
 
+#ifdef GGML_MUL_MAT_CPU_OPS
+void ggml_backend_tsavorite_set_threadpool(ggml_backend_t backend_tsavorite, ggml_threadpool_t threadpool) {
+
+    struct ggml_backend_tsavorite_context * ctx = (struct ggml_backend_tsavorite_context *)backend_tsavorite->context;
+
+    if (ctx->threadpool && ctx->threadpool != threadpool) {
+        // already had a different threadpool, pause/suspend it before switching
+        ggml_threadpool_pause(ctx->threadpool);
+    }
+    ctx->threadpool = threadpool;
+    global_threadpool = threadpool;
+}
+#endif
+
 static struct ggml_backend_tsavorite_context *ggml_tsavorite_init(ggml_backend_dev_t dev) {
   GGML_TSAVORITE_LOG_INFO("%s: Start\n", __func__);
   // Open a file named "tsi-op.txt" in the current directory for writing
@@ -1953,21 +1971,62 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     return false;
 }
 
-static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_device_context *ctx_dev,
-                                       const struct ggml_tensor *op) {
+static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
+
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
-  if (!ctx_dev)
-    return false;
+#if 0
+  static bool op_type[GGML_OP_COUNT] = {0};
+  if (op_type[op->op] == false){
+    printf("op->op %d %s\n", op->op, ggml_op_name(op->op));
+    op_type[op->op] = true;
+  }
+#endif
 
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
     return false;
 
+  switch (op->op) {
+  case GGML_OP_SET_ROWS:
+          return true;
+  case GGML_OP_GET_ROWS:
+          return true;
+#ifdef GGML_MUL_MAT_CPU_OPS
+  case GGML_OP_MUL_MAT:
+          if (!is_op_dtype_consistent_with_src(op))
+             return false;
+          return true;
+#endif
+  case GGML_OP_FLASH_ATTN_EXT:
+	  return false;
+  case GGML_OP_SOFT_MAX:
+          return true;
+  case GGML_OP_GET_ROWS_BACK:
+          return true;
+  case GGML_OP_ROPE:
+          return true;
+  case GGML_OP_ROPE_BACK:
+          return true;
+  case GGML_OP_RESHAPE:
+          return true;
+  case GGML_OP_VIEW:
+          return true;
+  case GGML_OP_TRANSPOSE:
+          return true;
+  case GGML_OP_CPY:
+          return true;
+  case GGML_OP_SET:
+          return true;
+  case GGML_OP_CONT:
+          return true;
+  default:
+	  break;
+	}
   if (!is_op_dtype_consistent_with_src(op))
     return false;
 
   switch (op->op) {
   case GGML_OP_NONE:
-          break;
+	  break;
 #ifdef TMU_SUPPORTED
   case GGML_OP_MUL_MAT:
 	  if (!mul_mat_supported_size(op))
@@ -2017,6 +2076,20 @@ static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_devic
   }
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
   return true;
+}
+
+static bool ggml_tsavorite_supports_op(const struct ggml_backend_tsavorite_device_context *ctx_dev,
+                                       const struct ggml_tensor *op) {
+  bool return_value = false;
+  GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
+
+  if (!ctx_dev)
+    return return_value;
+
+  return_value = ggml_tsavorite_internal_supports_op(op);
+
+  GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
+  return return_value;
 }
 
 /*
@@ -2721,11 +2794,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
 	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
-    if(kernel_sub_type == -1) {
-        printf("\n kernel_sub_type not suppored\n");
-        return GGML_STATUS_ABORTED;
-    }
-
     if (node->op == GGML_OP_RMS_NORM ||  node->op == GGML_OP_SOFT_MAX) {
         if (!glob_buf) {
             GGML_TSAVORITE_LOG_ERROR("tsi_alloc failied for creating memory for buf \n");
@@ -2739,7 +2807,39 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
         for(ii=0; ii <= 95; ++ii)
                vall[ii] = 0;
     }
+    struct ggml_compute_params params = {
+       .ith = 0,
+       .nth = 1,
+       .wsize = 1,
+       .wdata = glob_buf->data,
+       .threadpool = global_threadpool,
+    };
     switch (node->op) {
+    case GGML_OP_SET_ROWS:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SET_ROWS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_set_rows(&params, node);
+      break;
+    case GGML_OP_GET_ROWS:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_get_rows(&params, node);
+      break;
+    case GGML_OP_GET_ROWS_BACK:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS_BACK;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_get_rows_back(&params, node);
+      break;
+    case GGML_OP_ROPE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ROPE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_rope(&params, node);
+      break;
+    case GGML_OP_ROPE_BACK:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ROPE_BACK;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_rope_back(&params, node);
+      break;
     case GGML_OP_ADD:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_ADD;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
@@ -2774,11 +2874,25 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       break;
     case GGML_OP_SOFT_MAX:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX;
-      num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      //num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_soft_max(&params, node);
       break;
     case GGML_OP_MUL_MAT:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT;
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      // Disabling the tensor ignore and calling of CPU ops
+      // and use Tsavorite backend instead
+#ifdef GGML_MUL_MAT_CPU_OPS
+      // num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      // ggml_compute_forward_mul_mat(&params, node);
+#endif
+      break;
+    case GGML_OP_FLASH_ATTN_EXT:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_FLASH_ATTN_EXT;
+      //num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_flash_attn_ext(&params, node);
       break;
     case GGML_OP_GLU:
       kernel_type = tsi_glu_kernel_type(node);
@@ -2791,19 +2905,41 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
       num_of_input_tensors = TSAVORITE_TWO_INPUT_TENSORS;
       break;
     case GGML_OP_RESHAPE:
-        kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RESHAPE;
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-	break;
-    case GGML_OP_VIEW:
-        kernel_type = GGML_TSAVORITE_KERNEL_TYPE_VIEW;
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RESHAPE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_reshape(&params, node);
       break;
-  case GGML_OP_PERMUTE:
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-        break;
-  case GGML_OP_TRANSPOSE:
-        num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-        break;
+    case GGML_OP_VIEW:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_VIEW;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_reshape(&params, node);
+      break;
+    case GGML_OP_PERMUTE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_PERMUTE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_permute(&params, node);
+      break;
+    case GGML_OP_TRANSPOSE:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_TRANSPOSE;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_transpose(&params, node);
+      break;
+    case GGML_OP_SET:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SET;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_set(&params, node);
+      break;
+    case GGML_OP_CPY:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_CPY;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_cpy(&params, node);
+      break;
+    case GGML_OP_CONT:
+      kernel_type = GGML_TSAVORITE_KERNEL_TYPE_CONT;
+      num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
+      ggml_compute_forward_cont(&params, node);
+      break;
+
     case GGML_OP_UNARY:
       switch (ggml_get_unary_op(node)) {
       case GGML_UNARY_OP_NEG:
@@ -3158,7 +3294,14 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
         }
       }
     }
-    if (min_num_of_elem > 0) {
+    if (min_num_of_elem > 0
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SET_ROWS) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_GET_ROWS_BACK) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ROPE)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ROPE_BACK) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_TRANSPOSE)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RESHAPE) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_VIEW)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CPY) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SET)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CONT) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT)
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX) || (kernel_type == GGML_OP_FLASH_ATTN_EXT)) {
       ++device->stats.op_run_count[kernel_type].total_tensor_count;
 
       if (!(device->stats.op_run_count[kernel_type].min_num_of_elem) ||
@@ -3895,66 +4038,13 @@ static bool ggml_backend_tsavorite_device_supports_buft(ggml_backend_dev_t dev,
 // ggml_backend_sched_backend_id_from_cur  -> ggml_backend_offload_op ->
 static bool ggml_backend_tsavorite_device_offload_op(ggml_backend_dev_t dev,
                                                      const struct ggml_tensor *op) {
-  if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
-    return false;
+  bool return_value = false;
 
-  if (!is_op_dtype_consistent_with_src(op))
-    return false;
+  return_value = ggml_tsavorite_internal_supports_op(op);
 
-  switch (op->op) {
-  case GGML_OP_NONE:
-	  break;
-#ifdef TMU_SUPPORTED
-  case GGML_OP_MUL_MAT:
-	  if (!mul_mat_supported_size(op))
-		  return false;
-    break;
-#endif /* TMU_SUPPORTED */
-
-#ifdef TVU_SUPPORTED
-  case GGML_OP_ADD:
-  case GGML_OP_SUB:
-  case GGML_OP_DIV:
-  case GGML_OP_MUL:
-  case GGML_OP_SQRT:
-  case GGML_OP_SQR:
-  case GGML_OP_SIN:
-  case GGML_OP_RESHAPE:
-  case GGML_OP_VIEW:
-  case GGML_OP_PERMUTE:
-  case GGML_OP_TRANSPOSE:
-  case GGML_OP_RMS_NORM:
-
-#ifdef GGML_TARGET_POSIX_DEBUG
-  case GGML_OP_SOFT_MAX:
-#endif /* GGML_TARGET_POSIX_DEBUG */
-    break;
-
-  case GGML_OP_GLU:
-    {
-        const ggml_glu_op op_ext = ggml_get_glu_op(op);
-        if (op_ext != GGML_GLU_OP_SWIGLU)
-            return false;
-        break;
-    }
-  case GGML_OP_UNARY:
-    switch (ggml_get_unary_op(op)) {
-    case GGML_UNARY_OP_NEG:
-    case GGML_UNARY_OP_ABS:
-    case GGML_UNARY_OP_SIGMOID:
-    case GGML_UNARY_OP_SILU:
-      break;
-    default:
-      return false;
-    }
-    break;
-#endif /* TVU_SUPPORTED */
-  default:
-    return false;
-  }
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
-  return true;
   TSI_UNUSED(dev);
+  return return_value;
 }
 #ifdef SYNC_DEBUG
 static void ggml_backend_tsavorite_device_synchronize(ggml_backend_dev_t dev,
@@ -4013,11 +4103,185 @@ static ggml_backend_dev_t ggml_backend_tsavorite_reg_device_get(ggml_backend_reg
   GGML_UNUSED(index);
 }
 
+#ifdef GGML_MUL_MAT_CPU_OPS
+void ggml_backend_tsavorite_set_n_threads(ggml_backend_t backend_tsavorite, int n_threads) {
+    GGML_ASSERT(ggml_backend_is_tsavorite(backend_tsavorite));
+
+    struct ggml_backend_tsavorite_context * ctx = (struct ggml_backend_tsavorite_context *)backend_tsavorite->context;
+    ctx->n_threads = n_threads;
+}
+
+std::vector<ggml_backend_buffer_type_t> & ggml_backend_tsavorite_get_extra_buffer_types() {
+    static std::vector<ggml_backend_buffer_type_t> bufts = []() {
+        std::vector<ggml_backend_buffer_type_t> bufts;
+        return bufts;
+    }();
+
+    return bufts;
+}
+
+static ggml_backend_buffer_type_t * ggml_backend_tsavorite_device_get_extra_buffers_type(ggml_backend_dev_t device) {
+    static std::vector<ggml_backend_buffer_type_t> extra_bufts = [] {
+        std::vector<ggml_backend_buffer_type_t> bufts = ggml_backend_tsavorite_get_extra_buffer_types();
+        bufts.push_back(nullptr);
+        return bufts;
+    }();
+
+    return extra_bufts.data();
+
+    GGML_UNUSED(device);
+}
+#endif
+static ggml_backend_feature * ggml_backend_tsavorite_get_features(ggml_backend_reg_t reg) {
+    static std::vector<ggml_backend_feature> features = []() {
+        std::vector<ggml_backend_feature> features;
+        if (ggml_cpu_has_sse3()) {
+            features.push_back({ "SSE3", "1" });
+        }
+        if (ggml_cpu_has_ssse3()) {
+            features.push_back({ "SSSE3", "1" });
+        }
+        if (ggml_cpu_has_avx()) {
+            features.push_back({ "AVX", "1" });
+        }
+        if (ggml_cpu_has_avx_vnni()) {
+            features.push_back({ "AVX_VNNI", "1" });
+        }
+        if (ggml_cpu_has_avx2()) {
+            features.push_back({ "AVX2", "1" });
+        }
+        if (ggml_cpu_has_f16c()) {
+            features.push_back({ "F16C", "1" });
+        }
+        if (ggml_cpu_has_fma()) {
+            features.push_back({ "FMA", "1" });
+        }
+        if (ggml_cpu_has_bmi2()) {
+            features.push_back({ "BMI2", "1" });
+        }
+        if (ggml_cpu_has_avx512()) {
+            features.push_back({ "AVX512", "1" });
+        }
+        if (ggml_cpu_has_avx512_vbmi()) {
+            features.push_back({ "AVX512_VBMI", "1" });
+        }
+        if (ggml_cpu_has_avx512_vnni()) {
+            features.push_back({ "AVX512_VNNI", "1" });
+        }
+        if (ggml_cpu_has_avx512_bf16()) {
+            features.push_back({ "AVX512_BF16", "1" });
+        }
+        if (ggml_cpu_has_amx_int8()) {
+            features.push_back({ "AMX_INT8", "1" });
+        }
+        if (ggml_cpu_has_neon()) {
+            features.push_back({ "NEON", "1" });
+        }
+        if (ggml_cpu_has_arm_fma()) {
+            features.push_back({ "ARM_FMA", "1" });
+        }
+        if (ggml_cpu_has_fp16_va()) {
+            features.push_back({ "FP16_VA", "1" });
+        }
+        if (ggml_cpu_has_matmul_int8()) {
+            features.push_back({ "MATMUL_INT8", "1" });
+        }
+        if (ggml_cpu_has_sve()) {
+            features.push_back({ "SVE", "1" });
+        }
+        if (ggml_cpu_has_dotprod()) {
+            features.push_back({ "DOTPROD", "1" });
+        }
+        if (ggml_cpu_get_sve_cnt() > 0) {
+            static std::string sve_cnt = std::to_string(ggml_cpu_get_sve_cnt());
+            features.push_back({ "SVE_CNT", sve_cnt.c_str() });
+        }
+        if (ggml_cpu_has_sme()) {
+            features.push_back({ "SME", "1" });
+        }
+        if (ggml_cpu_has_riscv_v()) {
+            features.push_back({ "RISCV_V", "1" });
+        }
+        if (ggml_cpu_has_vsx()) {
+            features.push_back({ "VSX", "1" });
+        }
+        if (ggml_cpu_has_vxe()) {
+            features.push_back({ "VXE", "1" });
+        }
+        if (ggml_cpu_has_wasm_simd()) {
+            features.push_back({ "WASM_SIMD", "1" });
+        }
+        if (ggml_cpu_has_llamafile()) {
+            features.push_back({ "LLAMAFILE", "1" });
+        }
+    #ifdef GGML_USE_ACCELERATE
+        features.push_back({ "ACCELERATE", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_HBM
+        features.push_back({ "CPU_HBM", "1" });
+    #endif
+    #ifdef GGML_USE_OPENMP
+        features.push_back({ "OPENMP", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_KLEIDIAI
+        features.push_back({ "KLEIDIAI", "1" });
+    #endif
+    #ifdef GGML_USE_CPU_REPACK
+        features.push_back({ "REPACK", "1" });
+    #endif
+
+        features.push_back({ nullptr, nullptr });
+
+        return features;
+    }();
+
+    return features.data();
+
+    GGML_UNUSED(reg);
+}
+
+static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#ifdef GGML_MUL_MAT_CPU_OPS
+    if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        ggml_backend_set_n_threads_t fct = ggml_backend_tsavorite_set_n_threads;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_tsavorite_device_get_extra_buffers_type;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_get_features") == 0) {
+        return (void *)ggml_backend_tsavorite_get_features;
+    }
+    if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+        return (void *)ggml_backend_tsavorite_set_abort_callback;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_init") == 0) {
+        return (void *)ggml_numa_init;
+    }
+    if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
+        return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_threadpool_new") == 0) {
+        return (void *)ggml_threadpool_new;
+    }
+    if (strcmp(name, "ggml_threadpool_free") == 0) {
+        return (void *)ggml_threadpool_free;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
+        return (void *)ggml_backend_tsavorite_set_threadpool;
+    }
+#endif
+    return NULL;
+
+    GGML_UNUSED(reg);
+}
+
 static struct ggml_backend_reg_i ggml_backend_tsavorite_reg_i = {
     /* .get_name         = */ ggml_backend_tsavorite_reg_get_name,
     /* .device_count     = */ ggml_backend_tsavorite_reg_device_count,
     /* .device_get       = */ ggml_backend_tsavorite_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_tsavorite_get_proc_address,
 };
 
 #ifdef OLLAMA
