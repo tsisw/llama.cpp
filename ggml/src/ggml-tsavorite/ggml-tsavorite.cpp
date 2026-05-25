@@ -3301,7 +3301,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_RESHAPE) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_VIEW)
 		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CPY) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SET)
 		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_CONT) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_MUL_MAT)
-		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX) || (kernel_type == GGML_OP_FLASH_ATTN_EXT)) {
+		    || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_SOFT_MAX) || (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_FLASH_ATTN_EXT)) {
       ++device->stats.op_run_count[kernel_type].total_tensor_count;
 
       if (!(device->stats.op_run_count[kernel_type].min_num_of_elem) ||
