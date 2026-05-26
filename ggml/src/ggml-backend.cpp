@@ -981,11 +981,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             struct ggml_tensor * node = graph->nodes[i];
             int * node_backend_id = &tensor_backend_id(node);
             if (ggml_is_view_op(node->op)) {
-		if(node->src[0] && (sched->n_backends >= 1)) {
-	            *node_backend_id = sched->n_backends -1;
-		    node_backend_id  = &tensor_backend_id(node->src[0]); 
-	            *node_backend_id = sched->n_backends -1;
-		}
                 continue;
             }
             if (*node_backend_id != -1) {
@@ -995,11 +990,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 } else {
                     cur_backend_id = *node_backend_id;
                 }
-		// Below Code is Optimization which i am disabling for now since we have not implemented other
-		// Operation at tsavorite
-            } else { 
-                ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
-	    }
+            } else if (cur_backend_id != -1) {
+                ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
+            }
         }
     }
     // expand gpu up
