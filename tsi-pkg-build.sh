@@ -917,15 +917,31 @@ bundle_fpga() {
   mkdir -p "${TSI_GGML_BUNDLE_INSTALL_DIR}"
   rm -f "${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh"
 
-  cat > "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh" <<'EOL'
+cat > "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh" <<'EOL'
 #!/bin/bash
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
+
 tsi_kernels=("add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu" \
-"add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16" "mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128")
+"add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16" \
+"mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128")
+
+# copy normal kernels (same as before)
 for kernel in "${tsi_kernels[@]}"; do
   mkdir -p __TSI_BLOB_INSTALL_DIR__/txe_${kernel}
   cp blobs __TSI_BLOB_INSTALL_DIR__/txe_${kernel}/ -r
 done
+
+# ---------- (ONLY Triton) ----------
+TRITON_SRC="__TSI_BLOB_INSTALL_DIR__/txe_add/blobs/trition_add/txe_blob_0.blob"
+TRITON_DST="__TSI_BLOB_INSTALL_DIR__/txe_add_trition/blobs"
+
+rm -rf "${TRITON_DST}"
+mkdir -p "${TRITON_DST}"
+
+if [ -f "${TRITON_SRC}" ]; then
+  cp "${TRITON_SRC}" "${TRITON_DST}/txe_blob_0.blob"
+fi
+# --------------------------------------
 EOL
 
   sed -i "s|__TSI_BLOB_INSTALL_DIR__|${TSI_BLOB_INSTALL_DIR}|g" "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh"
