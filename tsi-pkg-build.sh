@@ -933,7 +933,7 @@ done
 
 # ---------- (ONLY Triton) ----------
 TRITON_SRC="__TSI_BLOB_INSTALL_DIR__/txe_add/blobs/trition_add/txe_blob_0.blob"
-TRITON_DST="__TSI_BLOB_INSTALL_DIR__/txe_add_trition/blobs"
+TRITON_DST="__TSI_BLOB_INSTALL_DIR__/txe_trition_add/blobs"
 
 rm -rf "${TRITON_DST}"
 mkdir -p "${TRITON_DST}"
