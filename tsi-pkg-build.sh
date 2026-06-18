@@ -570,17 +570,16 @@ resolve_paths() {
         TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
     fi
 
-    MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")" \
-        || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
+    MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
+    [ -n "${MLIR_COMPILER_DIR}" ] || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
 
-    TOOLBOX_DIR="$(absdir "${TOOLBOX_DIR_IN}")" \
-        || die "TOOLBOX_DIR not found: ${TOOLBOX_DIR_IN}"
+    TOOLBOX_DIR="$(absdir "${TOOLBOX_DIR_IN}")"
+    [ -n "${TOOLBOX_DIR}" ] || die "TOOLBOX_DIR not found: ${TOOLBOX_DIR_IN}"
 
-    # Derive TSICommon_DIR from TOOLBOX_DIR (SDK 0.4.1 compatible)
     TSICommon_DIR="${TOOLBOX_DIR}/lib/cmake/TSICommon"
     [ -d "${TSICommon_DIR}" ] || die "TSICommon_DIR not found: ${TSICommon_DIR}"
-    export TSICommon_DIR
 
+    export TSICommon_DIR
     export MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR}")}"
     export MLIR_COMPILER_DIR
     export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
@@ -603,7 +602,7 @@ setup_toolchain() {
 # Python venv (only when needed for blob generation)
 # -------------------------
 setup_python() {
-  # Save the caller's current VIRTUAL_ENV (if any). This allows restore.
+  # Save caller venv so cleanup() can restore it.
   __OLD_VIRTUAL_ENV="${VIRTUAL_ENV:-}"
 
   if [ "${OVERWRITE_VENV}" -eq 1 ] && [ -d "blob-creation" ]; then
@@ -616,25 +615,48 @@ setup_python() {
     # shellcheck disable=SC1091
     source blob-creation/bin/activate || return 1
     [ "${VIRTUAL_ENV:-}" != "${__OLD_VIRTUAL_ENV:-}" ] && __TSI_CHANGED_VENV=1 || true
-    return 0
+  else
+    run /proj/local/Python-3.11.12/bin/python3 -m venv blob-creation || return 1
+    run bash -c 'source blob-creation/bin/activate && python -V >/dev/null' || return 1
+    # shellcheck disable=SC1091
+    source blob-creation/bin/activate || return 1
+    [ "${VIRTUAL_ENV:-}" != "${__OLD_VIRTUAL_ENV:-}" ] && __TSI_CHANGED_VENV=1 || true
   fi
 
-  run /proj/local/Python-3.11.12/bin/python3 -m venv blob-creation || return 1
-  run bash -c 'source blob-creation/bin/activate && python -V >/dev/null' || return 1
-  # shellcheck disable=SC1091
-  source blob-creation/bin/activate || return 1
-  [ "${VIRTUAL_ENV:-}" != "${__OLD_VIRTUAL_ENV:-}" ] && __TSI_CHANGED_VENV=1 || true
-
-  log_info "installing mlir and python dependencies"
+  log_info "installing mlir / triton python dependencies from SDK"
   run pip install --upgrade pip || return 1
 
-  # Keep torch install as before (this is what your logs show)
-  run pip install torch==2.7.0 || return 1
-
-  # ---- FIX for SDK 0.4.1: requirements-common.txt may include "-r /python/...."
   local REQ_DIR="${MLIR_COMPILER_DIR}/python"
-  local REQ_MAIN="${REQ_DIR}/requirements-common.txt"
+  local TRITON_DIR="${MLIR_SDK_VERSION}/triton"
 
+  [ -d "${REQ_DIR}" ] || die "MLIR python directory not found: ${REQ_DIR}"
+  [ -d "${TRITON_DIR}" ] || die "SDK Triton directory not found: ${TRITON_DIR}"
+
+  # ---------------------------------------------------------------------------
+  # Install latest mlir_external_packages wheel from SDK compiler/python
+  # (your manual flow tried 1.8.2, 1.8.3, 1.9.1; safest is pick highest version)
+  # ---------------------------------------------------------------------------
+  local MLIR_WHL
+  MLIR_WHL="$(ls -1 "${REQ_DIR}"/mlir_external_packages-*.whl 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "${MLIR_WHL}" ] || die "No mlir_external_packages-*.whl found in ${REQ_DIR}"
+  log_info "Installing MLIR wheel: ${MLIR_WHL}"
+  run pip install "${MLIR_WHL}" || return 1
+
+  # ---------------------------------------------------------------------------
+  # Install latest Tsavorite Triton wheel from SDK triton/
+  # (your manual flow used triton_tsiai-1.0.0 / 0.1.3)
+  # ---------------------------------------------------------------------------
+  local TRITON_WHL
+  TRITON_WHL="$(ls -1 "${TRITON_DIR}"/triton_tsiai-*.whl 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "${TRITON_WHL}" ] || die "No triton_tsiai-*.whl found in ${TRITON_DIR}"
+  log_info "Installing Triton wheel: ${TRITON_WHL}"
+  run pip install "${TRITON_WHL}" || return 1
+
+  # ---------------------------------------------------------------------------
+  # Install compiler python requirements
+  # Keep the existing rewrite for bad '-r /python/...' includes
+  # ---------------------------------------------------------------------------
+  local REQ_MAIN="${REQ_DIR}/requirements-common.txt"
   if [ ! -f "${REQ_MAIN}" ]; then
     die "requirements-common.txt not found: ${REQ_MAIN}"
   fi
@@ -642,24 +664,43 @@ setup_python() {
   if grep -qE '^[[:space:]]*-r[[:space:]]+/python/' "${REQ_MAIN}"; then
     log_info "requirements-common.txt contains absolute /python includes; rewriting to ${REQ_DIR}"
     local REQ_TMP
-    REQ_TMP="$(mktemp -t tsi-req-XXXXXX.txt)"
+    REQ_TMP="$(mktemp -t tsi-req-XXXXXX.txt)" || return 1
     sed -E "s|(^[[:space:]]*-r[[:space:]]+)/python/|\\1${REQ_DIR}/|g" "${REQ_MAIN}" > "${REQ_TMP}"
-    run pip install -r "${REQ_TMP}" || { rm -f "${REQ_TMP}" >/dev/null 2>&1 || true; return 1; }
+    run pip install -r "${REQ_TMP}" || {
+      rm -f "${REQ_TMP}" >/dev/null 2>&1 || true
+      return 1
+    }
     rm -f "${REQ_TMP}" >/dev/null 2>&1 || true
   else
     run pip install -r "${REQ_MAIN}" || return 1
   fi
-  # ---- END FIX
 
-  local MLIR_WHL
-  MLIR_WHL="$(ls "${MLIR_COMPILER_DIR}/python"/mlir_external_packages-*.whl 2>/dev/null | head -1 || true)"
-  if [ -n "${MLIR_WHL}" ]; then
-    run pip install "${MLIR_WHL}" || return 1
-  else
-    log_info "WARNING: mlir_external_packages wheel not found in ${MLIR_COMPILER_DIR}/python/"
+  # Optional packages that your manual flow used later
+  if ! pip show torch >/dev/null 2>&1; then
+    run pip install torch==2.7.0 || return 1
   fi
 
-  run pip install onnxruntime-training || return 1
+  if ! pip show onnxruntime-training >/dev/null 2>&1; then
+    run pip install onnxruntime-training || return 1
+  fi
+
+  # ---------------------------------------------------------------------------
+  # Export runtime/library paths needed by create-all-kernels.sh
+  # based on your manual env setup
+  # ---------------------------------------------------------------------------
+  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/toolbox/build/install-posix/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/lib:${LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-wrapper/lib:${LD_LIBRARY_PATH}"
+
+  export LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/lib:${LIBRARY_PATH:-}"
+  export LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-wrapper/lib:${LIBRARY_PATH}"
+
+  # Helpful trace
+  log_info "Python: $(python -V 2>/dev/null)"
+  log_info "Using MLIR wheel: ${MLIR_WHL}"
+  log_info "Using Triton wheel: ${TRITON_WHL}"
+  python -c "import triton; print('INFO: triton module:', triton.__file__)" || return 1
+
   return 0
 }
 
@@ -954,19 +995,45 @@ do_clean_all() {
 
 main() {
   set -o pipefail
+
   local arch
+  local ORIG_PWD
+  ORIG_PWD="$(pwd)"
+
   arch="$(select_arch)" || return $?
   parse_args "$@" || return $?
+
   if [ "${SHOW_HELP}" -eq 1 ]; then
     usage
     return 0
   fi
-  if [ "${DO_CLEAN_ALL}" -eq 1 ]; then do_clean_all; return 0; fi
-  if [ "${DO_CLEAN}" -eq 1 ]; then do_clean; return 0; fi
 
-  resolve_paths "$arch" || return $?
-  setup_toolchain || return 1
-  ensure_submodules "${GIT_SUBMODULE_PULL}" || return 1
+  if [ "${DO_CLEAN_ALL}" -eq 1 ]; then
+    do_clean_all
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if [ "${DO_CLEAN}" -eq 1 ]; then
+    do_clean
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  resolve_paths "$arch" || {
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return $?
+  }
+
+  setup_toolchain || {
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return 1
+  }
+
+  ensure_submodules "${GIT_SUBMODULE_PULL}" || {
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return 1
+  }
 
   local need_python=0
   if [ "${OVERWRITE_VENV}" -eq 1 ] || [ "${DO_BLOB_FPGA}" -eq 1 ] || [ "${DO_BLOB_POSIX}" -eq 1 ]; then
@@ -977,7 +1044,11 @@ main() {
   local auto_fpga_blob=0
 
   if [ "${AUTO_BLOBS}" -eq 1 ]; then
-    cd "${SUBMODULE_DIR}" || return 1
+    cd "${SUBMODULE_DIR}" || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
+
     if [ "${DO_BUILD_POSIX}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE}" -eq 1 ]; then
       if ! posix_host_objs_present; then
         auto_posix_blob=1
@@ -986,6 +1057,7 @@ main() {
         DO_BLOB_POSIX=1
       fi
     fi
+
     if [ "${DO_BUILD_FPGA}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE}" -eq 1 ]; then
       if ! fpga_host_objs_present; then
         auto_fpga_blob=1
@@ -994,59 +1066,104 @@ main() {
         DO_BLOB_FPGA=1
       fi
     fi
-    cd .. || return 1
+
+    cd "${ORIG_PWD}" || return 1
   fi
 
   if [ "${need_python}" -eq 1 ] && ( [ "${DO_BLOB_FPGA}" -eq 1 ] || [ "${DO_BLOB_POSIX}" -eq 1 ] ); then
-    cd "${SUBMODULE_DIR}" || die "cannot enter ggml-tsi-kernel"
-    setup_python || return 1
-    [ "${DO_BLOB_FPGA}" -eq 1 ] && build_fpga_blobs || return 1
-    [ "${DO_BLOB_POSIX}" -eq 1 ] && build_posix_blobs || return 1
-    cd .. || return 1
+    (
+      cd "${SUBMODULE_DIR}" || exit 1
+      setup_python || exit 1
+      [ "${DO_BLOB_FPGA}" -eq 1 ] && build_fpga_blobs || exit 1
+      [ "${DO_BLOB_POSIX}" -eq 1 ] && build_posix_blobs || exit 1
+    )
+    local rc=$?
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    [ $rc -eq 0 ] || return $rc
   fi
 
   if [ "${DO_BUILD_POSIX}" -eq 1 ]; then
-    build_posix || return 1
-    wrap_glibc_bins "build-posix" || return 1
+    build_posix || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
+    wrap_glibc_bins "build-posix" || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
   fi
+
   if [ "${DO_BUILD_POSIX_TMU_ONLY}" -eq 1 ]; then
-    build_posix_tmu_only || return 1
-    wrap_glibc_bins "build-posix-tmu-only" || return 1
+    build_posix_tmu_only || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
+    wrap_glibc_bins "build-posix-tmu-only" || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
   fi
+
   if [ "${DO_BUILD_POSIX_TMU_DISABLE}" -eq 1 ]; then
-    build_posix_tmu_disable || return 1
-    wrap_glibc_bins "build-posix-tmu-disable" || return 1
+    build_posix_tmu_disable || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
+    wrap_glibc_bins "build-posix-tmu-disable" || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
   fi
 
   if [ "${DO_BUILD_FPGA}" -eq 1 ]; then
-    build_fpga || return 1
+    build_fpga || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
     PACKAGE_FPGA_BUILD_DIR="${PACKAGE_FPGA_BUILD_DIR:-build-fpga}"
   fi
+
   if [ "${DO_BUILD_FPGA_TMU_ONLY}" -eq 1 ]; then
-    build_fpga_tmu_only || return 1
+    build_fpga_tmu_only || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
     PACKAGE_FPGA_BUILD_DIR="${PACKAGE_FPGA_BUILD_DIR:-build-fpga-tmu-only}"
   fi
+
   if [ "${DO_BUILD_FPGA_TMU_DISABLE}" -eq 1 ]; then
-    build_fpga_tmu_disable || return 1
+    build_fpga_tmu_disable || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
     PACKAGE_FPGA_BUILD_DIR="${PACKAGE_FPGA_BUILD_DIR:-build-fpga-tmu-disable}"
   fi
 
   if [ "${DO_PACKAGE_FPGA}" -eq 1 ]; then
     local pkg_dir
     pkg_dir="$(choose_existing_fpga_build_dir_for_package)"
-    [ -n "${pkg_dir}" ] || die "package requested but no FPGA build output found (expected build-fpga / build-fpga-tmu-only / build-fpga-tmu-disable)."
-    bundle_fpga "${pkg_dir}" || return 1
+    [ -n "${pkg_dir}" ] || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      die "package requested but no FPGA build output found (expected build-fpga / build-fpga-tmu-only / build-fpga-tmu-disable)."
+    }
+    bundle_fpga "${pkg_dir}" || {
+      cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+      return 1
+    }
   fi
 
   if [ "${auto_posix_blob}" -eq 1 ]; then
     log_info "NOTE: POSIX blobs were auto-built because they are required for linking _mlir_ciface_*_host."
   fi
+
   if [ "${auto_fpga_blob}" -eq 1 ]; then
     log_info "NOTE: FPGA blobs were auto-built because they are required for linking _mlir_ciface_*_host."
   fi
 
+  cd "${ORIG_PWD}" >/dev/null 2>&1 || true
   return 0
 }
+
 
 if [ "$__TSI_SOURCED" -eq 1 ]; then
   trap cleanup RETURN
