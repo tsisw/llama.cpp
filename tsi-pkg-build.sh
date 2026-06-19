@@ -644,7 +644,7 @@ setup_python() {
 
   # ---------------------------------------------------------------------------
   # Install latest Tsavorite Triton wheel from SDK triton/
-  # (your manual flow used triton_tsiai-1.0.0 / 0.1.3)
+  # (manual flow used triton_tsiai-1.0.0 / 0.1.3)
   # ---------------------------------------------------------------------------
   local TRITON_WHL
   TRITON_WHL="$(ls -1 "${TRITON_DIR}"/triton_tsiai-*.whl 2>/dev/null | sort -V | tail -1 || true)"
