@@ -925,23 +925,24 @@ tsi_kernels=("add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigm
 "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16" \
 "mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128")
 
-# copy normal kernels (same as before)
 for kernel in "${tsi_kernels[@]}"; do
-  mkdir -p __TSI_BLOB_INSTALL_DIR__/txe_${kernel}
-  cp blobs __TSI_BLOB_INSTALL_DIR__/txe_${kernel}/ -r
+  dst="__TSI_BLOB_INSTALL_DIR__/txe_${kernel}/blobs"
+  rm -rf "${dst}"
+  mkdir -p "${dst}"
+
+  if [ -f "blobs/txe_${kernel}.blob" ]; then
+    cp "blobs/txe_${kernel}.blob" "${dst}/txe_${kernel}.blob"
+  fi
 done
 
-# ---------- (ONLY Triton) ----------
-TRITON_SRC="__TSI_BLOB_INSTALL_DIR__/txe_add/blobs/trition_add/txe_blob_0.blob"
-TRITON_DST="__TSI_BLOB_INSTALL_DIR__/txe_trition_add/blobs"
+# Triton ADD
+dst="__TSI_BLOB_INSTALL_DIR__/txe_trition_add/blobs"
+rm -rf "${dst}"
+mkdir -p "${dst}"
 
-rm -rf "${TRITON_DST}"
-mkdir -p "${TRITON_DST}"
-
-if [ -f "${TRITON_SRC}" ]; then
-  cp "${TRITON_SRC}" "${TRITON_DST}/txe_blob_0.blob"
+if [ -f "blobs/trition_add/txe_blob_0.blob" ]; then
+  cp "blobs/txe_trition_add/txe_blob_0.blob" "${dst}/txe_blob_0.blob"
 fi
-# --------------------------------------
 EOL
 
   sed -i "s|__TSI_BLOB_INSTALL_DIR__|${TSI_BLOB_INSTALL_DIR}|g" "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh"
