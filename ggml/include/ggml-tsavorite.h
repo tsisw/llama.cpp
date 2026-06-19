@@ -200,6 +200,7 @@ typedef enum tsi_data_type_ {
 /*
  * FP32
  */
+extern void _mlir_ciface_add_kernel_memory_wrapper(void *a, void *b, void *res, void *scalar_loop, void *scalar_grid1, void *scalar_grid2, void *scalar_grid3);
 extern void _mlir_ciface_txe_add_host(void *a, void *b, void *res);
 extern void _mlir_ciface_txe_sub_host(void *a, void *b, void *res);
 extern void _mlir_ciface_txe_mult_host(void *a, void *b, void *res);
