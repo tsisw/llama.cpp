@@ -3336,7 +3336,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     ++node->tsi_kernel_runs;
                 }
             }
-         }
+        }
         }
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
