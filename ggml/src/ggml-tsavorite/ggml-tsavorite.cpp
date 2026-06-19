@@ -70,6 +70,16 @@ struct TsavoriteRuntimeState {
     // one packed-args buffer per TXE
     std::vector<void *> packed_args;
 
+    std::vector<void *> scalar_loop_args;
+
+    std::vector<void *> scalar_m_args;
+    std::vector<void *> scalar_n_args;
+    std::vector<void *> scalar_k_args;
+
+    std::vector<void *> scalar_grid1_args;
+    std::vector<void *> scalar_grid2_args;
+    std::vector<void *> scalar_grid3_args;
+
     std::vector<std::thread> workers;
     std::mutex workers_mutex;
     std::mutex device_mutex;
@@ -102,6 +112,15 @@ auto &num_of_txes = g_rt.num_of_txes;
 auto &device_free = g_rt.device_free;
 auto &multi_thread_enable     = g_rt.multi_thread_enable;
 auto &packed_args     = g_rt.packed_args;
+
+auto &scalar_loop_args        = g_rt.scalar_loop_args;
+auto &scalar_m_args           = g_rt.scalar_m_args;
+auto &scalar_n_args           = g_rt.scalar_n_args;
+auto &scalar_k_args           = g_rt.scalar_k_args;
+
+auto &scalar_grid1_args       = g_rt.scalar_grid1_args;
+auto &scalar_grid2_args       = g_rt.scalar_grid2_args;
+auto &scalar_grid3_args       = g_rt.scalar_grid3_args;
 
 auto &workers = g_rt.workers;
 auto &workers_mutex = g_rt.workers_mutex;
@@ -643,14 +662,78 @@ static inline void tsi_init_per_txe_state_once() {
 
     // allocate per-TXE packed args buffer (device-visible)
     constexpr size_t kPackedArgsBytesMax = 2048;
+    constexpr size_t scalarLoopBytesMax  = 2048;
 
     if (packed_args.size() != num_of_txes) {
         packed_args.assign(num_of_txes, nullptr);
+
+        scalar_loop_args.assign(num_of_txes, nullptr);
+        scalar_m_args.assign(num_of_txes, nullptr);
+        scalar_n_args.assign(num_of_txes, nullptr);
+        scalar_k_args.assign(num_of_txes, nullptr);
+
+        scalar_grid1_args.assign(num_of_txes, nullptr);
+        scalar_grid2_args.assign(num_of_txes, nullptr);
+        scalar_grid3_args.assign(num_of_txes, nullptr);
         for (uint32_t i = 0; i < num_of_txes; ++i) {
             if (!packed_args[i]) {
                 packed_args[i] = tsi_alloc(kPackedArgsBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
                 if (!packed_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for packed_args[%u]\n", i);
+                    abort();
+                }
+            }
+
+            if (!scalar_loop_args[i]) {
+                scalar_loop_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_loop_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_loop_args[%u]\n", i);
+                    abort();
+                }
+            }
+            if (!scalar_m_args[i]) {
+                scalar_m_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_m_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_m_args[%u]\n", i);
+                    abort();
+                }
+            }
+
+            if (!scalar_n_args[i]) {
+                scalar_n_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_n_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_n_args[%u]\n", i);
+                    abort();
+                }
+            }
+
+            if (!scalar_k_args[i]) {
+                scalar_k_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_k_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_k_args[%u]\n", i);
+                    abort();
+                }
+            }
+
+
+            if (!scalar_grid1_args[i]) {
+                scalar_grid1_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_grid1_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_grid1_args[%u]\n", i);
+                    abort();
+                }
+            }
+            if (!scalar_grid2_args[i]) {
+                scalar_grid2_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_grid2_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_grid2_args[%u]\n", i);
+                    abort();
+                }
+            }
+            if (!scalar_grid3_args[i]) {
+                scalar_grid3_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                if (!scalar_grid3_args[i]) {
+                    fprintf(stderr, "tsi_alloc failed for scalar_grid3_args[%u]\n", i);
                     abort();
                 }
             }
@@ -1153,6 +1236,21 @@ static void tsi_blob_execution_internal(void *commandList) {
 }
 
 
+// NOTE:
+// Triton ADD kernel supports a host_wrapper-based invocation path today.
+// For Multi-TXE support, we plan to bypass the generated host_wrapper and
+// directly invoke the runtime shim API with manually packed arguments.
+//
+// However, the exact argument packing (ABI/layout) used by Triton-generated
+// kernels is currently not well understood. Due to this, the direct
+// pack-args + runtime shim path is temporarily disabled
+//
+// This will be revisited once we fully reverse-engineer or document the
+// Triton argument packing format through experiments and validation.
+//
+// Follow-up work tracked here:
+// https://tsavoritesi.atlassian.net/browse/FIR-1984
+#if TRITON_MULTI_TXE
 //lock goes out of scope
 // <--- function scope ends here mutex will be released
 //tsi_pack_mutex.unlock() is called automatically
@@ -1261,6 +1359,7 @@ static void _mlir_ciface_txe_add_host_new(void *a, void *b, void *res) {
        });
     }
 }
+#endif /* TRITON_MULTI_TXE */
 
 static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TSI_DeviceIdType deviceId) {
     constexpr int64_t kPackedArgsI64   = 9;
@@ -1477,11 +1576,15 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
           if (ggml_tsavorite_kernel_mode_flag == GGML_TSAVORITE_KERNEL_MODE_CPU)
               kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_test;
           else {
+// TODO(FIR-1984): Will be addressed as part of Triton multi-TXE packed-args support
+#if TRITON_MULTI_TXE
               #ifdef GGML_TARGET_POSIX
                   kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host;
               #else
                   kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host_new;
               #endif /* GGML_TARGET_POSIX */
+#endif /* TRITON_MULTI_TXE */
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host;
               kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_add_16_host;
 	  }
           kernel_pipeline->kernel_name = "TXE_ADD";
@@ -3137,7 +3240,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 	    } else {
 
             GGML_TENSOR_BINARY_OP_LOCALS
-
             for (int ir = 0; ir < nr; ++ir) {
                 const int64_t i03 = ir / (ne02 * ne01);
                 const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
@@ -3156,19 +3258,88 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 	        // (i.e., the first dimension) for all blob-related processing.
 
                 for (int64_t r = 0; r < nr0; ++r) {
+                   memset(srcP0, 0, sizeof(MemRefDescriptor<Rank>));
+                   memset(srcP1, 0, sizeof(MemRefDescriptor<Rank>));
+                   memset(nodeP, 0, sizeof(MemRefDescriptor<Rank>));
+
+
+
                     srcP0->shape[0]   = ne10;
+                    srcP0->offset     = 0;
+
                     srcP1->shape[0]   = ne10;
+                    srcP1->offset     = 0;
+
                     nodeP->shape[0]   = ne10;
+                    nodeP->offset     = 0;
+
                     srcP1->data =  srcP1->base = (void *)(src1_ptr);
                     srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
                     nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
                     // kernel call
-                    ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
+                       //printf("\n  CALLING GGML_OP_ADD -0 \n");
+                    if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
+                        // MemRefDescriptor
+                        int32_t *scalar_val; 
+                        srcP0->strides[0] = 1;
+                        srcP1->strides[0] = 1;
+                        nodeP->strides[0] = 1;
+                        MemRefDescriptor<Rank> *scalar_loop;
+                        MemRefDescriptor<Rank> *scalar_grid1;
+                        MemRefDescriptor<Rank> *scalar_grid2;
+                        MemRefDescriptor<Rank> *scalar_grid3;
+
+                        scalar_loop = (MemRefDescriptor<Rank> *)scalar_loop_args[0];
+                        scalar_grid1 = (MemRefDescriptor<Rank> *)scalar_grid1_args[0];
+                        scalar_grid2 = (MemRefDescriptor<Rank> *)scalar_grid2_args[0];
+                        scalar_grid3 = (MemRefDescriptor<Rank> *)scalar_grid3_args[0];
+
+                        memset(scalar_loop, 0, sizeof(MemRefDescriptor<Rank>));
+                        memset(scalar_grid1, 0, sizeof(MemRefDescriptor<Rank>));
+                        memset(scalar_grid2, 0, sizeof(MemRefDescriptor<Rank>));
+                        memset(scalar_grid3, 0, sizeof(MemRefDescriptor<Rank>));
+
+                        scalar_loop->shape[0] = 1;
+                        scalar_loop->data = scalar_loop->base = (void *)(scalar_loop+1);
+                        scalar_loop->offset = 0;
+
+                        scalar_val = (int32_t *)(scalar_loop+1);
+                        *scalar_val = (int32_t)srcP0->shape[0];
+
+                        scalar_grid1->shape[0] = 1;
+                        scalar_grid1->data = scalar_grid1->base = (void *)(scalar_grid1 +1);
+                        scalar_grid1->offset = 0;
+
+                        scalar_val = (int32_t *)(scalar_grid1+1);
+                        *scalar_val = 1;
+
+                        scalar_grid2->shape[0] = 1;
+                        scalar_grid2->data = scalar_grid2->base = (void *)(scalar_grid2 +1);
+                        scalar_grid2->offset = 0;
+
+                        scalar_val = (int32_t *)(scalar_grid2+1);
+                        *scalar_val = 1;
+
+                        scalar_grid3->shape[0] = 1;
+                        scalar_grid3->data = scalar_grid3->base = (void *)(scalar_grid3 +1);
+                        scalar_grid3->offset = 0;
+
+                        scalar_val = (int32_t *)(scalar_grid3+1);
+                        *scalar_val = 1;
+
+                        //ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, scalar_loop);
+                        _mlir_ciface_add_kernel_memory_wrapper(srcP0, srcP1, nodeP,
+                                        scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3);
+                        //ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
+                       //printf("\n  CALLING GGML_OP_ADD DONE\n");
+                    } else {
+                        ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
+                    }
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                     ++node->tsi_kernel_runs;
                 }
             }
-        }
+         }
         }
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {

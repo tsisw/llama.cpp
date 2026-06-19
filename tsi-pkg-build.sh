@@ -936,12 +936,12 @@ for kernel in "${tsi_kernels[@]}"; do
 done
 
 # Triton ADD
-dst="__TSI_BLOB_INSTALL_DIR__/txe_trition_add/blobs"
+dst="__TSI_BLOB_INSTALL_DIR__/txe_triton_add/blobs"
 rm -rf "${dst}"
 mkdir -p "${dst}"
 
-if [ -f "blobs/trition_add/txe_blob_0.blob" ]; then
-  cp "blobs/txe_trition_add/txe_blob_0.blob" "${dst}/txe_blob_0.blob"
+if [ -f "blobs/txe_triton_add/txe_blob_0.blob" ]; then
+  cp "blobs/txe_triton_add/txe_blob_0.blob" "${dst}/txe_blob_0.blob"
 fi
 EOL
 
