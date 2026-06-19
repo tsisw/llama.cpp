@@ -3277,7 +3277,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
                     nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
                     // kernel call
-                       //printf("\n  CALLING GGML_OP_ADD -0 \n");
                     if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
                         // MemRefDescriptor
                         int32_t *scalar_val; 
@@ -3330,8 +3329,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         //ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, scalar_loop);
                         _mlir_ciface_add_kernel_memory_wrapper(srcP0, srcP1, nodeP,
                                         scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3);
-                        //ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
-                       //printf("\n  CALLING GGML_OP_ADD DONE\n");
                     } else {
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
                     }
