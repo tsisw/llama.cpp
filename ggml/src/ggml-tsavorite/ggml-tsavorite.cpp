@@ -2472,7 +2472,6 @@ static inline void call_triton_matmul_blob_k(
     void *C_tile,         // blob-style: [TMU_M_TILE_MAX x TMU_N_BLOCK], row-major
     int32_t M_tile,       // actual valid rows
     int32_t N_tile) {     // actual valid cols
-
     constexpr int32_t TRITON_M_TILE = 8;
     constexpr int32_t TRITON_N_TILE = 64;
 
@@ -2499,6 +2498,7 @@ static inline void call_triton_matmul_blob_k(
     static int32_t *grid3_payload = nullptr;
 
     static bool inited = false;
+
     if (!inited) {
         A_triton = (float *) tsi_alloc((size_t) TRITON_M_TILE * (size_t) K * sizeof(float));
         B_triton = (float *) tsi_alloc((size_t) K * (size_t) TRITON_N_TILE * sizeof(float));
@@ -2536,6 +2536,7 @@ static inline void call_triton_matmul_blob_k(
         TSAVORITE_GGML_ASSERT((((uintptr_t) A_desc) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) B_desc) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) C_desc) & 127) == 0);
+
         TSAVORITE_GGML_ASSERT((((uintptr_t) M_desc) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) N_desc) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) K_desc) & 127) == 0);
@@ -2555,12 +2556,19 @@ static inline void call_triton_matmul_blob_k(
 
     const float *A_blob = (const float *) A_tile;   // [TMU_M_TILE_MAX x K]
     const float *B_blob = (const float *) B_tile;   // [TMU_N_BLOCK    x K] == [N x K]
-    float       *C_blob = (float *) C_tile;         // [TMU_M_TILE_MAX x TMU_N_BLOCK]
+    float       *C_blob = (float       *) C_tile;   // [TMU_M_TILE_MAX x TMU_N_BLOCK]
 
-    // B: blob-style [N x K] -> Triton physical [K x 64], padded
+    // -------------------------------------------------------------------------
+    // B adapter:
+    // Blob-style B is [N x K].
+    // Triton expects B as row-major [K x N].
+    // Physical N stride is always TRITON_N_TILE = 64.
+    // -------------------------------------------------------------------------
     memset(B_triton, 0, (size_t) K * (size_t) TRITON_N_TILE * sizeof(float));
+
     for (int32_t n = 0; n < N_tile; ++n) {
         const float *src_row = B_blob + (size_t) n * (size_t) K;
+
         for (int32_t kk = 0; kk < K; ++kk) {
             B_triton[(size_t) kk * (size_t) TRITON_N_TILE + (size_t) n] = src_row[kk];
         }
@@ -2570,31 +2578,68 @@ static inline void call_triton_matmul_blob_k(
         const int32_t m_valid =
             (M_tile - m0 > TRITON_M_TILE) ? TRITON_M_TILE : (M_tile - m0);
 
-        // A: blob row-major -> Triton physical [8 x K], padded
+        // ---------------------------------------------------------------------
+        // A adapter:
+        // Blob-style A is [M x K].
+        // Triton expects A as [8 x K].
+        // Zero-pad invalid rows.
+        // ---------------------------------------------------------------------
         memset(A_triton, 0, (size_t) TRITON_M_TILE * (size_t) K * sizeof(float));
+
         for (int32_t r = 0; r < m_valid; ++r) {
             const float *src_row = A_blob + (size_t) (m0 + r) * (size_t) K;
-            float *dst_row = A_triton + (size_t) r * (size_t) K;
+            float       *dst_row = A_triton + (size_t) r * (size_t) K;
+
             memcpy(dst_row, src_row, (size_t) K * sizeof(float));
         }
 
-        // C carry-in
+        // ---------------------------------------------------------------------
+        // C carry-in:
+        // Blob-style C is [M x TMU_N_BLOCK].
+        // Triton physical C is [8 x 64].
+        // Copy only valid rows/cols into padded C_triton.
+        // ---------------------------------------------------------------------
         memset(C_triton, 0, (size_t) TRITON_M_TILE * (size_t) TRITON_N_TILE * sizeof(float));
+
         for (int32_t r = 0; r < m_valid; ++r) {
             const float *src_row = C_blob + (size_t) (m0 + r) * (size_t) TMU_N_BLOCK;
-            float *dst_row = C_triton + (size_t) r * (size_t) TRITON_N_TILE;
+            float       *dst_row = C_triton + (size_t) r * (size_t) TRITON_N_TILE;
+
             for (int32_t n = 0; n < N_tile; ++n) {
                 dst_row[n] = src_row[n];
             }
         }
 
-        // IMPORTANT: logical flattened lengths, not padded physical lengths
-        init_rank1_memref_flat(A_desc, (void *) A_triton, (int64_t) m_valid * (int64_t) K);
-        init_rank1_memref_flat(B_desc, (void *) B_triton, (int64_t) N_tile * (int64_t) K);
-        init_rank1_memref_flat(C_desc, (void *) C_triton, (int64_t) m_valid * (int64_t) N_tile);
+        // ---------------------------------------------------------------------
+        // IMPORTANT FIX:
+        //
+        // Triton kernel creates block pointers using:
+        //   A strides = (K, 1)
+        //   B strides = (N, 1)
+        //   C strides = (N, 1)
+        //
+        // Since B_triton/C_triton are physically padded with N stride = 64,
+        // we must pass N = 64 to Triton, not logical N_tile.
+        //
+        // Copy-back below still copies only logical N_tile columns.
+        // ---------------------------------------------------------------------
+        init_rank1_memref_flat(
+            A_desc,
+            (void *) A_triton,
+            (int64_t) TRITON_M_TILE * (int64_t) K);
 
-        init_scalar_i32_memref_aligned(M_desc,     M_payload,     m_valid);
-        init_scalar_i32_memref_aligned(N_desc,     N_payload,     N_tile);
+        init_rank1_memref_flat(
+            B_desc,
+            (void *) B_triton,
+            (int64_t) K * (int64_t) TRITON_N_TILE);
+
+        init_rank1_memref_flat(
+            C_desc,
+            (void *) C_triton,
+            (int64_t) TRITON_M_TILE * (int64_t) TRITON_N_TILE);
+
+        init_scalar_i32_memref_aligned(M_desc,     M_payload,     TRITON_M_TILE);
+        init_scalar_i32_memref_aligned(N_desc,     N_payload,     TRITON_N_TILE);
         init_scalar_i32_memref_aligned(K_desc,     K_payload,     K);
         init_scalar_i32_memref_aligned(grid1_desc, grid1_payload, 1);
         init_scalar_i32_memref_aligned(grid2_desc, grid2_payload, 1);
@@ -2605,10 +2650,14 @@ static inline void call_triton_matmul_blob_k(
             M_desc, N_desc, K_desc,
             grid1_desc, grid2_desc, grid3_desc);
 
-        // copy valid result back
+        // ---------------------------------------------------------------------
+        // Copy valid logical result back to blob-style C tile.
+        // Only copy m_valid rows and N_tile valid columns.
+        // ---------------------------------------------------------------------
         for (int32_t r = 0; r < m_valid; ++r) {
-            float *dst_row = C_blob + (size_t) (m0 + r) * (size_t) TMU_N_BLOCK;
+            float       *dst_row = C_blob + (size_t) (m0 + r) * (size_t) TMU_N_BLOCK;
             const float *src_row = C_triton + (size_t) r * (size_t) TRITON_N_TILE;
+
             for (int32_t n = 0; n < N_tile; ++n) {
                 dst_row[n] = src_row[n];
             }
