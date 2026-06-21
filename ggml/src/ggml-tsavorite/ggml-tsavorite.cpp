@@ -2005,33 +2005,38 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 
     if (!a || !b) return false;
 
-    const int64_t K = a->ne[0];
-    const int64_t N = op->ne[0];
-    const int64_t M = op->ne[1];
+    // GGML MUL_MAT:
+    //   a/src0: [K, output_cols]
+    //   b/src1: [K, batch]
+    //   op/dst: [output_cols, batch]
+    const int64_t K          = a->ne[0];
+    const int64_t OUT_COLS   = op->ne[0];
+    const int64_t BATCH_COLS = op->ne[1];
 
-    if (K <= 0 || N <= 0 || M <= 0) return false;
-    if ((K % TMU_K_MULTIPLE) != 0) return false;
+    if (K <= 0 || OUT_COLS <= 0 || BATCH_COLS <= 0) return false;
+
+    // Current Triton path only supports F32 path and K decomposed by 32.
+    if ((K % 32) != 0) return false;
+
+    // Reduction dim must match.
     if (b->ne[0] != K) return false;
 
-    // ✅ ENABLE ONLY WORKING OPU SHAPE
-    // dst  = [576, 5]
-    // src0 = [576, 576]
-    // src1 = [576, 5]
-    if (K == 576 &&
-        N == 576 &&
-        M == 5 &&
-        op->ne[2] == 1 &&
-        op->ne[3] == 1 &&
-        a->ne[1] == 576 &&
-        b->ne[1] == 5) {
+    // Output shape must match expected GGML MUL_MAT relation.
+    if (a->ne[1] != OUT_COLS) return false;
+    if (b->ne[1] != BATCH_COLS) return false;
 
-        fprintf(stderr,
-                "\nTSI DEBUG: ENABLE OPU MAT_MUL (576x576 * 576x5)\n");
+    // Avoid GEMV / single-column cases for now.
+    // ggml_tsavorite_run_tmu_mul_mat() currently rejects src1->ne[1] == 1.
+    if (b->ne[1] == 1) return false;
 
-        return true;
-    }
+    // IMPORTANT:
+    // Keep only simple 2D matmul for now.
+    // Do not enable broadcast / batched 3D/4D shapes yet.
+    if (op->ne[2] != 1 || op->ne[3] != 1) return false;
+    if (a->ne[2]  != 1 || a->ne[3]  != 1) return false;
+    if (b->ne[2]  != 1 || b->ne[3]  != 1) return false;
 
-    return false;
+    return true;
 }
 
 
@@ -2844,7 +2849,6 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     struct ggml_tensor * node,
     enum ggml_tsavorite_kernel_type kernel_type,
     int /*kernel_sub_type*/) {
-
     if (!node || !node->src[0] || !node->src[1] || !node->data) {
         return GGML_STATUS_FAILED;
     }
@@ -2870,14 +2874,14 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     //   src1: [K, N]
     //   dst : [M, N]
     //
-    // In your currently enabled case:
+    // Example:
     //   src0 = [576, 576]
     //   src1 = [576, 5]
     //   dst  = [576, 5]
     // so:
     //   K = 576
-    //   M = 576   (dst->ne[0])
-    //   N = 5     (dst->ne[1])
+    //   M = 576
+    //   N = 5
     // -------------------------------------------------------------------------
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
@@ -2931,12 +2935,14 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         (N - n0 >= TMU_N_BLOCK) ? TMU_N_BLOCK : (N - n0);
 
                     // -----------------------------------------------------------------
-                    // IMPORTANT:
-                    // Zero C ONCE per output tile.
-                    // Triton wrapper must preserve/consume carry-in C across K buckets.
+                    // Zero C once per output tile.
+                    // Triton wrapper preloads current g_C_tile into C_triton and
+                    // accumulates each K chunk.
                     // -----------------------------------------------------------------
                     memset(g_C_tile, 0,
-                           (size_t) TMU_M_TILE_MAX * (size_t) TMU_N_BLOCK * sizeof(float));
+                           (size_t) TMU_M_TILE_MAX *
+                           (size_t) TMU_N_BLOCK *
+                           sizeof(float));
 
 #ifdef TMU_DEBUG_VALIDATE
                     memset(C_ref_accum, 0, sizeof(C_ref_accum));
@@ -2950,6 +2956,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                     for (int pi = 0; pi < np; ++pi) {
                         const int K_chunk = parts[pi];
+
                         const tmu_bucket_dispatch * bucket = tmu_find_bucket(K_chunk);
                         if (!bucket || !bucket->fn) return GGML_STATUS_FAILED;
 
@@ -2968,9 +2975,8 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                         // -------------------------------------------------------------
                         // Pack B -> blob-style row-major [TMU_N_BLOCK x K_chunk]
-                        // Existing helper already does:
-                        //   dst row = output column n
-                        //   dst[kk]  = B(k0+kk, n0+n)
+                        // dst row = output column n
+                        // dst[kk] = B(k0 + kk, n0 + n)
                         // -------------------------------------------------------------
                         pack_B_tile_f32(
                             g_B_pack,
@@ -2985,13 +2991,11 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         g_triton_cur_M_tile = (int32_t) m_tile;
                         g_triton_cur_N_tile = (int32_t) n_valid;
 
-                        // -----------------------------------------------------------------
-                        // IMPORTANT:
-                        // No host-side g_C_prev workaround here.
-                        // call_triton_matmul_blob_k() must preload current g_C_tile into
-                        // Triton C buffer and Triton does:
-                        //   acc = load(C); acc += dot(A, B); store(C)
-                        // -----------------------------------------------------------------
+                        // -------------------------------------------------------------
+                        // Triton MAT_MUL call through selected K bucket.
+                        // Current working path:
+                        //   bucket->fn -> tmu_mul_mat_k32 -> call_triton_matmul_blob_k<32>
+                        // -------------------------------------------------------------
                         bucket->fn(g_A_pack, g_B_pack, g_C_tile);
 
                         // Stats per kernel call
@@ -3002,17 +3006,43 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
 #ifdef TMU_DEBUG_VALIDATE
                         // -------------------------------------------------------------
-                        // CPU reference for THIS K_chunk on packed tiles
-                        // accumulate chunk-by-chunk and compare against g_C_tile
+                        // CPU reference for THIS K_chunk on packed tiles.
+                        // Accumulate chunk-by-chunk and compare against g_C_tile.
+                        //
+                        // IMPORTANT:
+                        // Use abs + relative tolerance. FP32 dot accumulation can differ
+                        // slightly due to accumulation order. Example:
+                        //   TMU=325.606201 REF=325.606079
+                        // is acceptable and should not abort.
                         // -------------------------------------------------------------
                         memset(C_ref_chunk, 0, sizeof(C_ref_chunk));
 
                         MemRefDescriptor<4> Aref, Bref, Cref;
-                        init_memref_4d(Aref, (void *) g_A_pack, 1, 1, TMU_M_TILE_MAX, (int64_t) K_chunk);
-                        init_memref_4d(Bref, (void *) g_B_pack, 1, 1, TMU_N_BLOCK,   (int64_t) K_chunk);
-                        init_memref_4d(Cref, (void *) C_ref_chunk, 1, 1, TMU_M_TILE_MAX, TMU_N_BLOCK);
 
-                        // Use the EXISTING top-level helper already present in the file
+                        init_memref_4d(
+                            Aref,
+                            (void *) g_A_pack,
+                            1,
+                            1,
+                            TMU_M_TILE_MAX,
+                            (int64_t) K_chunk);
+
+                        init_memref_4d(
+                            Bref,
+                            (void *) g_B_pack,
+                            1,
+                            1,
+                            TMU_N_BLOCK,
+                            (int64_t) K_chunk);
+
+                        init_memref_4d(
+                            Cref,
+                            (void *) C_ref_chunk,
+                            1,
+                            1,
+                            TMU_M_TILE_MAX,
+                            TMU_N_BLOCK);
+
                         cpu_ref_mul_mat_f32(&Aref, &Bref, &Cref);
 
                         for (int64_t rr = 0; rr < m_tile; ++rr) {
@@ -3026,13 +3056,27 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                             for (int64_t cc = 0; cc < n_valid; ++cc) {
                                 const float tmu_v = g_C_tile[rr * TMU_N_BLOCK + cc];
                                 const float ref_v = C_ref_accum[rr * TMU_N_BLOCK + cc];
-                                if (fabsf(tmu_v - ref_v) > 1e-4f) {
+
+                                const float abs_err = fabsf(tmu_v - ref_v);
+                                const float rel_err = abs_err / fmaxf(1.0f, fabsf(ref_v));
+
+                                if (abs_err > 1e-3f && rel_err > 1e-5f) {
                                     fprintf(stderr,
                                             "\nTMU/TRITON MISMATCH (packed-ref)\n"
                                             "m0=%ld n0=%ld k0=%ld K_chunk=%d pi=%d\n"
-                                            "r=%ld c=%ld TMU=%f REF=%f\n",
-                                            (long)m0, (long)n0, (long)k0, K_chunk, pi,
-                                            (long)rr, (long)cc, tmu_v, ref_v);
+                                            "r=%ld c=%ld TMU=%f REF=%f ABS=%e REL=%e\n",
+                                            (long)m0,
+                                            (long)n0,
+                                            (long)k0,
+                                            K_chunk,
+                                            pi,
+                                            (long)rr,
+                                            (long)cc,
+                                            tmu_v,
+                                            ref_v,
+                                            abs_err,
+                                            rel_err);
+
                                     tsi_cleanup();
                                     abort();
                                 }
@@ -3049,7 +3093,9 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     }
 
                     // -------------------------------------------------------------
-                    // Copy tile back to GGML output
+                    // Copy valid tile back to GGML output.
+                    // g_C_tile is packed row-major [TMU_M_TILE_MAX x TMU_N_BLOCK].
+                    // GGML output uses byte strides.
                     // -------------------------------------------------------------
                     {
                         char *dst_base = (char *) node->data;
@@ -3065,8 +3111,8 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                 const int64_t byte_off =
                                     m_idx * c_nb0 +
                                     n_idx * c_nb1 +
-                                    od2  * c_nb2 +
-                                    od3  * c_nb3;
+                                    od2   * c_nb2 +
+                                    od3   * c_nb3;
 
                                 if (byte_off < 0 ||
                                     (size_t) byte_off + sizeof(float) > bytes_total) {
@@ -3085,15 +3131,15 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     return GGML_STATUS_SUCCESS;
 }
 
-static std::mutex g_tsavorite_compute_mutex;
-
 // nodes are intermediate which has multiple src tensors & operation
 // Here we create multiple thread
 // Each Thread run the command buffer & pick Tensor and execute and get the result back base on
 // async or sync all Compute wil finish all tensors execution
 static enum ggml_status ggml_tsavorite_graph_compute(ggml_backend_t backend,
                                                      struct ggml_cgraph *cgraph) {
+static std::mutex g_tsavorite_compute_mutex;
 std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
+
 #if 0
     GGML_LOG_INFO("Start %s\n", __func__);
     struct ggml_backend_tsavorite_context        * ctx     = backend->context;
