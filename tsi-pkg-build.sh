@@ -921,9 +921,16 @@ cat > "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh" <<'EOL'
 #!/bin/bash
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
 
-tsi_kernels=("add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu" \
-"add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16" \
-"mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128")
+tsi_kernels=(
+  "add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu"
+  "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt" "sqr" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16"
+  "mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128"
+)
+
+triton_kernels=(
+  "triton_add"
+  "triton_mat_mul"
+)
 
 for kernel in "${tsi_kernels[@]}"; do
   dst="__TSI_BLOB_INSTALL_DIR__/txe_${kernel}/blobs"
@@ -935,14 +942,15 @@ for kernel in "${tsi_kernels[@]}"; do
   fi
 done
 
-# Triton ADD
-dst="__TSI_BLOB_INSTALL_DIR__/txe_triton_add/blobs"
-rm -rf "${dst}"
-mkdir -p "${dst}"
+for kernel in "${triton_kernels[@]}"; do
+  dst="__TSI_BLOB_INSTALL_DIR__/txe_${kernel}/blobs"
+  rm -rf "${dst}"
+  mkdir -p "${dst}"
 
-if [ -f "blobs/txe_triton_add/txe_blob_0.blob" ]; then
-  cp "blobs/txe_triton_add/txe_blob_0.blob" "${dst}/txe_blob_0.blob"
-fi
+  if [ -f "blobs/txe_${kernel}/txe_blob_0.blob" ]; then
+    cp "blobs/txe_${kernel}/txe_blob_0.blob" "${dst}/txe_blob_0.blob"
+  fi
+done
 EOL
 
   sed -i "s|__TSI_BLOB_INSTALL_DIR__|${TSI_BLOB_INSTALL_DIR}|g" "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh"

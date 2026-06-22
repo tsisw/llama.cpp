@@ -2469,20 +2469,59 @@ static inline void init_scalar_i32_memref_aligned(
     *((int32_t *) payload_ptr) = v;
 }
 
+static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
+    return ((v + a - 1) / a) * a;
+}
 
-template<int K>
-static inline void call_triton_matmul_blob_k(
-    const void *A_tile,   // blob-style: [TMU_M_TILE_MAX x K], row-major
-    const void *B_tile,   // blob-style: [TMU_N_BLOCK    x K], row-major as N x K
-    void *C_tile,         // blob-style: [TMU_M_TILE_MAX x TMU_N_BLOCK], row-major
-    int32_t M_tile,       // actual valid rows
-    int32_t N_tile) {     // actual valid cols
-    constexpr int32_t TRITON_M_TILE = 8;
-    constexpr int32_t TRITON_N_TILE = 64;
+static constexpr int32_t TRITON_FULL_M_TILE = 64;
+static constexpr int32_t TRITON_FULL_N_TILE = 64;
 
-    static float *A_triton = nullptr;   // physical [8 x K]
-    static float *B_triton = nullptr;   // physical [K x 64]
-    static float *C_triton = nullptr;   // physical [8 x 64]
+static float *g_triton_A_full = nullptr; // [64 x K_cap]
+static float *g_triton_B_full = nullptr; // [K_cap x 64]
+static float *g_triton_C_full = nullptr; // [64 x 64]
+static int64_t g_triton_K_cap = 0;
+
+static inline void ensure_triton_full_buffers(int64_t K) {
+    TSAVORITE_GGML_ASSERT(K > 0);
+
+    const int64_t need_K = tsi_round_up_i64(K, 32);
+
+    if (!g_triton_C_full) {
+        g_triton_C_full = (float *) tsi_alloc(
+            (size_t) TRITON_FULL_M_TILE *
+            (size_t) TRITON_FULL_N_TILE *
+            sizeof(float));
+
+        TSAVORITE_GGML_ASSERT(g_triton_C_full);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
+    }
+
+    if (need_K > g_triton_K_cap) {
+        g_triton_K_cap = need_K;
+
+        g_triton_A_full = (float *) tsi_alloc(
+            (size_t) TRITON_FULL_M_TILE *
+            (size_t) g_triton_K_cap *
+            sizeof(float));
+
+        g_triton_B_full = (float *) tsi_alloc(
+            (size_t) g_triton_K_cap *
+            (size_t) TRITON_FULL_N_TILE *
+            sizeof(float));
+
+        TSAVORITE_GGML_ASSERT(g_triton_A_full && g_triton_B_full);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_A_full) & 127) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_B_full) & 127) == 0);
+    }
+}
+
+static inline void call_triton_matmul_full_packed(
+    float *A_full,     // physical [M_pad x K]
+    float *B_full,     // physical [K x N_pad]
+    float *C_full,     // physical [M_pad x N_pad]
+    int32_t M_pad,
+    int32_t N_pad,
+    int32_t K) {
 
     static MemRefDescriptor<Rank> *A_desc = nullptr;
     static MemRefDescriptor<Rank> *B_desc = nullptr;
@@ -2505,10 +2544,6 @@ static inline void call_triton_matmul_blob_k(
     static bool inited = false;
 
     if (!inited) {
-        A_triton = (float *) tsi_alloc((size_t) TRITON_M_TILE * (size_t) K * sizeof(float));
-        B_triton = (float *) tsi_alloc((size_t) K * (size_t) TRITON_N_TILE * sizeof(float));
-        C_triton = (float *) tsi_alloc((size_t) TRITON_M_TILE * (size_t) TRITON_N_TILE * sizeof(float));
-
         A_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
         B_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
         C_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
@@ -2527,156 +2562,67 @@ static inline void call_triton_matmul_blob_k(
         grid2_payload = (int32_t *) tsi_alloc(128);
         grid3_payload = (int32_t *) tsi_alloc(128);
 
-        TSAVORITE_GGML_ASSERT(A_triton && B_triton && C_triton);
         TSAVORITE_GGML_ASSERT(A_desc && B_desc && C_desc);
         TSAVORITE_GGML_ASSERT(M_desc && N_desc && K_desc);
         TSAVORITE_GGML_ASSERT(grid1_desc && grid2_desc && grid3_desc);
         TSAVORITE_GGML_ASSERT(M_payload && N_payload && K_payload);
         TSAVORITE_GGML_ASSERT(grid1_payload && grid2_payload && grid3_payload);
 
-        TSAVORITE_GGML_ASSERT((((uintptr_t) A_triton) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) B_triton) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) C_triton) & 127) == 0);
-
-        TSAVORITE_GGML_ASSERT((((uintptr_t) A_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) B_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) C_desc) & 127) == 0);
-
-        TSAVORITE_GGML_ASSERT((((uintptr_t) M_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) N_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) K_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid1_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid2_desc) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid3_desc) & 127) == 0);
-
-        TSAVORITE_GGML_ASSERT((((uintptr_t) M_payload) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) N_payload) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) K_payload) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid1_payload) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid2_payload) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) grid3_payload) & 127) == 0);
-
         inited = true;
     }
 
-    const float *A_blob = (const float *) A_tile;   // [TMU_M_TILE_MAX x K]
-    const float *B_blob = (const float *) B_tile;   // [TMU_N_BLOCK    x K] == [N x K]
-    float       *C_blob = (float       *) C_tile;   // [TMU_M_TILE_MAX x TMU_N_BLOCK]
+    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
+    TSAVORITE_GGML_ASSERT((K % 32) == 0);
 
-    // -------------------------------------------------------------------------
-    // B adapter:
-    // Blob-style B is [N x K].
-    // Triton expects B as row-major [K x N].
-    // Physical N stride is always TRITON_N_TILE = 64.
-    // -------------------------------------------------------------------------
-    memset(B_triton, 0, (size_t) K * (size_t) TRITON_N_TILE * sizeof(float));
+    init_rank1_memref_flat(
+        A_desc,
+        (void *) A_full,
+        (int64_t) M_pad * (int64_t) K);
 
-    for (int32_t n = 0; n < N_tile; ++n) {
-        const float *src_row = B_blob + (size_t) n * (size_t) K;
+    init_rank1_memref_flat(
+        B_desc,
+        (void *) B_full,
+        (int64_t) K * (int64_t) N_pad);
 
-        for (int32_t kk = 0; kk < K; ++kk) {
-            B_triton[(size_t) kk * (size_t) TRITON_N_TILE + (size_t) n] = src_row[kk];
-        }
-    }
+    init_rank1_memref_flat(
+        C_desc,
+        (void *) C_full,
+        (int64_t) M_pad * (int64_t) N_pad);
 
-    for (int32_t m0 = 0; m0 < M_tile; m0 += TRITON_M_TILE) {
-        const int32_t m_valid =
-            (M_tile - m0 > TRITON_M_TILE) ? TRITON_M_TILE : (M_tile - m0);
+    init_scalar_i32_memref_aligned(M_desc,     M_payload,     M_pad);
+    init_scalar_i32_memref_aligned(N_desc,     N_payload,     N_pad);
+    init_scalar_i32_memref_aligned(K_desc,     K_payload,     K);
+    init_scalar_i32_memref_aligned(grid1_desc, grid1_payload, 1);
+    init_scalar_i32_memref_aligned(grid2_desc, grid2_payload, 1);
+    init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
 
-        // ---------------------------------------------------------------------
-        // A adapter:
-        // Blob-style A is [M x K].
-        // Triton expects A as [8 x K].
-        // Zero-pad invalid rows.
-        // ---------------------------------------------------------------------
-        memset(A_triton, 0, (size_t) TRITON_M_TILE * (size_t) K * sizeof(float));
-
-        for (int32_t r = 0; r < m_valid; ++r) {
-            const float *src_row = A_blob + (size_t) (m0 + r) * (size_t) K;
-            float       *dst_row = A_triton + (size_t) r * (size_t) K;
-
-            memcpy(dst_row, src_row, (size_t) K * sizeof(float));
-        }
-
-        // ---------------------------------------------------------------------
-        // C carry-in:
-        // Blob-style C is [M x TMU_N_BLOCK].
-        // Triton physical C is [8 x 64].
-        // Copy only valid rows/cols into padded C_triton.
-        // ---------------------------------------------------------------------
-        memset(C_triton, 0, (size_t) TRITON_M_TILE * (size_t) TRITON_N_TILE * sizeof(float));
-
-        for (int32_t r = 0; r < m_valid; ++r) {
-            const float *src_row = C_blob + (size_t) (m0 + r) * (size_t) TMU_N_BLOCK;
-            float       *dst_row = C_triton + (size_t) r * (size_t) TRITON_N_TILE;
-
-            for (int32_t n = 0; n < N_tile; ++n) {
-                dst_row[n] = src_row[n];
-            }
-        }
-
-        // ---------------------------------------------------------------------
-        // IMPORTANT FIX:
-        //
-        // Triton kernel creates block pointers using:
-        //   A strides = (K, 1)
-        //   B strides = (N, 1)
-        //   C strides = (N, 1)
-        //
-        // Since B_triton/C_triton are physically padded with N stride = 64,
-        // we must pass N = 64 to Triton, not logical N_tile.
-        //
-        // Copy-back below still copies only logical N_tile columns.
-        // ---------------------------------------------------------------------
-        init_rank1_memref_flat(
-            A_desc,
-            (void *) A_triton,
-            (int64_t) TRITON_M_TILE * (int64_t) K);
-
-        init_rank1_memref_flat(
-            B_desc,
-            (void *) B_triton,
-            (int64_t) K * (int64_t) TRITON_N_TILE);
-
-        init_rank1_memref_flat(
-            C_desc,
-            (void *) C_triton,
-            (int64_t) TRITON_M_TILE * (int64_t) TRITON_N_TILE);
-
-        init_scalar_i32_memref_aligned(M_desc,     M_payload,     TRITON_M_TILE);
-        init_scalar_i32_memref_aligned(N_desc,     N_payload,     TRITON_N_TILE);
-        init_scalar_i32_memref_aligned(K_desc,     K_payload,     K);
-        init_scalar_i32_memref_aligned(grid1_desc, grid1_payload, 1);
-        init_scalar_i32_memref_aligned(grid2_desc, grid2_payload, 1);
-        init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
-
-        _mlir_ciface_matmul_kernel_memory_wrapper(
-            A_desc, B_desc, C_desc,
-            M_desc, N_desc, K_desc,
-            grid1_desc, grid2_desc, grid3_desc);
-
-        // ---------------------------------------------------------------------
-        // Copy valid logical result back to blob-style C tile.
-        // Only copy m_valid rows and N_tile valid columns.
-        // ---------------------------------------------------------------------
-        for (int32_t r = 0; r < m_valid; ++r) {
-            float       *dst_row = C_blob + (size_t) (m0 + r) * (size_t) TMU_N_BLOCK;
-            const float *src_row = C_triton + (size_t) r * (size_t) TRITON_N_TILE;
-
-            for (int32_t n = 0; n < N_tile; ++n) {
-                dst_row[n] = src_row[n];
-            }
-        }
-    }
+    _mlir_ciface_matmul_kernel_memory_wrapper(
+        A_desc, B_desc, C_desc,
+        M_desc, N_desc, K_desc,
+        grid1_desc, grid2_desc, grid3_desc);
 }
 
 
+#if 0
 // Replace ONLY k32 first
 extern "C" void tmu_mul_mat_k32(const void *A, const void *B, void *C) {
     call_triton_matmul_blob_k<32>(
         A, B, C,
         g_triton_cur_M_tile,
         g_triton_cur_N_tile);
+}
+#endif /* 0 */
+
+extern "C" void tmu_mul_mat_k32(const void *A, const void *B, void *C) {
+    (void) A;
+    (void) B;
+    (void) C;
+
+    fprintf(stderr,
+            "ERROR: legacy tmu_mul_mat_k32 path should not be called "
+            "after enabling full dynamic Triton MAT_MUL path\n");
+    abort();
 }
 
 
@@ -2849,47 +2795,34 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     struct ggml_tensor * node,
     enum ggml_tsavorite_kernel_type kernel_type,
     int /*kernel_sub_type*/) {
+
     if (!node || !node->src[0] || !node->src[1] || !node->data) {
         return GGML_STATUS_FAILED;
     }
 
-    const struct ggml_tensor * src0 = node->src[0];
-    const struct ggml_tensor * src1 = node->src[1];
+    const struct ggml_tensor *src0 = node->src[0];
+    const struct ggml_tensor *src1 = node->src[1];
 
-    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 ||
+        node->type != GGML_TYPE_F32) {
         return GGML_STATUS_FAILED;
     }
 
-    ensure_tmu_pack_buffers();
-
-#ifdef TMU_DEBUG_VALIDATE
-    // CPU reference buffers: accumulate chunk-by-chunk in packed space
-    static float C_ref_chunk[TMU_M_TILE_MAX * TMU_N_BLOCK];
-    static float C_ref_accum[TMU_M_TILE_MAX * TMU_N_BLOCK];
-#endif
-
-    // -------------------------------------------------------------------------
-    // GGML MUL_MAT convention used here:
-    //   src0: [K, M]
-    //   src1: [K, N]
-    //   dst : [M, N]
-    //
-    // Example:
-    //   src0 = [576, 576]
-    //   src1 = [576, 5]
-    //   dst  = [576, 5]
-    // so:
-    //   K = 576
-    //   M = 576
-    //   N = 5
-    // -------------------------------------------------------------------------
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
 
+    if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
     if (src1->ne[0] != K) return GGML_STATUS_FAILED;
-    if ((K % TMU_K_MULTIPLE) != 0) return GGML_STATUS_FAILED;
-    if (src1->ne[1] == 1) return GGML_STATUS_FAILED; // avoid GEMV
+    if ((K % 32) != 0) return GGML_STATUS_FAILED;
+    if (src1->ne[1] == 1) return GGML_STATUS_FAILED;
+
+    ensure_triton_full_buffers(K);
+
+#ifdef TMU_DEBUG_VALIDATE
+    static float C_ref_tile[TRITON_FULL_M_TILE * TRITON_FULL_N_TILE];
+#endif
 
     const int64_t a_nb0 = nb_or_default(src0, 0);
     const int64_t a_nb1 = nb_or_default(src0, 1);
@@ -2906,7 +2839,6 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     const int64_t c_nb2 = nb_or_default(node, 2);
     const int64_t c_nb3 = nb_or_default(node, 3);
 
-    // broadcast dims from inputs
     const int64_t A2 = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t A3 = src0->ne[3] ? src0->ne[3] : 1;
     const int64_t B2 = src1->ne[2] ? src1->ne[2] : 1;
@@ -2923,187 +2855,155 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
             const int64_t a_d2 = map_repeat_i64(od2, A2);
             const int64_t b_d2 = map_repeat_i64(od2, B2);
 
-            const char *A_base_d23 = (const char *) src0->data + a_d2 * a_nb2 + a_d3 * a_nb3;
-            const char *B_base_d23 = (const char *) src1->data + b_d2 * b_nb2 + b_d3 * b_nb3;
+            const char *A_base_d23 =
+                (const char *) src0->data + a_d2 * a_nb2 + a_d3 * a_nb3;
 
-            for (int64_t m0 = 0; m0 < M; m0 += TMU_M_TILE_MAX) {
-                const int64_t m_tile =
-                    (M - m0 > TMU_M_TILE_MAX) ? TMU_M_TILE_MAX : (M - m0);
+            const char *B_base_d23 =
+                (const char *) src1->data + b_d2 * b_nb2 + b_d3 * b_nb3;
 
-                for (int64_t n0 = 0; n0 < N; n0 += TMU_N_BLOCK) {
+            for (int64_t m0 = 0; m0 < M; m0 += TRITON_FULL_M_TILE) {
+                const int64_t m_valid =
+                    (M - m0 > TRITON_FULL_M_TILE) ? TRITON_FULL_M_TILE : (M - m0);
+
+                const int64_t M_pad = tsi_round_up_i64(m_valid, 8);
+
+                for (int64_t n0 = 0; n0 < N; n0 += TRITON_FULL_N_TILE) {
                     const int64_t n_valid =
-                        (N - n0 >= TMU_N_BLOCK) ? TMU_N_BLOCK : (N - n0);
+                        (N - n0 > TRITON_FULL_N_TILE) ? TRITON_FULL_N_TILE : (N - n0);
 
-                    // -----------------------------------------------------------------
-                    // Zero C once per output tile.
-                    // Triton wrapper preloads current g_C_tile into C_triton and
-                    // accumulates each K chunk.
-                    // -----------------------------------------------------------------
-                    memset(g_C_tile, 0,
-                           (size_t) TMU_M_TILE_MAX *
-                           (size_t) TMU_N_BLOCK *
-                           sizeof(float));
+                    const int64_t N_pad = TRITON_FULL_N_TILE;
 
-#ifdef TMU_DEBUG_VALIDATE
-                    memset(C_ref_accum, 0, sizeof(C_ref_accum));
-#endif
+                    // ---------------------------------------------------------
+                    // Pack A as Triton-native row-major:
+                    //   A_full = [M_pad x K]
+                    // ---------------------------------------------------------
+                    memset(g_triton_A_full, 0,
+                           (size_t) M_pad * (size_t) K * sizeof(float));
 
-                    int parts[128];
-                    const int np = tmu_decompose_k(K, parts, (int)(sizeof(parts) / sizeof(parts[0])));
-                    if (np < 0) return GGML_STATUS_FAILED;
+                    for (int64_t r = 0; r < m_valid; ++r) {
+                        const int64_t m_idx = m0 + r;
+                        float *dst_row = g_triton_A_full + r * K;
 
-                    int64_t k0 = 0;
+                        const char *src_row =
+                            A_base_d23 + m_idx * a_nb1;
 
-                    for (int pi = 0; pi < np; ++pi) {
-                        const int K_chunk = parts[pi];
-
-                        const tmu_bucket_dispatch * bucket = tmu_find_bucket(K_chunk);
-                        if (!bucket || !bucket->fn) return GGML_STATUS_FAILED;
-
-                        // -------------------------------------------------------------
-                        // Pack A -> blob-style row-major [TMU_M_TILE_MAX x K_chunk]
-                        // -------------------------------------------------------------
-                        pack_A_tile_f32(
-                            g_A_pack,
-                            A_base_d23,
-                            m0,
-                            m_tile,
-                            k0,
-                            K_chunk,
-                            a_nb0,
-                            a_nb1);
-
-                        // -------------------------------------------------------------
-                        // Pack B -> blob-style row-major [TMU_N_BLOCK x K_chunk]
-                        // dst row = output column n
-                        // dst[kk] = B(k0 + kk, n0 + n)
-                        // -------------------------------------------------------------
-                        pack_B_tile_f32(
-                            g_B_pack,
-                            B_base_d23,
-                            n0,
-                            n_valid,
-                            k0,
-                            K_chunk,
-                            b_nb0,
-                            b_nb1);
-
-                        g_triton_cur_M_tile = (int32_t) m_tile;
-                        g_triton_cur_N_tile = (int32_t) n_valid;
-
-                        // -------------------------------------------------------------
-                        // Triton MAT_MUL call through selected K bucket.
-                        // Current working path:
-                        //   bucket->fn -> tmu_mul_mat_k32 -> call_triton_matmul_blob_k<32>
-                        // -------------------------------------------------------------
-                        bucket->fn(g_A_pack, g_B_pack, g_C_tile);
-
-                        // Stats per kernel call
-                        if (device) {
-                            ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
+                        for (int64_t kk = 0; kk < K; ++kk) {
+                            dst_row[kk] =
+                                *(const float *)(src_row + kk * a_nb0);
                         }
-                        ++node->tsi_kernel_runs;
-
-#ifdef TMU_DEBUG_VALIDATE
-                        // -------------------------------------------------------------
-                        // CPU reference for THIS K_chunk on packed tiles.
-                        // Accumulate chunk-by-chunk and compare against g_C_tile.
-                        //
-                        // IMPORTANT:
-                        // Use abs + relative tolerance. FP32 dot accumulation can differ
-                        // slightly due to accumulation order. Example:
-                        //   TMU=325.606201 REF=325.606079
-                        // is acceptable and should not abort.
-                        // -------------------------------------------------------------
-                        memset(C_ref_chunk, 0, sizeof(C_ref_chunk));
-
-                        MemRefDescriptor<4> Aref, Bref, Cref;
-
-                        init_memref_4d(
-                            Aref,
-                            (void *) g_A_pack,
-                            1,
-                            1,
-                            TMU_M_TILE_MAX,
-                            (int64_t) K_chunk);
-
-                        init_memref_4d(
-                            Bref,
-                            (void *) g_B_pack,
-                            1,
-                            1,
-                            TMU_N_BLOCK,
-                            (int64_t) K_chunk);
-
-                        init_memref_4d(
-                            Cref,
-                            (void *) C_ref_chunk,
-                            1,
-                            1,
-                            TMU_M_TILE_MAX,
-                            TMU_N_BLOCK);
-
-                        cpu_ref_mul_mat_f32(&Aref, &Bref, &Cref);
-
-                        for (int64_t rr = 0; rr < m_tile; ++rr) {
-                            for (int64_t cc = 0; cc < n_valid; ++cc) {
-                                C_ref_accum[rr * TMU_N_BLOCK + cc] +=
-                                    C_ref_chunk[rr * TMU_N_BLOCK + cc];
-                            }
-                        }
-
-                        for (int64_t rr = 0; rr < m_tile; ++rr) {
-                            for (int64_t cc = 0; cc < n_valid; ++cc) {
-                                const float tmu_v = g_C_tile[rr * TMU_N_BLOCK + cc];
-                                const float ref_v = C_ref_accum[rr * TMU_N_BLOCK + cc];
-
-                                const float abs_err = fabsf(tmu_v - ref_v);
-                                const float rel_err = abs_err / fmaxf(1.0f, fabsf(ref_v));
-
-                                if (abs_err > 1e-3f && rel_err > 1e-5f) {
-                                    fprintf(stderr,
-                                            "\nTMU/TRITON MISMATCH (packed-ref)\n"
-                                            "m0=%ld n0=%ld k0=%ld K_chunk=%d pi=%d\n"
-                                            "r=%ld c=%ld TMU=%f REF=%f ABS=%e REL=%e\n",
-                                            (long)m0,
-                                            (long)n0,
-                                            (long)k0,
-                                            K_chunk,
-                                            pi,
-                                            (long)rr,
-                                            (long)cc,
-                                            tmu_v,
-                                            ref_v,
-                                            abs_err,
-                                            rel_err);
-
-                                    tsi_cleanup();
-                                    abort();
-                                }
-                            }
-                        }
-#endif
-
-                        k0 += K_chunk;
                     }
 
-                    // exact K coverage required
-                    if (k0 != K) {
-                        return GGML_STATUS_FAILED;
+                    // ---------------------------------------------------------
+                    // Pack B as Triton-native row-major:
+                    //   B_full = [K x N_pad]
+                    // GGML/src1 is logically [K, N].
+                    // ---------------------------------------------------------
+                    memset(g_triton_B_full, 0,
+                           (size_t) K * (size_t) N_pad * sizeof(float));
+
+                    for (int64_t c = 0; c < n_valid; ++c) {
+                        const int64_t n_idx = n0 + c;
+
+                        const char *src_col =
+                            B_base_d23 + n_idx * b_nb1;
+
+                        for (int64_t kk = 0; kk < K; ++kk) {
+                            g_triton_B_full[kk * N_pad + c] =
+                                *(const float *)(src_col + kk * b_nb0);
+                        }
                     }
 
-                    // -------------------------------------------------------------
-                    // Copy valid tile back to GGML output.
-                    // g_C_tile is packed row-major [TMU_M_TILE_MAX x TMU_N_BLOCK].
-                    // GGML output uses byte strides.
-                    // -------------------------------------------------------------
+                    // ---------------------------------------------------------
+                    // C starts from zero for the full K matmul.
+                    // Triton kernel does:
+                    //   acc = load(C)
+                    //   acc += dot(A, B)
+                    //   store(C)
+                    // ---------------------------------------------------------
+                    memset(g_triton_C_full, 0,
+                           (size_t) M_pad * (size_t) N_pad * sizeof(float));
+
+                    call_triton_matmul_full_packed(
+                        g_triton_A_full,
+                        g_triton_B_full,
+                        g_triton_C_full,
+                        (int32_t) M_pad,
+                        (int32_t) N_pad,
+                        (int32_t) K);
+
+                    if (device) {
+                        ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
+                    }
+                    ++node->tsi_kernel_runs;
+
+#ifdef TMU_DEBUG_VALIDATE
+                    memset(C_ref_tile, 0, sizeof(C_ref_tile));
+
+                    for (int64_t rr = 0; rr < m_valid; ++rr) {
+                        const int64_t m_idx = m0 + rr;
+                        const char *a_row =
+                            A_base_d23 + m_idx * a_nb1;
+
+                        for (int64_t cc = 0; cc < n_valid; ++cc) {
+                            const int64_t n_idx = n0 + cc;
+                            const char *b_col =
+                                B_base_d23 + n_idx * b_nb1;
+
+                            float acc = 0.0f;
+                            for (int64_t kk = 0; kk < K; ++kk) {
+                                const float av =
+                                    *(const float *)(a_row + kk * a_nb0);
+                                const float bv =
+                                    *(const float *)(b_col + kk * b_nb0);
+                                acc += av * bv;
+                            }
+
+                            C_ref_tile[rr * N_pad + cc] = acc;
+                        }
+                    }
+
+                    for (int64_t rr = 0; rr < m_valid; ++rr) {
+                        for (int64_t cc = 0; cc < n_valid; ++cc) {
+                            const float tmu_v =
+                                g_triton_C_full[rr * N_pad + cc];
+                            const float ref_v =
+                                C_ref_tile[rr * N_pad + cc];
+
+                            const float abs_err = fabsf(tmu_v - ref_v);
+                            const float rel_err =
+                                abs_err / fmaxf(1.0f, fabsf(ref_v));
+
+                            if (abs_err > 1e-3f && rel_err > 1e-5f) {
+                                fprintf(stderr,
+                                        "\nTRITON FULL MATMUL MISMATCH\n"
+                                        "m0=%ld n0=%ld K=%ld\n"
+                                        "r=%ld c=%ld TRITON=%f REF=%f ABS=%e REL=%e\n",
+                                        (long)m0,
+                                        (long)n0,
+                                        (long)K,
+                                        (long)rr,
+                                        (long)cc,
+                                        tmu_v,
+                                        ref_v,
+                                        abs_err,
+                                        rel_err);
+
+                                tsi_cleanup();
+                                abort();
+                            }
+                        }
+                    }
+#endif
+
+                    // ---------------------------------------------------------
+                    // Copy valid result back to GGML output.
+                    // ---------------------------------------------------------
                     {
                         char *dst_base = (char *) node->data;
                         const size_t bytes_total = (size_t) ggml_nbytes(node);
 
-                        for (int64_t rr = 0; rr < m_tile; ++rr) {
+                        for (int64_t rr = 0; rr < m_valid; ++rr) {
                             const int64_t m_idx = m0 + rr;
-                            const float *src_row = g_C_tile + rr * TMU_N_BLOCK;
 
                             for (int64_t cc = 0; cc < n_valid; ++cc) {
                                 const int64_t n_idx = n0 + cc;
@@ -3119,7 +3019,8 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                     continue;
                                 }
 
-                                *(float *)(dst_base + byte_off) = src_row[cc];
+                                *(float *)(dst_base + byte_off) =
+                                    g_triton_C_full[rr * N_pad + cc];
                             }
                         }
                     }
