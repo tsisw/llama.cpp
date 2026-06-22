@@ -2486,6 +2486,9 @@ static inline void ensure_triton_full_buffers(int64_t K) {
 
     const int64_t need_K = tsi_round_up_i64(K, 32);
 
+    // Allocate at least 2048 once so we do not grow/re-allocate for common model K values.
+    const int64_t alloc_K = (need_K > 2048) ? need_K : 2048;
+
     if (!g_triton_C_full) {
         g_triton_C_full = (float *) tsi_alloc(
             (size_t) TRITON_FULL_M_TILE *
@@ -2496,8 +2499,8 @@ static inline void ensure_triton_full_buffers(int64_t K) {
         TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
     }
 
-    if (need_K > g_triton_K_cap) {
-        g_triton_K_cap = need_K;
+    if (!g_triton_A_full || !g_triton_B_full || alloc_K > g_triton_K_cap) {
+        g_triton_K_cap = alloc_K;
 
         g_triton_A_full = (float *) tsi_alloc(
             (size_t) TRITON_FULL_M_TILE *
@@ -2874,32 +2877,60 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     const int64_t N_pad = TRITON_FULL_N_TILE;
 
                     // ---------------------------------------------------------
-                    // Pack A as Triton-native row-major:
-                    //   A_full = [M_pad x K]
+                    // Pack A as Triton-native row-major [M_pad x K].
+                    // Optimization:
+                    // - If rows are contiguous, use memcpy per row.
+                    // - Only memset A when padding rows are needed.
                     // ---------------------------------------------------------
-                    memset(g_triton_A_full, 0,
-                           (size_t) M_pad * (size_t) K * sizeof(float));
+                    if (m_valid < M_pad) {
+                        memset(g_triton_A_full, 0,
+                               (size_t) M_pad * (size_t) K * sizeof(float));
+                    }
 
-                    for (int64_t r = 0; r < m_valid; ++r) {
-                        const int64_t m_idx = m0 + r;
-                        float *dst_row = g_triton_A_full + r * K;
+                    if (a_nb0 == (int64_t) sizeof(float)) {
+                        for (int64_t r = 0; r < m_valid; ++r) {
+                            const int64_t m_idx = m0 + r;
 
-                        const char *src_row =
-                            A_base_d23 + m_idx * a_nb1;
+                            const char *src_row =
+                                A_base_d23 + m_idx * a_nb1;
 
-                        for (int64_t kk = 0; kk < K; ++kk) {
-                            dst_row[kk] =
-                                *(const float *)(src_row + kk * a_nb0);
+                            float *dst_row =
+                                g_triton_A_full + r * K;
+
+                            memcpy(dst_row, src_row, (size_t) K * sizeof(float));
+                        }
+                    } else {
+                        if (m_valid == M_pad) {
+                            // No padding rows, but non-contiguous K stride.
+                            // Every valid element is written below, so no memset required.
+                        }
+
+                        for (int64_t r = 0; r < m_valid; ++r) {
+                            const int64_t m_idx = m0 + r;
+
+                            const char *src_row =
+                                A_base_d23 + m_idx * a_nb1;
+
+                            float *dst_row =
+                                g_triton_A_full + r * K;
+
+                            for (int64_t kk = 0; kk < K; ++kk) {
+                                dst_row[kk] =
+                                    *(const float *)(src_row + kk * a_nb0);
+                            }
                         }
                     }
 
                     // ---------------------------------------------------------
-                    // Pack B as Triton-native row-major:
-                    //   B_full = [K x N_pad]
-                    // GGML/src1 is logically [K, N].
+                    // Pack B as Triton-native row-major [K x N_pad].
+                    // Optimization:
+                    // - If full N tile, every B element is written, so skip memset.
+                    // - If tail N tile, memset is required to zero padded columns.
                     // ---------------------------------------------------------
-                    memset(g_triton_B_full, 0,
-                           (size_t) K * (size_t) N_pad * sizeof(float));
+                    if (n_valid < N_pad) {
+                        memset(g_triton_B_full, 0,
+                               (size_t) K * (size_t) N_pad * sizeof(float));
+                    }
 
                     for (int64_t c = 0; c < n_valid; ++c) {
                         const int64_t n_idx = n0 + c;
@@ -2914,11 +2945,9 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     }
 
                     // ---------------------------------------------------------
-                    // C starts from zero for the full K matmul.
-                    // Triton kernel does:
+                    // C must be zero because Triton does:
                     //   acc = load(C)
-                    //   acc += dot(A, B)
-                    //   store(C)
+                    //   acc += dot(A,B)
                     // ---------------------------------------------------------
                     memset(g_triton_C_full, 0,
                            (size_t) M_pad * (size_t) N_pad * sizeof(float));
@@ -2950,6 +2979,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                 B_base_d23 + n_idx * b_nb1;
 
                             float acc = 0.0f;
+
                             for (int64_t kk = 0; kk < K; ++kk) {
                                 const float av =
                                     *(const float *)(a_row + kk * a_nb0);
@@ -2966,6 +2996,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         for (int64_t cc = 0; cc < n_valid; ++cc) {
                             const float tmu_v =
                                 g_triton_C_full[rr * N_pad + cc];
+
                             const float ref_v =
                                 C_ref_tile[rr * N_pad + cc];
 
@@ -2997,6 +3028,8 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                     // ---------------------------------------------------------
                     // Copy valid result back to GGML output.
+                    // Keep element-wise copy because GGML output layout/stride
+                    // is not row-major [M x N] in the same physical order.
                     // ---------------------------------------------------------
                     {
                         char *dst_base = (char *) node->data;
