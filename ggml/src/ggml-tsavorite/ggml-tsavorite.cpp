@@ -2091,7 +2091,6 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
   switch (op->op) {
   case GGML_OP_SET_ROWS:
           return true;
-#ifndef OLLAMA
   case GGML_OP_GET_ROWS:
           return true;
 #ifdef GGML_MUL_MAT_CPU_OPS
@@ -2106,10 +2105,12 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
           return true;
   case GGML_OP_GET_ROWS_BACK:
           return true;
+#ifndef OLLAMA
   case GGML_OP_ROPE:
           return true;
   case GGML_OP_ROPE_BACK:
           return true;
+#endif
   case GGML_OP_RESHAPE:
           return true;
   case GGML_OP_VIEW:
@@ -2122,7 +2123,6 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
           return true;
   case GGML_OP_CONT:
           return true;
-#endif
   default:
 	  break;
 	}
