@@ -2000,44 +2000,181 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
 
 //TMU Test case
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
+    if (!op) return false;
+
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
 
     if (!a || !b) return false;
 
+    // Current Triton MAT_MUL path supports only F32/F32/F32.
+    if (a->type  != GGML_TYPE_F32 ||
+        b->type  != GGML_TYPE_F32 ||
+        op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     // GGML MUL_MAT:
-    //   a/src0: [K, output_cols]
-    //   b/src1: [K, batch]
-    //   op/dst: [output_cols, batch]
-    const int64_t K          = a->ne[0];
-    const int64_t OUT_COLS   = op->ne[0];
-    const int64_t BATCH_COLS = op->ne[1];
+    //   src0/a: [K, M, 1, 1]
+    //   src1/b: [K, N, 1, 1]
+    //   dst/op: [M, N, 1, 1]
+    const int64_t K = a->ne[0];
+    const int64_t M = a->ne[1];
+    const int64_t N = b->ne[1];
 
-    if (K <= 0 || OUT_COLS <= 0 || BATCH_COLS <= 0) return false;
-
-    // Current Triton path only supports F32 path and K decomposed by 32.
-    if ((K % 32) != 0) return false;
+    if (K <= 0 || M <= 0 || N <= 0) return false;
 
     // Reduction dim must match.
     if (b->ne[0] != K) return false;
 
-    // Output shape must match expected GGML MUL_MAT relation.
-    if (a->ne[1] != OUT_COLS) return false;
-    if (b->ne[1] != BATCH_COLS) return false;
+    // Output shape must match.
+    if (op->ne[0] != M) return false;
+    if (op->ne[1] != N) return false;
 
-    // Avoid GEMV / single-column cases for now.
-    // ggml_tsavorite_run_tmu_mul_mat() currently rejects src1->ne[1] == 1.
-    if (b->ne[1] == 1) return false;
-
-    // IMPORTANT:
-    // Keep only simple 2D matmul for now.
-    // Do not enable broadcast / batched 3D/4D shapes yet.
+    // Only 2D for now.
     if (op->ne[2] != 1 || op->ne[3] != 1) return false;
     if (a->ne[2]  != 1 || a->ne[3]  != 1) return false;
     if (b->ne[2]  != 1 || b->ne[3]  != 1) return false;
 
+    // Triton kernel constraint.
+    if ((K % 32) != 0) return false;
+
+    // Safety limits for dynamic packed buffers.
+    static constexpr int64_t TSI_TRITON_MAX_K = 8192;
+    static constexpr int64_t TSI_TRITON_MAX_M = 32768;
+    static constexpr int64_t TSI_TRITON_MAX_N = 4096;
+
+    if (K > TSI_TRITON_MAX_K) return false;
+    if (M > TSI_TRITON_MAX_M) return false;
+    if (N > TSI_TRITON_MAX_N) return false;
+
+    // Local round-up helper because tsi_round_up_i64 is declared later in this file.
+    auto round_up_i64_local = [](int64_t v, int64_t a) -> int64_t {
+        return ((v + a - 1) / a) * a;
+    };
+
+    const int64_t M_pad = round_up_i64_local(M, 8);
+    const int64_t N_pad = round_up_i64_local(N, 64);
+
+    const int64_t elems_A = M_pad * K;
+    const int64_t elems_B = K * N_pad;
+    const int64_t elems_C = M_pad * N_pad;
+
+    // ~512 MB packed workspace guard.
+    static constexpr int64_t TSI_TRITON_MAX_PACKED_FLOATS =
+        (512LL * 1024LL * 1024LL) / (int64_t)sizeof(float);
+
+    if (elems_A <= 0 || elems_B <= 0 || elems_C <= 0) return false;
+
+    if (elems_A + elems_B + elems_C > TSI_TRITON_MAX_PACKED_FLOATS) {
+        return false;
+    }
+
     return true;
 }
+
+
+
+#if phase1
+static bool mul_mat_supported_size(const struct ggml_tensor *op) {
+    const struct ggml_tensor *a = op->src[0];
+    const struct ggml_tensor *b = op->src[1];
+
+    if (!a || !b) return false;
+
+    const int64_t K = a->ne[0];
+    const int64_t M = a->ne[1];
+    const int64_t N = b->ne[1];
+
+    // =====================================================
+    // ✅ BASIC SAFETY (DO NOT CHANGE)
+    // =====================================================
+    if (K <= 0 || M <= 0 || N <= 0) return false;
+
+    if (b->ne[0] != K) return false;
+
+    if (a->ne[1] != op->ne[0]) return false;
+    if (b->ne[1] != op->ne[1]) return false;
+
+    // Only 2D tensors (important)
+    if (op->ne[2] != 1 || op->ne[3] != 1) return false;
+    if (a->ne[2]  != 1 || a->ne[3]  != 1) return false;
+    if (b->ne[2]  != 1 || b->ne[3]  != 1) return false;
+
+    // skip GEMV for now
+    if (N == 1) return false;
+
+    // Triton requirement
+    if ((K % 32) != 0) return false;
+
+    // DEBUG (KEEP ON until stable)
+    //printf("CHECK: K=%ld M=%ld N=%ld\n", K, M, N);
+
+
+    // =====================================================
+    // ✅ PHASE 1 — GUARANTEED HIT (START HERE)
+    // Goal: confirm routing to OPU works again
+    // =====================================================
+#if 1
+    if ((K % 32) == 0 && N != 1) {
+        return true;   // broad allow
+    }
+    return false;
+#endif
+
+
+    // =====================================================
+    // ✅ PHASE 2 — CONTROLLED (REAL SHAPES)
+    // Enable after Phase 1 stable
+    // =====================================================
+#if 1
+    if (K == 576 &&
+        (M == 576 || M == 192 || M == 128 || M == 1) &&
+        (N >= 2 && N <= 64)) {
+        return true;
+    }
+    return false;
+#endif
+
+
+    // =====================================================
+    // ✅ PHASE 3 — ADD LARGE K (1536)
+    // =====================================================
+#if 3
+    if ((K == 576 || K == 1536) &&
+        (M == 576 || M == 192 || M == 1536 || M == 128) &&
+        (N >= 2 && N <= 64)) {
+        return true;
+    }
+    return false;
+#endif
+
+
+    // =====================================================
+    // ✅ PHASE 4 — SMALL SHAPES (attention path)
+    // =====================================================
+#if 4
+    if ((K == 576 || K == 1536 || K == 256 || K == 64) &&
+        (M == 576 || M == 192 || M == 1536 || M == 256 || M == 64 || M == 1) &&
+        (N >= 2 && N <= 128)) {
+        return true;
+    }
+    return false;
+#endif
+
+
+    // =====================================================
+    // ✅ FINAL — ALL SAFE TRITON SHAPES
+    // =====================================================
+#if 5
+    if ((K % 32) == 0 && N != 1) {
+        return true;
+    }
+    return false;
+#endif
+}
+#endif /* phase1 */
+
 
 
 #if 0
@@ -2476,45 +2613,58 @@ static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
 static constexpr int32_t TRITON_FULL_M_TILE = 64;
 static constexpr int32_t TRITON_FULL_N_TILE = 64;
 
-static float *g_triton_A_full = nullptr; // [64 x K_cap]
-static float *g_triton_B_full = nullptr; // [K_cap x 64]
-static float *g_triton_C_full = nullptr; // [64 x 64]
+static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
+static float *g_triton_B_full = nullptr; // [K_cap x N_cap]
+static float *g_triton_C_full = nullptr; // [M_cap x N_cap]
+
+static int64_t g_triton_M_cap = 0;
+static int64_t g_triton_N_cap = 0;
 static int64_t g_triton_K_cap = 0;
 
-static inline void ensure_triton_full_buffers(int64_t K) {
+static inline void ensure_triton_full_buffers(int64_t M_pad, int64_t N_pad, int64_t K) {
+    TSAVORITE_GGML_ASSERT(M_pad > 0);
+    TSAVORITE_GGML_ASSERT(N_pad > 0);
     TSAVORITE_GGML_ASSERT(K > 0);
 
+    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
+    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+
+    const int64_t need_M = M_pad;
+    const int64_t need_N = N_pad;
     const int64_t need_K = tsi_round_up_i64(K, 32);
 
-    // Allocate at least 2048 once so we do not grow/re-allocate for common model K values.
-    const int64_t alloc_K = (need_K > 2048) ? need_K : 2048;
+    if (!g_triton_A_full || !g_triton_B_full || !g_triton_C_full ||
+        need_M > g_triton_M_cap ||
+        need_N > g_triton_N_cap ||
+        need_K > g_triton_K_cap) {
 
-    if (!g_triton_C_full) {
-        g_triton_C_full = (float *) tsi_alloc(
-            (size_t) TRITON_FULL_M_TILE *
-            (size_t) TRITON_FULL_N_TILE *
-            sizeof(float));
-
-        TSAVORITE_GGML_ASSERT(g_triton_C_full);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
-    }
-
-    if (!g_triton_A_full || !g_triton_B_full || alloc_K > g_triton_K_cap) {
-        g_triton_K_cap = alloc_K;
+        g_triton_M_cap = need_M;
+        g_triton_N_cap = need_N;
+        g_triton_K_cap = need_K;
 
         g_triton_A_full = (float *) tsi_alloc(
-            (size_t) TRITON_FULL_M_TILE *
+            (size_t) g_triton_M_cap *
             (size_t) g_triton_K_cap *
             sizeof(float));
 
         g_triton_B_full = (float *) tsi_alloc(
             (size_t) g_triton_K_cap *
-            (size_t) TRITON_FULL_N_TILE *
+            (size_t) g_triton_N_cap *
             sizeof(float));
 
-        TSAVORITE_GGML_ASSERT(g_triton_A_full && g_triton_B_full);
+        g_triton_C_full = (float *) tsi_alloc(
+            (size_t) g_triton_M_cap *
+            (size_t) g_triton_N_cap *
+            sizeof(float));
+
+        TSAVORITE_GGML_ASSERT(g_triton_A_full);
+        TSAVORITE_GGML_ASSERT(g_triton_B_full);
+        TSAVORITE_GGML_ASSERT(g_triton_C_full);
+
         TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_A_full) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_B_full) & 127) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
     }
 }
 
@@ -2819,245 +2969,93 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
     if (src1->ne[0] != K) return GGML_STATUS_FAILED;
     if ((K % 32) != 0) return GGML_STATUS_FAILED;
-    if (src1->ne[1] == 1) return GGML_STATUS_FAILED;
 
-    ensure_triton_full_buffers(K);
+    // 2D only.
+    if (node->ne[2] != 1 || node->ne[3] != 1) return GGML_STATUS_FAILED;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return GGML_STATUS_FAILED;
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return GGML_STATUS_FAILED;
 
-#ifdef TMU_DEBUG_VALIDATE
-    static float C_ref_tile[TRITON_FULL_M_TILE * TRITON_FULL_N_TILE];
-#endif
+    if (node->ne[0] != M) return GGML_STATUS_FAILED;
+    if (node->ne[1] != N) return GGML_STATUS_FAILED;
+
+    const int64_t M_pad = tsi_round_up_i64(M, 8);
+    const int64_t N_pad = tsi_round_up_i64(N, 64);
+
+    ensure_triton_full_buffers(M_pad, N_pad, K);
 
     const int64_t a_nb0 = nb_or_default(src0, 0);
     const int64_t a_nb1 = nb_or_default(src0, 1);
-    const int64_t a_nb2 = nb_or_default(src0, 2);
-    const int64_t a_nb3 = nb_or_default(src0, 3);
 
     const int64_t b_nb0 = nb_or_default(src1, 0);
     const int64_t b_nb1 = nb_or_default(src1, 1);
-    const int64_t b_nb2 = nb_or_default(src1, 2);
-    const int64_t b_nb3 = nb_or_default(src1, 3);
 
     const int64_t c_nb0 = nb_or_default(node, 0);
     const int64_t c_nb1 = nb_or_default(node, 1);
-    const int64_t c_nb2 = nb_or_default(node, 2);
-    const int64_t c_nb3 = nb_or_default(node, 3);
 
-    const int64_t A2 = src0->ne[2] ? src0->ne[2] : 1;
-    const int64_t A3 = src0->ne[3] ? src0->ne[3] : 1;
-    const int64_t B2 = src1->ne[2] ? src1->ne[2] : 1;
-    const int64_t B3 = src1->ne[3] ? src1->ne[3] : 1;
+    // Pack A: [M_pad x K]
+    memset(g_triton_A_full, 0, (size_t) M_pad * (size_t) K * sizeof(float));
 
-    const int64_t D2 = (A2 > B2) ? A2 : B2;
-    const int64_t D3 = (A3 > B3) ? A3 : B3;
+    for (int64_t r = 0; r < M; ++r) {
+        const char *src_row = (const char *) src0->data + r * a_nb1;
+        float *dst_row = g_triton_A_full + r * K;
 
-    for (int64_t od3 = 0; od3 < D3; ++od3) {
-        const int64_t a_d3 = map_repeat_i64(od3, A3);
-        const int64_t b_d3 = map_repeat_i64(od3, B3);
+        if (a_nb0 == (int64_t) sizeof(float)) {
+            memcpy(dst_row, src_row, (size_t) K * sizeof(float));
+        } else {
+            for (int64_t kk = 0; kk < K; ++kk) {
+                dst_row[kk] = *(const float *)(src_row + kk * a_nb0);
+            }
+        }
+    }
 
-        for (int64_t od2 = 0; od2 < D2; ++od2) {
-            const int64_t a_d2 = map_repeat_i64(od2, A2);
-            const int64_t b_d2 = map_repeat_i64(od2, B2);
+    // Pack B: [K x N_pad]
+    memset(g_triton_B_full, 0, (size_t) K * (size_t) N_pad * sizeof(float));
 
-            const char *A_base_d23 =
-                (const char *) src0->data + a_d2 * a_nb2 + a_d3 * a_nb3;
+    for (int64_t c = 0; c < N; ++c) {
+        const char *src_col = (const char *) src1->data + c * b_nb1;
 
-            const char *B_base_d23 =
-                (const char *) src1->data + b_d2 * b_nb2 + b_d3 * b_nb3;
+        for (int64_t kk = 0; kk < K; ++kk) {
+            g_triton_B_full[kk * N_pad + c] =
+                *(const float *)(src_col + kk * b_nb0);
+        }
+    }
 
-            for (int64_t m0 = 0; m0 < M; m0 += TRITON_FULL_M_TILE) {
-                const int64_t m_valid =
-                    (M - m0 > TRITON_FULL_M_TILE) ? TRITON_FULL_M_TILE : (M - m0);
+    // C must be zero because Triton kernel does:
+    // acc = load(C); acc += dot(A, B)
+    memset(g_triton_C_full, 0, (size_t) M_pad * (size_t) N_pad * sizeof(float));
 
-                const int64_t M_pad = tsi_round_up_i64(m_valid, 8);
+    // Single Triton call for full 2D MAT_MUL/GEMV.
+    call_triton_matmul_full_packed(
+        g_triton_A_full,
+        g_triton_B_full,
+        g_triton_C_full,
+        (int32_t) M_pad,
+        (int32_t) N_pad,
+        (int32_t) K);
 
-                for (int64_t n0 = 0; n0 < N; n0 += TRITON_FULL_N_TILE) {
-                    const int64_t n_valid =
-                        (N - n0 > TRITON_FULL_N_TILE) ? TRITON_FULL_N_TILE : (N - n0);
+    if (device) {
+        ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
+    }
+    ++node->tsi_kernel_runs;
 
-                    const int64_t N_pad = TRITON_FULL_N_TILE;
+    // Copy back dst [M x N]
+    {
+        char *dst_base = (char *) node->data;
+        const size_t bytes_total = (size_t) ggml_nbytes(node);
 
-                    // ---------------------------------------------------------
-                    // Pack A as Triton-native row-major [M_pad x K].
-                    // Optimization:
-                    // - If rows are contiguous, use memcpy per row.
-                    // - Only memset A when padding rows are needed.
-                    // ---------------------------------------------------------
-                    if (m_valid < M_pad) {
-                        memset(g_triton_A_full, 0,
-                               (size_t) M_pad * (size_t) K * sizeof(float));
-                    }
+        for (int64_t r = 0; r < M; ++r) {
+            for (int64_t c = 0; c < N; ++c) {
+                const int64_t byte_off =
+                    r * c_nb0 +
+                    c * c_nb1;
 
-                    if (a_nb0 == (int64_t) sizeof(float)) {
-                        for (int64_t r = 0; r < m_valid; ++r) {
-                            const int64_t m_idx = m0 + r;
-
-                            const char *src_row =
-                                A_base_d23 + m_idx * a_nb1;
-
-                            float *dst_row =
-                                g_triton_A_full + r * K;
-
-                            memcpy(dst_row, src_row, (size_t) K * sizeof(float));
-                        }
-                    } else {
-                        if (m_valid == M_pad) {
-                            // No padding rows, but non-contiguous K stride.
-                            // Every valid element is written below, so no memset required.
-                        }
-
-                        for (int64_t r = 0; r < m_valid; ++r) {
-                            const int64_t m_idx = m0 + r;
-
-                            const char *src_row =
-                                A_base_d23 + m_idx * a_nb1;
-
-                            float *dst_row =
-                                g_triton_A_full + r * K;
-
-                            for (int64_t kk = 0; kk < K; ++kk) {
-                                dst_row[kk] =
-                                    *(const float *)(src_row + kk * a_nb0);
-                            }
-                        }
-                    }
-
-                    // ---------------------------------------------------------
-                    // Pack B as Triton-native row-major [K x N_pad].
-                    // Optimization:
-                    // - If full N tile, every B element is written, so skip memset.
-                    // - If tail N tile, memset is required to zero padded columns.
-                    // ---------------------------------------------------------
-                    if (n_valid < N_pad) {
-                        memset(g_triton_B_full, 0,
-                               (size_t) K * (size_t) N_pad * sizeof(float));
-                    }
-
-                    for (int64_t c = 0; c < n_valid; ++c) {
-                        const int64_t n_idx = n0 + c;
-
-                        const char *src_col =
-                            B_base_d23 + n_idx * b_nb1;
-
-                        for (int64_t kk = 0; kk < K; ++kk) {
-                            g_triton_B_full[kk * N_pad + c] =
-                                *(const float *)(src_col + kk * b_nb0);
-                        }
-                    }
-
-                    // ---------------------------------------------------------
-                    // C must be zero because Triton does:
-                    //   acc = load(C)
-                    //   acc += dot(A,B)
-                    // ---------------------------------------------------------
-                    memset(g_triton_C_full, 0,
-                           (size_t) M_pad * (size_t) N_pad * sizeof(float));
-
-                    call_triton_matmul_full_packed(
-                        g_triton_A_full,
-                        g_triton_B_full,
-                        g_triton_C_full,
-                        (int32_t) M_pad,
-                        (int32_t) N_pad,
-                        (int32_t) K);
-
-                    if (device) {
-                        ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                    }
-                    ++node->tsi_kernel_runs;
-
-#ifdef TMU_DEBUG_VALIDATE
-                    memset(C_ref_tile, 0, sizeof(C_ref_tile));
-
-                    for (int64_t rr = 0; rr < m_valid; ++rr) {
-                        const int64_t m_idx = m0 + rr;
-                        const char *a_row =
-                            A_base_d23 + m_idx * a_nb1;
-
-                        for (int64_t cc = 0; cc < n_valid; ++cc) {
-                            const int64_t n_idx = n0 + cc;
-                            const char *b_col =
-                                B_base_d23 + n_idx * b_nb1;
-
-                            float acc = 0.0f;
-
-                            for (int64_t kk = 0; kk < K; ++kk) {
-                                const float av =
-                                    *(const float *)(a_row + kk * a_nb0);
-                                const float bv =
-                                    *(const float *)(b_col + kk * b_nb0);
-                                acc += av * bv;
-                            }
-
-                            C_ref_tile[rr * N_pad + cc] = acc;
-                        }
-                    }
-
-                    for (int64_t rr = 0; rr < m_valid; ++rr) {
-                        for (int64_t cc = 0; cc < n_valid; ++cc) {
-                            const float tmu_v =
-                                g_triton_C_full[rr * N_pad + cc];
-
-                            const float ref_v =
-                                C_ref_tile[rr * N_pad + cc];
-
-                            const float abs_err = fabsf(tmu_v - ref_v);
-                            const float rel_err =
-                                abs_err / fmaxf(1.0f, fabsf(ref_v));
-
-                            if (abs_err > 1e-3f && rel_err > 1e-5f) {
-                                fprintf(stderr,
-                                        "\nTRITON FULL MATMUL MISMATCH\n"
-                                        "m0=%ld n0=%ld K=%ld\n"
-                                        "r=%ld c=%ld TRITON=%f REF=%f ABS=%e REL=%e\n",
-                                        (long)m0,
-                                        (long)n0,
-                                        (long)K,
-                                        (long)rr,
-                                        (long)cc,
-                                        tmu_v,
-                                        ref_v,
-                                        abs_err,
-                                        rel_err);
-
-                                tsi_cleanup();
-                                abort();
-                            }
-                        }
-                    }
-#endif
-
-                    // ---------------------------------------------------------
-                    // Copy valid result back to GGML output.
-                    // Keep element-wise copy because GGML output layout/stride
-                    // is not row-major [M x N] in the same physical order.
-                    // ---------------------------------------------------------
-                    {
-                        char *dst_base = (char *) node->data;
-                        const size_t bytes_total = (size_t) ggml_nbytes(node);
-
-                        for (int64_t rr = 0; rr < m_valid; ++rr) {
-                            const int64_t m_idx = m0 + rr;
-
-                            for (int64_t cc = 0; cc < n_valid; ++cc) {
-                                const int64_t n_idx = n0 + cc;
-
-                                const int64_t byte_off =
-                                    m_idx * c_nb0 +
-                                    n_idx * c_nb1 +
-                                    od2   * c_nb2 +
-                                    od3   * c_nb3;
-
-                                if (byte_off < 0 ||
-                                    (size_t) byte_off + sizeof(float) > bytes_total) {
-                                    continue;
-                                }
-
-                                *(float *)(dst_base + byte_off) =
-                                    g_triton_C_full[rr * N_pad + cc];
-                            }
-                        }
-                    }
+                if (byte_off < 0 ||
+                    (size_t) byte_off + sizeof(float) > bytes_total) {
+                    continue;
                 }
+
+                *(float *)(dst_base + byte_off) =
+                    g_triton_C_full[r * N_pad + c];
             }
         }
     }
