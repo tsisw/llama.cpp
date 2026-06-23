@@ -2476,45 +2476,58 @@ static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
 static constexpr int32_t TRITON_FULL_M_TILE = 64;
 static constexpr int32_t TRITON_FULL_N_TILE = 64;
 
-static float *g_triton_A_full = nullptr; // [64 x K_cap]
-static float *g_triton_B_full = nullptr; // [K_cap x 64]
-static float *g_triton_C_full = nullptr; // [64 x 64]
+static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
+static float *g_triton_B_full = nullptr; // [K_cap x N_cap]
+static float *g_triton_C_full = nullptr; // [M_cap x N_cap]
+
+static int64_t g_triton_M_cap = 0;
+static int64_t g_triton_N_cap = 0;
 static int64_t g_triton_K_cap = 0;
 
-static inline void ensure_triton_full_buffers(int64_t K) {
+static inline void ensure_triton_full_buffers(int64_t M_pad, int64_t N_pad, int64_t K) {
+    TSAVORITE_GGML_ASSERT(M_pad > 0);
+    TSAVORITE_GGML_ASSERT(N_pad > 0);
     TSAVORITE_GGML_ASSERT(K > 0);
 
+    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
+    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+
+    const int64_t need_M = M_pad;
+    const int64_t need_N = N_pad;
     const int64_t need_K = tsi_round_up_i64(K, 32);
 
-    // Allocate at least 2048 once so we do not grow/re-allocate for common model K values.
-    const int64_t alloc_K = (need_K > 2048) ? need_K : 2048;
+    if (!g_triton_A_full || !g_triton_B_full || !g_triton_C_full ||
+        need_M > g_triton_M_cap ||
+        need_N > g_triton_N_cap ||
+        need_K > g_triton_K_cap) {
 
-    if (!g_triton_C_full) {
-        g_triton_C_full = (float *) tsi_alloc(
-            (size_t) TRITON_FULL_M_TILE *
-            (size_t) TRITON_FULL_N_TILE *
-            sizeof(float));
-
-        TSAVORITE_GGML_ASSERT(g_triton_C_full);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
-    }
-
-    if (!g_triton_A_full || !g_triton_B_full || alloc_K > g_triton_K_cap) {
-        g_triton_K_cap = alloc_K;
+        g_triton_M_cap = need_M;
+        g_triton_N_cap = need_N;
+        g_triton_K_cap = need_K;
 
         g_triton_A_full = (float *) tsi_alloc(
-            (size_t) TRITON_FULL_M_TILE *
+            (size_t) g_triton_M_cap *
             (size_t) g_triton_K_cap *
             sizeof(float));
 
         g_triton_B_full = (float *) tsi_alloc(
             (size_t) g_triton_K_cap *
-            (size_t) TRITON_FULL_N_TILE *
+            (size_t) g_triton_N_cap *
             sizeof(float));
 
-        TSAVORITE_GGML_ASSERT(g_triton_A_full && g_triton_B_full);
+        g_triton_C_full = (float *) tsi_alloc(
+            (size_t) g_triton_M_cap *
+            (size_t) g_triton_N_cap *
+            sizeof(float));
+
+        TSAVORITE_GGML_ASSERT(g_triton_A_full);
+        TSAVORITE_GGML_ASSERT(g_triton_B_full);
+        TSAVORITE_GGML_ASSERT(g_triton_C_full);
+
         TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_A_full) & 127) == 0);
         TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_B_full) & 127) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
     }
 }
 
