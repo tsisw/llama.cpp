@@ -2000,79 +2000,58 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
 
 //TMU Test case
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
-    if (!op) return false;
-
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
 
     if (!a || !b) return false;
 
-    // Current Triton MAT_MUL path supports only F32/F32/F32.
-    if (a->type  != GGML_TYPE_F32 ||
-        b->type  != GGML_TYPE_F32 ||
+    // =====================================================
+    // TYPE FILTER (ONLY F32 FOR NOW)
+    // =====================================================
+    if (a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 ||
         op->type != GGML_TYPE_F32) {
         return false;
     }
 
-    // GGML MUL_MAT:
-    //   src0/a: [K, M, 1, 1]
-    //   src1/b: [K, N, 1, 1]
-    //   dst/op: [M, N, 1, 1]
     const int64_t K = a->ne[0];
     const int64_t M = a->ne[1];
     const int64_t N = b->ne[1];
 
+    // =====================================================
+    // BASIC VALIDATION
+    // =====================================================
     if (K <= 0 || M <= 0 || N <= 0) return false;
 
-    // Reduction dim must match.
     if (b->ne[0] != K) return false;
 
-    // Output shape must match.
-    if (op->ne[0] != M) return false;
-    if (op->ne[1] != N) return false;
+    if (a->ne[1] != op->ne[0]) return false;
+    if (b->ne[1] != op->ne[1]) return false;
 
-    // Only 2D for now.
+    // Only pure 2D (REQUIRED for Triton path right now)
     if (op->ne[2] != 1 || op->ne[3] != 1) return false;
     if (a->ne[2]  != 1 || a->ne[3]  != 1) return false;
     if (b->ne[2]  != 1 || b->ne[3]  != 1) return false;
 
-    // Triton kernel constraint.
+    // Skip GEMV for now (can enable later)
+    if (N == 1) return false;
+
+    // Triton tiling requirement
     if ((K % 32) != 0) return false;
 
-    // Safety limits for dynamic packed buffers.
-    static constexpr int64_t TSI_TRITON_MAX_K = 8192;
-    static constexpr int64_t TSI_TRITON_MAX_M = 32768;
-    static constexpr int64_t TSI_TRITON_MAX_N = 4096;
+    // =====================================================
+    // GENERIC SAFE FILTER
+    // =====================================================
 
-    if (K > TSI_TRITON_MAX_K) return false;
-    if (M > TSI_TRITON_MAX_M) return false;
-    if (N > TSI_TRITON_MAX_N) return false;
+    // Avoid extremely tiny cases (overhead > compute)
+    if (M < 16 || N < 2) return false;
 
-    // Local round-up helper because tsi_round_up_i64 is declared later in this file.
-    auto round_up_i64_local = [](int64_t v, int64_t a) -> int64_t {
-        return ((v + a - 1) / a) * a;
-    };
+    // Avoid extremely large pathological cases (optional safety)
+    if (M > 4096 || N > 4096 || K > 8192) return false;
 
-    const int64_t M_pad = round_up_i64_local(M, 8);
-    const int64_t N_pad = round_up_i64_local(N, 64);
-
-    const int64_t elems_A = M_pad * K;
-    const int64_t elems_B = K * N_pad;
-    const int64_t elems_C = M_pad * N_pad;
-
-    // ~512 MB packed workspace guard.
-    static constexpr int64_t TSI_TRITON_MAX_PACKED_FLOATS =
-        (512LL * 1024LL * 1024LL) / (int64_t)sizeof(float);
-
-    if (elems_A <= 0 || elems_B <= 0 || elems_C <= 0) return false;
-
-    if (elems_A + elems_B + elems_C > TSI_TRITON_MAX_PACKED_FLOATS) {
-        return false;
-    }
-
+    // Allow everything else
     return true;
 }
-
 
 
 #if phase1
@@ -2949,12 +2928,15 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     enum ggml_tsavorite_kernel_type kernel_type,
     int /*kernel_sub_type*/) {
 
+    // ---------------------------------------------------------
+    // Basic validation
+    // ---------------------------------------------------------
     if (!node || !node->src[0] || !node->src[1] || !node->data) {
         return GGML_STATUS_FAILED;
     }
 
-    const struct ggml_tensor *src0 = node->src[0];
-    const struct ggml_tensor *src1 = node->src[1];
+    const struct ggml_tensor *src0 = node->src[0]; // A
+    const struct ggml_tensor *src1 = node->src[1]; // B
 
     if (src0->type != GGML_TYPE_F32 ||
         src1->type != GGML_TYPE_F32 ||
@@ -2969,20 +2951,20 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
     if (src1->ne[0] != K) return GGML_STATUS_FAILED;
     if ((K % 32) != 0) return GGML_STATUS_FAILED;
+    if (src1->ne[1] == 1) return GGML_STATUS_FAILED;
 
-    // 2D only.
-    if (node->ne[2] != 1 || node->ne[3] != 1) return GGML_STATUS_FAILED;
-    if (src0->ne[2] != 1 || src0->ne[3] != 1) return GGML_STATUS_FAILED;
-    if (src1->ne[2] != 1 || src1->ne[3] != 1) return GGML_STATUS_FAILED;
-
-    if (node->ne[0] != M) return GGML_STATUS_FAILED;
-    if (node->ne[1] != N) return GGML_STATUS_FAILED;
-
+    // ---------------------------------------------------------
+    // Ensure Triton buffers
+    // Padding
+    // ---------------------------------------------------------
     const int64_t M_pad = tsi_round_up_i64(M, 8);
     const int64_t N_pad = tsi_round_up_i64(N, 64);
 
     ensure_triton_full_buffers(M_pad, N_pad, K);
 
+    // ---------------------------------------------------------
+    // Strides
+    // ---------------------------------------------------------
     const int64_t a_nb0 = nb_or_default(src0, 0);
     const int64_t a_nb1 = nb_or_default(src0, 1);
 
@@ -2992,15 +2974,19 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     const int64_t c_nb0 = nb_or_default(node, 0);
     const int64_t c_nb1 = nb_or_default(node, 1);
 
-    // Pack A: [M_pad x K]
-    memset(g_triton_A_full, 0, (size_t) M_pad * (size_t) K * sizeof(float));
+
+    // ---------------------------------------------------------
+    // Pack FULL A → [M_pad x K]
+    // ---------------------------------------------------------
+    memset(g_triton_A_full, 0, (size_t)M_pad * K * sizeof(float));
 
     for (int64_t r = 0; r < M; ++r) {
-        const char *src_row = (const char *) src0->data + r * a_nb1;
+        const char *src_row = (const char *)src0->data + r * a_nb1;
+
         float *dst_row = g_triton_A_full + r * K;
 
-        if (a_nb0 == (int64_t) sizeof(float)) {
-            memcpy(dst_row, src_row, (size_t) K * sizeof(float));
+        if (a_nb0 == sizeof(float)) {
+            memcpy(dst_row, src_row, (size_t)K * sizeof(float));
         } else {
             for (int64_t kk = 0; kk < K; ++kk) {
                 dst_row[kk] = *(const float *)(src_row + kk * a_nb0);
@@ -3008,11 +2994,13 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         }
     }
 
-    // Pack B: [K x N_pad]
-    memset(g_triton_B_full, 0, (size_t) K * (size_t) N_pad * sizeof(float));
+    // ---------------------------------------------------------
+    // Pack FULL B → [K x N_pad]
+    // ---------------------------------------------------------
+    memset(g_triton_B_full, 0, (size_t)K * N_pad * sizeof(float));
 
     for (int64_t c = 0; c < N; ++c) {
-        const char *src_col = (const char *) src1->data + c * b_nb1;
+        const char *src_col = (const char *)src1->data + c * b_nb1;
 
         for (int64_t kk = 0; kk < K; ++kk) {
             g_triton_B_full[kk * N_pad + c] =
@@ -3020,37 +3008,46 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         }
     }
 
-    // C must be zero because Triton kernel does:
-    // acc = load(C); acc += dot(A, B)
-    memset(g_triton_C_full, 0, (size_t) M_pad * (size_t) N_pad * sizeof(float));
+    // ---------------------------------------------------------
+    // Zero C
+    // ---------------------------------------------------------
+    memset(g_triton_C_full, 0, (size_t)M_pad * N_pad * sizeof(float));
 
-    // Single Triton call for full 2D MAT_MUL/GEMV.
+    // ---------------------------------------------------------
+    // SINGLE Triton call (FULL MATMUL)
+    // ---------------------------------------------------------
     call_triton_matmul_full_packed(
         g_triton_A_full,
         g_triton_B_full,
         g_triton_C_full,
-        (int32_t) M_pad,
-        (int32_t) N_pad,
-        (int32_t) K);
+        (int32_t)M_pad,
+        (int32_t)N_pad,
+        (int32_t)K);
 
+    // ---------------------------------------------------------
+    // Stats update (IMPORTANT)
+    // ---------------------------------------------------------
     if (device) {
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
     }
     ++node->tsi_kernel_runs;
 
-    // Copy back dst [M x N]
+    // ---------------------------------------------------------
+    // Copy back to GGML tensor
+    // ---------------------------------------------------------
     {
-        char *dst_base = (char *) node->data;
+        char *dst_base = (char *)node->data;
         const size_t bytes_total = (size_t) ggml_nbytes(node);
 
         for (int64_t r = 0; r < M; ++r) {
             for (int64_t c = 0; c < N; ++c) {
+
                 const int64_t byte_off =
                     r * c_nb0 +
                     c * c_nb1;
 
                 if (byte_off < 0 ||
-                    (size_t) byte_off + sizeof(float) > bytes_total) {
+                    (size_t)byte_off + sizeof(float) > bytes_total) {
                     continue;
                 }
 
