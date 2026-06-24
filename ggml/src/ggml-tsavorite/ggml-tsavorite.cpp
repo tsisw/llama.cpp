@@ -2105,12 +2105,10 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
           return true;
   case GGML_OP_GET_ROWS_BACK:
           return true;
-#ifndef OLLAMA
   case GGML_OP_ROPE:
           return true;
   case GGML_OP_ROPE_BACK:
           return true;
-#endif
   case GGML_OP_RESHAPE:
           return true;
   case GGML_OP_VIEW:
@@ -2899,7 +2897,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     if(node->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16 && (!src1 || src1->type == GGML_TYPE_F16))
 	    kernel_sub_type = DATA_TYPE_F16_INDEX;
 
-    if (node->op == GGML_OP_RMS_NORM ||  node->op == GGML_OP_SOFT_MAX) {
+    if (node->op == GGML_OP_RMS_NORM ||  node->op == GGML_OP_SOFT_MAX || node->op == GGML_OP_ROPE || node->op == GGML_OP_ROPE_BACK) {
         if (!glob_buf) {
             GGML_TSAVORITE_LOG_ERROR("tsi_alloc failied for creating memory for buf \n");
             return GGML_STATUS_ABORTED;
