@@ -2000,47 +2000,263 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
 
 //TMU Test case
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
+    if (!op) return false;
+
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
-
     if (!a || !b) return false;
 
+    // Only safe F32 Triton MAT_MUL path.
+    if (a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 ||
+        op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     // GGML MUL_MAT:
-    //   a/src0: [K, output_cols]
-    //   b/src1: [K, batch]
-    //   op/dst: [output_cols, batch]
-    const int64_t K          = a->ne[0];
-    const int64_t OUT_COLS   = op->ne[0];
-    const int64_t BATCH_COLS = op->ne[1];
+    //   a/src0: [K, M, d2, d3]
+    //   b/src1: [K, N, d2, d3]
+    //   op/dst: [M, N, d2, d3]
+    const int64_t K = a->ne[0];
+    const int64_t M = a->ne[1];
+    const int64_t N = b->ne[1];
 
-    if (K <= 0 || OUT_COLS <= 0 || BATCH_COLS <= 0) return false;
+    if (K <= 0 || M <= 0 || N <= 0) return false;
 
-    // Current Triton path only supports F32 path and K decomposed by 32.
+    // Shape correctness.
+    if (b->ne[0]  != K) return false;
+    if (op->ne[0] != M) return false;
+    if (op->ne[1] != N) return false;
+
+    // Triton MAT_MUL K requirement.
     if ((K % 32) != 0) return false;
 
-    // Reduction dim must match.
-    if (b->ne[0] != K) return false;
+    const int64_t M_pad = ((M + 7)  / 8)  * 8;
+    const int64_t N_pad = ((N + 63) / 64) * 64;
 
-    // Output shape must match expected GGML MUL_MAT relation.
-    if (a->ne[1] != OUT_COLS) return false;
-    if (b->ne[1] != BATCH_COLS) return false;
+    const int64_t elems_A = M_pad * K;
+    const int64_t elems_B = K * N_pad;
+    const int64_t elems_C = M_pad * N_pad;
 
-    // Avoid GEMV / single-column cases for now.
-    // ggml_tsavorite_run_tmu_mul_mat() currently rejects src1->ne[1] == 1.
-    if (b->ne[1] == 1) return false;
+    if (elems_A <= 0 || elems_B <= 0 || elems_C <= 0) {
+        return false;
+    }
 
-    // IMPORTANT:
-    // Keep only simple 2D matmul for now.
-    // Do not enable broadcast / batched 3D/4D shapes yet.
+    const int64_t total_bytes =
+        (elems_A + elems_B + elems_C) * (int64_t) sizeof(float);
+
+    /*
+     * Workaround for SS-1345:
+     *
+     * Current crash:
+     *   Failed to allocate 46137344 in DRAM_xxx
+     *
+     * Stack:
+     *   _mlir_ciface_matmul_kernel_memory_wrapper
+     *     -> matmul_kernel_memory_wrapper
+     *     -> matmul_kernel
+     *     -> tsi_alloc
+     *
+     * Keep limit below the crashing range.
+     */
+    static constexpr int64_t MAX_SAFE_PACKED_BYTES =
+        44LL * 1024LL * 1024LL;
+
+    if (total_bytes >= MAX_SAFE_PACKED_BYTES) {
+        /*
+         * Temporary debug for SS-1345:
+         * Print each rejected shape only once to avoid flooding logs.
+         */
+        static std::mutex s_reject_log_mutex;
+        static std::vector<std::string> s_reject_log_keys;
+
+        char key_buf[256];
+        snprintf(key_buf, sizeof(key_buf),
+                 "K=%ld M=%ld N=%ld M_pad=%ld N_pad=%ld total_bytes=%ld",
+                 (long) K, (long) M, (long) N,
+                 (long) M_pad, (long) N_pad,
+                 (long) total_bytes);
+
+#if 0
+        bool already_logged = false;
+        {
+            std::lock_guard<std::mutex> lock(s_reject_log_mutex);
+            for (const std::string &k : s_reject_log_keys) {
+                if (k == key_buf) {
+                    already_logged = true;
+                    break;
+                }
+            }
+
+            if (!already_logged) {
+                s_reject_log_keys.push_back(std::string(key_buf));
+            }
+        }
+
+        if (!already_logged) {
+            fprintf(stderr,
+                    "MUL_MAT_REJECT_SS1345: K=%ld M=%ld N=%ld "
+                    "M_pad=%ld N_pad=%ld total_bytes=%ld limit=%ld "
+                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                    (long) K, (long) M, (long) N,
+                    (long) M_pad, (long) N_pad,
+                    (long) total_bytes,
+                    (long) MAX_SAFE_PACKED_BYTES,
+                    (long) a->ne[0],  (long) a->ne[1],  (long) a->ne[2],  (long) a->ne[3],
+                    (long) b->ne[0],  (long) b->ne[1],  (long) b->ne[2],  (long) b->ne[3],
+                    (long) op->ne[0], (long) op->ne[1], (long) op->ne[2], (long) op->ne[3]);
+        }
+#endif /* 0 */
+
+        return false;
+    }
+
+    // Extra sanity caps.
+    if (K > 8192)  return false;
+    if (M > 32768) return false;
+    if (N > 4096)  return false;
+
+    // ============================================================
+    // PHASE 0: current stable path — strict logical 2D only.
+    // ============================================================
+    if (op->ne[2] == 1 && op->ne[3] == 1 &&
+        a->ne[2]  == 1 && a->ne[3]  == 1 &&
+        b->ne[2]  == 1 && b->ne[3]  == 1) {
+        // Avoid GEMV/single-column path for current 2D Triton path.
+        if (N == 1) return false;
+        return true;
+    }
+
+    // ============================================================
+    // PHASE 1: enable only known small Tiny-Llama 4D shapes.
+    //
+    // Current known-safe 4D shapes from shape log:
+    //   op=[256,1,32,1], src0=[64,256,4,1],  src1=[64,1,32,1]
+    //   op=[64,1,32,1],  src0=[256,64,4,1],  src1=[256,1,32,1]
+    //
+    // NOTE:
+    // Runner must use broadcast mapping:
+    //   a_d2 = d2 % a->ne[2]
+    //   b_d2 = d2 % b->ne[2]
+    //
+    // Do not enable any other 4D shape yet.
+    // ============================================================
+    if (op->ne[3] == 1 && a->ne[3] == 1 && b->ne[3] == 1 &&
+        op->ne[2] == 32 &&
+        b->ne[2]  == 32 &&
+        a->ne[2]  == 4 &&
+        N == 1) {
+
+        if (K == 64 && M == 256) {
+#if 0
+            fprintf(stderr,
+                    "MUL_MAT_4D_ENABLE_PHASE1: K=%ld M=%ld N=%ld "
+                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                    (long) K, (long) M, (long) N,
+                    (long) a->ne[0],  (long) a->ne[1],  (long) a->ne[2],  (long) a->ne[3],
+                    (long) b->ne[0],  (long) b->ne[1],  (long) b->ne[2],  (long) b->ne[3],
+                    (long) op->ne[0], (long) op->ne[1], (long) op->ne[2], (long) op->ne[3]);
+#endif /* 0 */
+            return true;
+        }
+
+        if (K == 256 && M == 64) {
+#if 0
+            fprintf(stderr,
+                    "MUL_MAT_4D_ENABLE_PHASE1: K=%ld M=%ld N=%ld "
+                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                    (long) K, (long) M, (long) N,
+                    (long) a->ne[0],  (long) a->ne[1],  (long) a->ne[2],  (long) a->ne[3],
+                    (long) b->ne[0],  (long) b->ne[1],  (long) b->ne[2],  (long) b->ne[3],
+                    (long) op->ne[0], (long) op->ne[1], (long) op->ne[2], (long) op->ne[3]);
+#endif /* 0 */
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+
+
+#if 0
+static bool mul_mat_supported_size(const struct ggml_tensor *op) {
+    if (!op) return false;
+
+    const struct ggml_tensor *a = op->src[0];
+    const struct ggml_tensor *b = op->src[1];
+    if (!a || !b) return false;
+
+    // Only F32 Triton MAT_MUL path for now.
+    if (a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 ||
+        op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // GGML MUL_MAT:
+    //   a/src0: [K, M, 1, 1]
+    //   b/src1: [K, N, 1, 1]
+    //   op/dst: [M, N, 1, 1]
+    const int64_t K = a->ne[0];
+    const int64_t M = a->ne[1];
+    const int64_t N = b->ne[1];
+
+    if (K <= 0 || M <= 0 || N <= 0) return false;
+
+    // Shape correctness.
+    if (b->ne[0]  != K) return false;
+    if (op->ne[0] != M) return false;
+    if (op->ne[1] != N) return false;
+
+    // STRICT 2D ONLY. Do not enable 3D/4D/broadcast yet.
     if (op->ne[2] != 1 || op->ne[3] != 1) return false;
     if (a->ne[2]  != 1 || a->ne[3]  != 1) return false;
     if (b->ne[2]  != 1 || b->ne[3]  != 1) return false;
+
+    // Triton requirement.
+    if ((K % 32) != 0) return false;
+
+    // Skip GEMV/single-column for now.
+    if (N == 1) return false;
+
+    // Restore wider yesterday-like limits, but still bounded.
+    static constexpr int64_t TSI_TRITON_MAX_K = 8192;
+    static constexpr int64_t TSI_TRITON_MAX_M = 32768;
+    static constexpr int64_t TSI_TRITON_MAX_N = 4096;
+
+    if (K > TSI_TRITON_MAX_K) return false;
+    if (M > TSI_TRITON_MAX_M) return false;
+    if (N > TSI_TRITON_MAX_N) return false;
+
+    const int64_t M_pad = ((M + 7)  / 8)  * 8;
+    const int64_t N_pad = ((N + 63) / 64) * 64;
+
+    const int64_t elems_A = M_pad * K;
+    const int64_t elems_B = K * N_pad;
+    const int64_t elems_C = M_pad * N_pad;
+
+    if (elems_A <= 0 || elems_B <= 0 || elems_C <= 0) return false;
+
+    const int64_t total_bytes =
+        (elems_A + elems_B + elems_C) * (int64_t) sizeof(float);
+
+    /*
+     * With USER_DRAM_SIZE=8192, 46MB allocation succeeds.
+     * Keep a guard to avoid accidental huge OPU workspace.
+     */
+    static constexpr int64_t MAX_PACKED_BYTES =
+        128LL * 1024LL * 1024LL;   // 128 MB
+
+    if (total_bytes > MAX_PACKED_BYTES) {
+        return false;
+    }
 
     return true;
 }
 
 
-#if 0
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
