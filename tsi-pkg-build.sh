@@ -210,6 +210,23 @@
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-all-blobs
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga-blobs
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-posix-blobs
+# 10a) Triton MAT_MUL default build:
+#     If no triton option is provided, TRITON_MAT_MUL is enabled by default.
+#     This builds only the Triton MAT_MUL kernel and passes -DTRITON_MAT_MUL=1
+#     to ggml-tsavorite.cpp.
+#     SDK_VERSION=0.4.9 source tsi-pkg-build.sh build-posix
+#
+# 10b) Triton MAT_MUL explicit build:
+#     Same as default, but explicitly selects Triton MAT_MUL.
+#     SDK_VERSION=0.4.9 source tsi-pkg-build.sh triton mat_mul build-posix
+#
+# 10c) Triton ADD explicit build:
+#     Selects Triton ADD and disables Triton MAT_MUL for this build.
+#     SDK_VERSION=0.4.9 source tsi-pkg-build.sh triton add build-posix
+#
+# 10d) Triton ADD + MAT_MUL explicit build:
+#     Selects both Triton ADD and Triton MAT_MUL when compiler support is available.
+#     SDK_VERSION=0.4.9 source tsi-pkg-build.sh triton all build-posix
 #
 # 11) Incremental builds (do not delete build dirs):
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh incremental build-posix build-fpga
@@ -402,6 +419,15 @@ parse_args() {
 
   # packaging selection
   PACKAGE_FPGA_BUILD_DIR=""
+  # Triton kernel selection
+  # Default: MAT_MUL enabled if user does not pass any triton option.
+  # User can override with:
+  #   triton add
+  #   triton mat_mul
+  #   triton all
+  ENABLE_TRITON_ADD=0
+  ENABLE_TRITON_MAT_MUL=1
+  __EXPECT_TRITON_ARG=0
 
   local a
   for a in "$@"; do
@@ -421,6 +447,49 @@ parse_args() {
       git-submodule-pull)
         GIT_SUBMODULE_PULL=1
         log_info "git-submodule-pull detected"
+        ;;
+      triton)
+        __EXPECT_TRITON_ARG=1
+        log_info "triton option detected; expecting one of: add | mat_mul | all"
+        ;;
+
+      add)
+        if [ "${__EXPECT_TRITON_ARG}" -eq 1 ]; then
+          ENABLE_TRITON_ADD=1
+          ENABLE_TRITON_MAT_MUL=0
+          __EXPECT_TRITON_ARG=0
+          log_info "TRITON_ADD selected"
+        elif [ -z "${MLIR_COMPILER_DIR_IN}" ]; then
+          MLIR_COMPILER_DIR_IN="$a"
+        elif [ -z "${TOOLBOX_DIR_IN}" ]; then
+          TOOLBOX_DIR_IN="$a"
+        fi
+        ;;
+
+      mat_mul|mat-mul|matmul)
+        if [ "${__EXPECT_TRITON_ARG}" -eq 1 ]; then
+          ENABLE_TRITON_ADD=0
+          ENABLE_TRITON_MAT_MUL=1
+          __EXPECT_TRITON_ARG=0
+          log_info "TRITON_MAT_MUL selected"
+        elif [ -z "${MLIR_COMPILER_DIR_IN}" ]; then
+          MLIR_COMPILER_DIR_IN="$a"
+        elif [ -z "${TOOLBOX_DIR_IN}" ]; then
+          TOOLBOX_DIR_IN="$a"
+        fi
+        ;;
+
+      all)
+        if [ "${__EXPECT_TRITON_ARG}" -eq 1 ]; then
+          ENABLE_TRITON_ADD=1
+          ENABLE_TRITON_MAT_MUL=1
+          __EXPECT_TRITON_ARG=0
+          log_info "TRITON_ADD + TRITON_MAT_MUL selected"
+        elif [ -z "${MLIR_COMPILER_DIR_IN}" ]; then
+          MLIR_COMPILER_DIR_IN="$a"
+        elif [ -z "${TOOLBOX_DIR_IN}" ]; then
+          TOOLBOX_DIR_IN="$a"
+        fi
         ;;
       build-fpga-blobs)
         DO_BLOB_FPGA=1
@@ -553,7 +622,14 @@ parse_args() {
     BUILD_TYPE="debug"
   fi
 
+  # If user wrote only "triton" without argument → error
+  if [ "${__EXPECT_TRITON_ARG}" -eq 1 ]; then
+    die "Missing Triton kernel argument. Use: triton add OR triton mat_mul OR triton all"
+  fi
 
+  # Export so other functions/scripts can use it
+  export ENABLE_TRITON_ADD
+  export ENABLE_TRITON_MAT_MUL
   return 0
 }
 
@@ -796,11 +872,14 @@ build_posix_impl() {
   compute_perf_and_debug_defs "posix"
 
   local common="-DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DGGML_NATIVE=ON -DGGML_AMX_TILE=OFF -DGGML_AMX_INT8=OFF -DGGML_AMX_BF16=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF"
+
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
   [ "${want_tvu}" -eq 1 ] && supported="${supported} -DTVU_SUPPORTED"
 
-  local cflags_base="-DGGML_TARGET_POSIX -DGGML_TSAVORITE ${supported} -mno-amx-tile -mno-amx-int8 -mno-amx-bf16 -mno-avx512bf16 -mno-avxvnni"
+  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL}"
+
+  local cflags_base="-DGGML_TARGET_POSIX -DGGML_TSAVORITE ${supported} ${triton_defs} -mno-amx-tile -mno-amx-int8 -mno-amx-bf16 -mno-avx512bf16 -mno-avxvnni"
 
   run cmake -B "${build_dir}" ${common} \
     -DCMAKE_C_COMPILER="${CC}" -DCMAKE_CXX_COMPILER="${CXX}" \
@@ -861,15 +940,18 @@ build_fpga_impl() {
   compute_perf_and_debug_defs "fpga"
 
   local ARM_TOOLCHAIN_FILE="${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
+
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
   [ "${want_tvu}" -eq 1 ] && supported="${supported} -DTVU_SUPPORTED"
 
+  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL}"
+
   run cmake -B "${build_dir}" \
     -DCMAKE_TOOLCHAIN_FILE="${ARM_TOOLCHAIN_FILE}" \
     -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DLLAMA_CURL=OFF \
-    -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported}" \
-    -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported}" \
+    -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
+    -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
@@ -1099,8 +1181,14 @@ main() {
     (
       cd "${SUBMODULE_DIR}" || exit 1
       setup_python || exit 1
-      [ "${DO_BLOB_FPGA}" -eq 1 ] && build_fpga_blobs || exit 1
-      [ "${DO_BLOB_POSIX}" -eq 1 ] && build_posix_blobs || exit 1
+
+      if [ "${DO_BLOB_FPGA}" -eq 1 ]; then
+        build_fpga_blobs || exit 1
+      fi
+
+      if [ "${DO_BLOB_POSIX}" -eq 1 ]; then
+        build_posix_blobs || exit 1
+      fi
     )
     local rc=$?
     cd "${ORIG_PWD}" >/dev/null 2>&1 || true
