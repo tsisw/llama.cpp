@@ -2839,7 +2839,9 @@ static inline void init_scalar_i32_memref_aligned(
     d->base       = payload_ptr;
     d->data       = payload_ptr;
     d->offset     = 0;
-    d->shape[0]   = 1;
+    //We bypass Triton generated host_wrapper and pack blob args manually.
+    //d->shape[0]   = 1;
+    d->shape[0]   = v;
     d->strides[0] = 1;
     *((int32_t *) payload_ptr) = v;
 }
