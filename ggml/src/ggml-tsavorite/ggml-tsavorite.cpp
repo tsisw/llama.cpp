@@ -2009,6 +2009,8 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
 
 void
 tsi_cleanup() {
+    fflush(stderr);
+    fflush(stdout);
     if (runtime_initialized != true)
         return;
     runtime_initialized = false;
