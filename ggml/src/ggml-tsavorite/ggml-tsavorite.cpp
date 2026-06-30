@@ -2691,6 +2691,7 @@ static inline void tsi_pack_triton_matmul_arg(
 #endif
 }
 
+
 extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
     void *A_desc_v,
     void *B_desc_v,
@@ -2702,7 +2703,7 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
     void *grid2_desc_v,
     void *grid3_desc_v) {
     constexpr TSI_DeviceIdType kDeviceId = 0;
-    constexpr int64_t kPackedArgsI64     = 12;
+    constexpr int64_t kPackedArgsI64     = 18;
     constexpr int64_t kPackedArgsBytes   = kPackedArgsI64 * (int64_t)sizeof(int64_t);
 
     tsi_init_per_txe_state_once();
@@ -2726,15 +2727,15 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
         abort();
     }
 
+    auto *grid1_desc = (MemRefDescriptor<Rank> *)grid1_desc_v;
+    auto *grid2_desc = (MemRefDescriptor<Rank> *)grid2_desc_v;
+    auto *grid3_desc = (MemRefDescriptor<Rank> *)grid3_desc_v;
     auto *A_desc     = (MemRefDescriptor<Rank> *)A_desc_v;
     auto *B_desc     = (MemRefDescriptor<Rank> *)B_desc_v;
     auto *C_desc     = (MemRefDescriptor<Rank> *)C_desc_v;
     auto *M_desc     = (MemRefDescriptor<Rank> *)M_desc_v;
     auto *N_desc     = (MemRefDescriptor<Rank> *)N_desc_v;
     auto *K_desc     = (MemRefDescriptor<Rank> *)K_desc_v;
-    auto *grid1_desc = (MemRefDescriptor<Rank> *)grid1_desc_v;
-    auto *grid2_desc = (MemRefDescriptor<Rank> *)grid2_desc_v;
-    auto *grid3_desc = (MemRefDescriptor<Rank> *)grid3_desc_v;
 
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
@@ -2743,23 +2744,30 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
 
     int idx = 0;
 
-#if 0
+    M_desc->offset = 0;
+    N_desc->offset = 0;
+    K_desc->offset = 0;
+    A_desc->offset = 0;
+    B_desc->offset = 0;
+    C_desc->offset = 0;
+    grid1_desc->offset = 0;
+    grid2_desc->offset = 0;
+    grid3_desc->offset = 0;
+
+// m,n,k,a,b,c,g1,g2,g3
+    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
+    //M_desc->shape[0] = 1;
+    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
+    //N_desc->shape[0] = 1;
+    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
+    //K_desc->shape[0] = 1;
     tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
     tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
     tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
-    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
-    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
-    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
     tsi_pack_triton_matmul_arg(p, idx, grid1_desc, "grid1");
     tsi_pack_triton_matmul_arg(p, idx, grid2_desc, "grid2");
     tsi_pack_triton_matmul_arg(p, idx, grid3_desc, "grid3");
-#endif
-    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
-    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
-    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
-    tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
-    tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
-    tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
+
 
     if (idx != kPackedArgsI64) {
         fprintf(stderr,
@@ -2858,8 +2866,8 @@ static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
     return ((v + a - 1) / a) * a;
 }
 
-static constexpr int32_t TRITON_FULL_M_TILE = 64;
-static constexpr int32_t TRITON_FULL_N_TILE = 64;
+//static constexpr int32_t TRITON_FULL_M_TILE = 64;
+//static constexpr int32_t TRITON_FULL_N_TILE = 64;
 
 static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
 static float *g_triton_B_full = nullptr; // [K_cap x N_cap]
@@ -2997,6 +3005,7 @@ static inline void call_triton_matmul_full_packed(
     init_scalar_i32_memref_aligned(grid1_desc, grid1_payload, 1);
     init_scalar_i32_memref_aligned(grid2_desc, grid2_payload, 1);
     init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
+
 
     _mlir_ciface_matmul_kernel_memory_wrapper_new(
         A_desc, B_desc, C_desc,
