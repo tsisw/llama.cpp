@@ -90,10 +90,17 @@ struct TsavoriteRuntimeState {
     BlobDescriptor **blobDescriptor_add = nullptr;
     BlobDescriptor **blobDescriptor_mult = nullptr;
     BlobDescriptor **blobDescriptor_rms_norm = nullptr;
+#if TRITON_MAT_MUL
+    BlobDescriptor **blobDescriptor_matmul = nullptr;
+#endif
+
 
     void **loadResult_add = nullptr;
     void **loadResult_mult = nullptr;
     void **loadResult_rms_norm = nullptr;
+#if TRITON_MAT_MUL
+    void **loadResult_matmul;
+#endif
 
     // blob lifetime state machine
     enum BlobState : uint8_t {
@@ -132,10 +139,17 @@ auto &device_cv = g_rt.device_cv;
 auto &blobDescriptor_add      = g_rt.blobDescriptor_add;
 auto &blobDescriptor_mult     = g_rt.blobDescriptor_mult;
 auto &blobDescriptor_rms_norm = g_rt.blobDescriptor_rms_norm;
+#if TRITON_MAT_MUL
+auto &blobDescriptor_matmul   = g_rt.blobDescriptor_matmul;
+#endif
+
 
 auto &loadResult_add          = g_rt.loadResult_add;
 auto &loadResult_mult         = g_rt.loadResult_mult;
 auto &loadResult_rms_norm     = g_rt.loadResult_rms_norm;
+#if TRITON_MAT_MUL
+auto &loadResult_matmul       = g_rt.loadResult_matmul;
+#endif
 } // anonymous namespace
 
 constexpr int kMaxBacktraceFrames = 64;
@@ -473,6 +487,18 @@ static inline void tsi_blob_free_tables() {
         blobDescriptor_rms_norm = nullptr;
     }
 
+#if TRITON_MAT_MUL
+    if (loadResult_matmul) {
+        free(loadResult_matmul);
+        loadResult_matmul = nullptr;
+    }
+
+    if (blobDescriptor_matmul) {
+        free(blobDescriptor_matmul);
+        blobDescriptor_matmul = nullptr;
+    }
+#endif
+
     g_rt.blob_tables_txes = 0;
     g_rt.blob_state = TsavoriteRuntimeState::BLOB_UNINITIALIZED;
 }
@@ -503,11 +529,26 @@ static inline void tsi_blob_unload_only() {
             }
         }
     }
+#if TRITON_MAT_MUL
+    if (blobDescriptor_matmul) {
+        for (uint32_t i = 0; i < TSI_RUN_TIME_INSTANCE; ++i) {
+            if (blobDescriptor_matmul[i]) {
+                tsi_unload_blob(blobDescriptor_matmul[i]);
+                blobDescriptor_matmul[i] = nullptr;
+            }
+        }
+    }
+#endif
 
     // best-effort: clear loadResult_* entries too
     if (loadResult_add)      memset(loadResult_add,      0, TSI_RUN_TIME_INSTANCE * sizeof(void *));
     if (loadResult_mult)     memset(loadResult_mult,     0, TSI_RUN_TIME_INSTANCE * sizeof(void *));
     if (loadResult_rms_norm) memset(loadResult_rms_norm, 0, TSI_RUN_TIME_INSTANCE * sizeof(void *));
+#if TRITON_MAT_MUL
+    if (loadResult_matmul) {
+        memset(loadResult_matmul, 0, TSI_RUN_TIME_INSTANCE * sizeof(void *));
+    }
+#endif
 
     g_rt.blob_state = TsavoriteRuntimeState::BLOB_TABLES_ALLOCATED;
 }
@@ -526,13 +567,26 @@ static inline void tsi_blob_ensure_tables_allocated() {
     loadResult_add      = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
     loadResult_mult     = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
     loadResult_rms_norm = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
+#if TRITON_MAT_MUL
+    loadResult_matmul   = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
+#endif
 
     blobDescriptor_add      = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
     blobDescriptor_mult     = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
     blobDescriptor_rms_norm = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
+#if TRITON_MAT_MUL
+    blobDescriptor_matmul   = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
+#endif
 
     if (!loadResult_add || !loadResult_mult || !loadResult_rms_norm ||
-        !blobDescriptor_add || !blobDescriptor_mult || !blobDescriptor_rms_norm) {
+#if TRITON_MAT_MUL
+        !loadResult_matmul ||
+#endif
+        !blobDescriptor_add || !blobDescriptor_mult || !blobDescriptor_rms_norm
+#if TRITON_MAT_MUL
+        || !blobDescriptor_matmul
+#endif
+        ) {
         // free any partial allocations before abort
         tsi_blob_free_tables();
         fprintf(stderr, "Failed to allocate blob tables (num_of_txes=%u)\n", (unsigned)num_of_txes);
@@ -562,11 +616,17 @@ static void tsi_load_all_blobs() {
         char name_add[64];
         char name_mult[64];
         char name_rms[64];
+#if TRITON_MAT_MUL
+        char name_matmul[64];
+#endif
+
 
         snprintf(name_add,  sizeof(name_add),  "txe_add_dev%u",  i);
         snprintf(name_mult, sizeof(name_mult), "txe_mult_dev%u", i);
         snprintf(name_rms,  sizeof(name_rms),  "txe_rms_norm_dev%u", i);
-
+#if TRITON_MAT_MUL
+        snprintf(name_matmul, sizeof(name_matmul), "txe_triton_mat_mul_dev%u", i);
+#endif
         failed_txe = i;
 
         // ADD
@@ -613,6 +673,26 @@ static void tsi_load_all_blobs() {
         }
         blobDescriptor_rms_norm[i] =
             static_cast<BlobDescriptor *>(loadResult_rms_norm[i]);
+
+
+    #if TRITON_MAT_MUL
+        // Triton MAT_MUL
+        loadResult_matmul[i] = tsi_load_blob(
+            i,
+            name_matmul,
+            blob_prefix(
+                "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_triton_mat_mul/blobs/txe_blob_0"
+            ).c_str()
+        );
+
+        if (!loadResult_matmul[i]) {
+            strcpy(blob_name, name_matmul);
+            goto error;
+        }
+
+        blobDescriptor_matmul[i] =
+            static_cast<BlobDescriptor *>(loadResult_matmul[i]);
+    #endif
     }
 
     // success
@@ -2566,12 +2646,10 @@ static int32_t g_triton_cur_N_tile = TMU_N_BLOCK;
 
 
 // I will enable at next PR when multi threadig tested with 2 TXE
-#if MAT_MUL_HOST_GENERATED
 extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
     void *A, void *B, void *C,
     void *M_scalar, void *N_scalar, void *K_scalar,
     void *grid1_scalar, void *grid2_scalar, void *grid3_scalar);
-#endif /* MAT_MUL_HOST_GENERATED */
 
 // -----------------------------------------------------------------------------
 // Triton MAT_MUL manual memory wrapper
@@ -2596,70 +2674,6 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
 // First step: fixed device 0.
 // -----------------------------------------------------------------------------
 
-static void *g_triton_matmul_load_result = nullptr;
-static BlobDescriptor *g_triton_matmul_blob_desc = nullptr;
-
-static inline const char *tsavorite_getenv_or_default(const char *name, const char *defval) {
-    const char *v = std::getenv(name);
-    return (v && v[0]) ? v : defval;
-}
-
-static inline void tsi_load_triton_matmul_blob_once() {
-    if (g_triton_matmul_blob_desc) {
-        return;
-    }
-
-    const char *blob_name = tsavorite_getenv_or_default(
-        "TSAVORITE_TRITON_MATMUL_BLOB_NAME",
-        "txe_triton_mat_mul_dev0");
-
-    const char *blob_prefix_env = std::getenv("TSAVORITE_TRITON_MATMUL_BLOB_PREFIX");
-
-    std::string prefix;
-    if (blob_prefix_env && blob_prefix_env[0]) {
-        prefix = blob_prefix_env;
-    } else {
-#ifdef GGML_TARGET_POSIX
-        prefix = blob_prefix(
-            "/ggml-tsi-kernel/posix-kernel/build-posix/txe_triton_mat_mul/blobs/txe_blob_0"
-        );
-#else
-        prefix = blob_prefix(
-            "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_triton_mat_mul/blobs/txe_blob_0"
-        );
-#endif
-    }
-
-#if TRITON_DEBUG
-    fprintf(stderr,
-            "TRITON_MATMUL_LOAD_BLOB: device=0 name=%s prefix=%s\n",
-            blob_name, prefix.c_str());
-#endif
-
-    g_triton_matmul_load_result = tsi_load_blob(
-        0,
-        blob_name,
-        prefix.c_str());
-
-    if (!g_triton_matmul_load_result) {
-        fprintf(stderr,
-                "ERROR: failed to load Triton MAT_MUL blob: device=0 name=%s prefix=%s\n",
-                blob_name, prefix.c_str());
-        tsi_cleanup();
-        abort();
-    }
-
-    g_triton_matmul_blob_desc =
-        static_cast<BlobDescriptor *>(g_triton_matmul_load_result);
-
-    if (!g_triton_matmul_blob_desc) {
-        fprintf(stderr,
-                "ERROR: Triton MAT_MUL blob descriptor is NULL after load: name=%s prefix=%s\n",
-                blob_name, prefix.c_str());
-        tsi_cleanup();
-        abort();
-    }
-}
 
 static inline void tsi_pack_triton_matmul_arg(
     int64_t *p,
@@ -2692,8 +2706,24 @@ static inline void tsi_pack_triton_matmul_arg(
 #endif
 }
 
+// Triton MAT_MUL wrapper (F32-only)
+//
+// Inputs:
+//   A_desc_v     : MemRefDescriptor<F32> for matrix A
+//   B_desc_v     : MemRefDescriptor<F32> for matrix B
+//   C_desc_v     : MemRefDescriptor<F32> for output matrix C
+//   M_desc_v     : MemRefDescriptor<F32> scalar M
+//   N_desc_v     : MemRefDescriptor<F32> scalar N
+//   K_desc_v     : MemRefDescriptor<F32> scalar K
+//   grid1_desc_v : MemRefDescriptor<F32> scalar grid1
+//   grid2_desc_v : MemRefDescriptor<F32> scalar grid2
+//   grid3_desc_v : MemRefDescriptor<F32> scalar grid3
+//
+// Note:
+//   Current implementation supports F32 only. BF16/F16 and mixed-precision
+//   are not supported in ggml-tsavorite.cpp.
 
-extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
+extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
     void *A_desc_v,
     void *B_desc_v,
     void *C_desc_v,
@@ -2708,7 +2738,6 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
     constexpr int64_t kPackedArgsBytes   = kPackedArgsI64 * (int64_t)sizeof(int64_t);
 
     tsi_init_per_txe_state_once();
-    tsi_load_triton_matmul_blob_once();
 
     if ((uint32_t)kDeviceId >= num_of_txes) {
         fprintf(stderr,
@@ -2782,7 +2811,7 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
     fprintf(stderr,
             "TRITON_MATMUL_LAUNCH: device=%d blob_desc=%p packed_args=%p packed_handle=%ld bytes=%ld\n",
             (int)kDeviceId,
-            (void *)g_triton_matmul_blob_desc,
+            (void *)blobDescriptor_matmul[0],
             packed_args[kDeviceId],
             (long)packedHandle,
             (long)kPackedArgsBytes);
@@ -2798,7 +2827,7 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
     }
 
     void *blobExecuteCmd = tsi_launch_blob(
-        g_triton_matmul_blob_desc,
+        blobDescriptor_matmul[0],
         packedHandle,
         kPackedArgsBytes);
 
@@ -2806,7 +2835,7 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
         fprintf(stderr,
                 "ERROR: tsi_launch_blob failed for Triton MAT_MUL device=%d blob_desc=%p packedHandle=%ld bytes=%ld\n",
                 (int)kDeviceId,
-                (void *)g_triton_matmul_blob_desc,
+                (void *)blobDescriptor_matmul[0],
                 (long)packedHandle,
                 (long)kPackedArgsBytes);
         tsi_cleanup();
@@ -3004,10 +3033,18 @@ static inline void call_triton_matmul_full_packed(
     init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
 
 
-    _mlir_ciface_matmul_kernel_memory_wrapper_new(
-        A_desc, B_desc, C_desc,
-        M_desc, N_desc, K_desc,
-        grid1_desc, grid2_desc, grid3_desc);
+    if (multi_thread_enable) {
+        _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
+            A_desc, B_desc, C_desc,
+            M_desc, N_desc, K_desc,
+            grid1_desc, grid2_desc, grid3_desc);
+    } else {
+         // below api is generated by triton compiler
+        _mlir_ciface_matmul_kernel_memory_wrapper(
+            A_desc, B_desc, C_desc,
+            M_desc, N_desc, K_desc,
+            grid1_desc, grid2_desc, grid3_desc);
+    }
 }
 #endif /* TRITON_MAT_MUL */
 
