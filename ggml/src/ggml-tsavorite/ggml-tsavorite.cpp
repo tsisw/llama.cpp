@@ -2565,12 +2565,13 @@ static int32_t g_triton_cur_M_tile = TMU_M_TILE_MAX;
 static int32_t g_triton_cur_N_tile = TMU_N_BLOCK;
 
 
-#if 0
+// I will enable at next PR when multi threadig tested with 2 TXE
+#if MAT_MUL_HOST_GENERATED
 extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
     void *A, void *B, void *C,
     void *M_scalar, void *N_scalar, void *K_scalar,
     void *grid1_scalar, void *grid2_scalar, void *grid3_scalar);
-#endif /* 0 */
+#endif /* MAT_MUL_HOST_GENERATED */
 
 // -----------------------------------------------------------------------------
 // Triton MAT_MUL manual memory wrapper
@@ -2821,7 +2822,6 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
 }
 
 
-// ANOOP
 // -----------------------------------------------------------------------------
 // Triton MAT_MUL ABI helpers
 // IMPORTANT:
