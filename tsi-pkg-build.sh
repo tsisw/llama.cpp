@@ -382,8 +382,18 @@ ensure_submodules() {
 parse_args() {
   SHOW_HELP=0
   BUILD_TYPE=""
-  MLIR_COMPILER_DIR_IN="${MLIR_COMPILER_DIR:-}"
-  TOOLBOX_DIR_IN="${TOOLBOX_DIR:-}"
+  # Always reset SDK-derived env on every script invocation.
+  # SDK_VERSION is the only required input. Old exported paths must not leak
+  # across runs when switching SDK versions.
+  unset MLIR_COMPILER_DIR
+  unset TOOLBOX_DIR
+  unset TSICommon_DIR
+  unset MLIR_SDK_VERSION
+  unset COMPILER_INSTALL_DIR
+  unset FAU_LOOKUP_TABLE_PATH
+
+  MLIR_COMPILER_DIR_IN=""
+  TOOLBOX_DIR_IN=""
   ENABLE_COVERAGE_FLAG=""
 
   # submodules
