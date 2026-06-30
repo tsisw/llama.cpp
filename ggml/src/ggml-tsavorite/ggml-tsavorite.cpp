@@ -2757,11 +2757,8 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_new(
 
 // m,n,k,a,b,c,g1,g2,g3
     tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
-    //M_desc->shape[0] = 1;
     tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
-    //N_desc->shape[0] = 1;
     tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
-    //K_desc->shape[0] = 1;
     tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
     tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
     tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
