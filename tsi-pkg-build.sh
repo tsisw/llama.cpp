@@ -382,8 +382,18 @@ ensure_submodules() {
 parse_args() {
   SHOW_HELP=0
   BUILD_TYPE=""
-  MLIR_COMPILER_DIR_IN="${MLIR_COMPILER_DIR:-}"
-  TOOLBOX_DIR_IN="${TOOLBOX_DIR:-}"
+  # Always reset SDK-derived env on every script invocation.
+  # SDK_VERSION is the only required input. Old exported paths must not leak
+  # across runs when switching SDK versions.
+  unset MLIR_COMPILER_DIR
+  unset TOOLBOX_DIR
+  unset TSICommon_DIR
+  unset MLIR_SDK_VERSION
+  unset COMPILER_INSTALL_DIR
+  unset FAU_LOOKUP_TABLE_PATH
+
+  MLIR_COMPILER_DIR_IN=""
+  TOOLBOX_DIR_IN=""
   ENABLE_COVERAGE_FLAG=""
 
   # submodules
@@ -420,12 +430,14 @@ parse_args() {
   # packaging selection
   PACKAGE_FPGA_BUILD_DIR=""
   # Triton kernel selection
-  # Default: MAT_MUL enabled if user does not pass any triton option.
+  # Default behavior is equivalent to: triton all
+  # TODO: keep "triton all" option for now for backward compatibility.
+  # Later release can remove explicit "all" option once default behavior is stable.
   # User can override with:
   #   triton add
   #   triton mat_mul
   #   triton all
-  ENABLE_TRITON_ADD=0
+  ENABLE_TRITON_ADD=1
   ENABLE_TRITON_MAT_MUL=1
   __EXPECT_TRITON_ARG=0
 
