@@ -430,12 +430,14 @@ parse_args() {
   # packaging selection
   PACKAGE_FPGA_BUILD_DIR=""
   # Triton kernel selection
-  # Default: MAT_MUL enabled if user does not pass any triton option.
+  # Default behavior is equivalent to: triton all
+  # TODO: keep "triton all" option for now for backward compatibility.
+  # Later release can remove explicit "all" option once default behavior is stable.
   # User can override with:
   #   triton add
   #   triton mat_mul
   #   triton all
-  ENABLE_TRITON_ADD=0
+  ENABLE_TRITON_ADD=1
   ENABLE_TRITON_MAT_MUL=1
   __EXPECT_TRITON_ARG=0
 
