@@ -440,6 +440,7 @@ parse_args() {
   ENABLE_TRITON_ADD=1
   ENABLE_TRITON_MAT_MUL=1
   __EXPECT_TRITON_ARG=0
+  ENABLE_TRITON_DEBUG=0
 
   local a
   for a in "$@"; do
@@ -464,6 +465,11 @@ parse_args() {
         __EXPECT_TRITON_ARG=1
         log_info "triton option detected; expecting one of: add | mat_mul | all"
         ;;
+
+      triton-debug)
+         ENABLE_TRITON_DEBUG=1
+         log_info "TRITON_DEBUG enabled"
+         ;;
 
       add)
         if [ "${__EXPECT_TRITON_ARG}" -eq 1 ]; then
@@ -642,6 +648,7 @@ parse_args() {
   # Export so other functions/scripts can use it
   export ENABLE_TRITON_ADD
   export ENABLE_TRITON_MAT_MUL
+  export ENABLE_TRITON_DEBUG
   return 0
 }
 
@@ -889,7 +896,7 @@ build_posix_impl() {
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
   [ "${want_tvu}" -eq 1 ] && supported="${supported} -DTVU_SUPPORTED"
 
-  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL}"
+  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL} -DTRITON_DEBUG=${ENABLE_TRITON_DEBUG}"
 
   local cflags_base="-DGGML_TARGET_POSIX -DGGML_TSAVORITE ${supported} ${triton_defs} -mno-amx-tile -mno-amx-int8 -mno-amx-bf16 -mno-avx512bf16 -mno-avxvnni"
 
@@ -957,7 +964,7 @@ build_fpga_impl() {
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
   [ "${want_tvu}" -eq 1 ] && supported="${supported} -DTVU_SUPPORTED"
 
-  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL}"
+  local triton_defs="-DTRITON_ADD=${ENABLE_TRITON_ADD} -DTRITON_MAT_MUL=${ENABLE_TRITON_MAT_MUL} -DTRITON_DEBUG=${ENABLE_TRITON_DEBUG}"
 
   run cmake -B "${build_dir}" \
     -DCMAKE_TOOLCHAIN_FILE="${ARM_TOOLCHAIN_FILE}" \
