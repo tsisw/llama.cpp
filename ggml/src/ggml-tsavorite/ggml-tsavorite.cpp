@@ -2725,6 +2725,7 @@ static inline void tsi_pack_triton_matmul_arg(
 //   Current implementation supports F32 only. BF16/F16 and mixed-precision
 //   are not supported in ggml-tsavorite.cpp.
 
+#if 0
 extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
     void *A_desc_v,
     void *B_desc_v,
@@ -2847,6 +2848,186 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
     tsi_add_command_to_list(commandList, blobExecuteCmd);
     tsi_finalize_command_list(commandList);
     tsi_wait(commandList);
+}
+#endif /* 0 */
+
+static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
+    void *A_desc_v,
+    void *B_desc_v,
+    void *C_desc_v,
+    void *M_desc_v,
+    void *N_desc_v,
+    void *K_desc_v,
+    void *grid1_desc_v,
+    void *grid2_desc_v,
+    void *grid3_desc_v,
+    TSI_DeviceIdType deviceId) {
+
+    constexpr int64_t kPackedArgsI64   = 18;
+    constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * (int64_t)sizeof(int64_t);
+
+    std::lock_guard<std::mutex> lock(tsi_pack_mutex);
+
+    if ((uint32_t)deviceId >= num_of_txes) {
+        fprintf(stderr,
+                "ERROR: Triton MAT_MUL deviceId=%d out of range num_of_txes=%u\n",
+                (int)deviceId, (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    if (packed_args.size() != num_of_txes || !packed_args[deviceId]) {
+        fprintf(stderr,
+                "ERROR: Triton MAT_MUL packed_args not initialized deviceId=%d size=%zu num_of_txes=%u\n",
+                (int)deviceId,
+                packed_args.size(),
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    auto *grid1_desc = (MemRefDescriptor<Rank> *)grid1_desc_v;
+    auto *grid2_desc = (MemRefDescriptor<Rank> *)grid2_desc_v;
+    auto *grid3_desc = (MemRefDescriptor<Rank> *)grid3_desc_v;
+
+    auto *A_desc = (MemRefDescriptor<Rank> *)A_desc_v;
+    auto *B_desc = (MemRefDescriptor<Rank> *)B_desc_v;
+    auto *C_desc = (MemRefDescriptor<Rank> *)C_desc_v;
+
+    auto *M_desc = (MemRefDescriptor<Rank> *)M_desc_v;
+    auto *N_desc = (MemRefDescriptor<Rank> *)N_desc_v;
+    auto *K_desc = (MemRefDescriptor<Rank> *)K_desc_v;
+
+    int64_t *p = static_cast<int64_t *>(packed_args[deviceId]);
+    memset(p, 0, (size_t)kPackedArgsBytes);
+
+    M_desc->offset = 0;
+    N_desc->offset = 0;
+    K_desc->offset = 0;
+    A_desc->offset = 0;
+    B_desc->offset = 0;
+    C_desc->offset = 0;
+    grid1_desc->offset = 0;
+    grid2_desc->offset = 0;
+    grid3_desc->offset = 0;
+
+    int idx = 0;
+
+    // M,N,K,A,B,C,grid1,grid2,grid3
+    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
+    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
+    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
+    tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
+    tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
+    tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
+    tsi_pack_triton_matmul_arg(p, idx, grid1_desc, "grid1");
+    tsi_pack_triton_matmul_arg(p, idx, grid2_desc, "grid2");
+    tsi_pack_triton_matmul_arg(p, idx, grid3_desc, "grid3");
+
+    if (idx != kPackedArgsI64) {
+        fprintf(stderr,
+                "ERROR: Triton MAT_MUL packed idx=%d expected=%ld\n",
+                idx, (long)kPackedArgsI64);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    void *commandList = tsi_create_command_list(deviceId);
+    if (!commandList) {
+        fprintf(stderr,
+                "ERROR: tsi_create_command_list failed for Triton MAT_MUL device=%d\n",
+                (int)deviceId);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    const int64_t packedHandle =
+        tsi_shmem_handle_from_ptr(packed_args[deviceId]);
+
+    void *blobExecuteCmd = tsi_launch_blob(
+        blobDescriptor_matmul[0],
+        packedHandle,
+        kPackedArgsBytes);
+
+    if (!blobExecuteCmd) {
+        fprintf(stderr,
+                "ERROR: tsi_launch_blob failed for Triton MAT_MUL device=%d blob_desc=%p packedHandle=%ld bytes=%ld\n",
+                (int)deviceId,
+                (void *)blobDescriptor_matmul[0],
+                (long)packedHandle,
+                (long)kPackedArgsBytes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    tsi_add_command_to_list(commandList, blobExecuteCmd);
+    return commandList;
+}
+
+extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
+    void *A_desc_v,
+    void *B_desc_v,
+    void *C_desc_v,
+    void *M_desc_v,
+    void *N_desc_v,
+    void *K_desc_v,
+    void *grid1_desc_v,
+    void *grid2_desc_v,
+    void *grid3_desc_v) {
+
+    tsi_init_per_txe_state_once();
+
+    if (!multi_thread_enable) {
+        _mlir_ciface_matmul_kernel_memory_wrapper(
+            A_desc_v,
+            B_desc_v,
+            C_desc_v,
+            M_desc_v,
+            N_desc_v,
+            K_desc_v,
+            grid1_desc_v,
+            grid2_desc_v,
+            grid3_desc_v);
+        return;
+    }
+
+    int deviceId = acquire_device_blocking();
+
+    void *commandList =
+        _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
+            A_desc_v,
+            B_desc_v,
+            C_desc_v,
+            M_desc_v,
+            N_desc_v,
+            K_desc_v,
+            grid1_desc_v,
+            grid2_desc_v,
+            grid3_desc_v,
+            deviceId);
+
+    if (!commandList) {
+        fprintf(stderr,
+                "Command List Empty for Triton MAT_MUL on device %d\n",
+                deviceId);
+        fflush(stderr);
+        release_device(deviceId);
+        tsi_cleanup();
+        abort();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex);
+        workers.emplace_back([=]() {
+       tsi_blob_execution_internal(commandList);
+            release_device(deviceId);
+        });
+    }
 }
 
 
@@ -3035,18 +3216,10 @@ static inline void call_triton_matmul_full_packed(
     init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
 
 
-    if (multi_thread_enable) {
-        _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
-            A_desc, B_desc, C_desc,
-            M_desc, N_desc, K_desc,
-            grid1_desc, grid2_desc, grid3_desc);
-    } else {
-         // below api is generated by triton compiler
-        _mlir_ciface_matmul_kernel_memory_wrapper(
-            A_desc, B_desc, C_desc,
-            M_desc, N_desc, K_desc,
-            grid1_desc, grid2_desc, grid3_desc);
-    }
+    _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch(
+        A_desc, B_desc, C_desc,
+        M_desc, N_desc, K_desc,
+        grid1_desc, grid2_desc, grid3_desc);
 }
 #endif /* TRITON_MAT_MUL */
 
