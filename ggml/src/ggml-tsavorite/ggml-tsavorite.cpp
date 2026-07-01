@@ -3503,6 +3503,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 (int32_t)N_pad,
                 (int32_t)K);
 
+            if (multi_thread_enable) {
+                join_all_workers();
+            }
+
             // -----------------------
             // Copy back
             // -----------------------
