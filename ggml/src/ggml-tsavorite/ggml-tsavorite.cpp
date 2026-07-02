@@ -2658,6 +2658,8 @@ void _mlir_ciface_txe_mul_mat_tile_f32_k2048_host  (void *A_tile, void *B_tile, 
 // -----------------------------------------------------------------------------
 
 
+#if TRITON_MAT_MUL
+
 // TXE Shape specific
 #define TRITON_MATMUL_1X8_M_DIM      8
 #define TRITON_MATMUL_1X8_N_DIM     64
@@ -2935,7 +2937,6 @@ static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
 // - Descriptor and scalar payload must both be device-visible and 128B aligned
 // -----------------------------------------------------------------------------
 
-#if TRITON_MAT_MUL
 template<int N>
 static inline void init_rank1_memref_flat(
     MemRefDescriptor<N> *d,
@@ -3305,163 +3306,6 @@ static inline void call_triton_matmul_full_packed_on_device(
     tsi_blob_execution_internal(commandList);
 }
 
-#endif /* TRITON_MAT_MUL */
-
-extern "C" void tmu_mul_mat_k32 (const void *A, const void *B, void *C) {
-    call_tmu_blob<32>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k32_host);
-}
-extern "C" void tmu_mul_mat_k64 (const void *A, const void *B, void *C) {
-    call_tmu_blob<64>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k64_host);
-}
-extern "C" void tmu_mul_mat_k128(const void *A, const void *B, void *C) {
-    call_tmu_blob<128>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k128_host);
-}
-extern "C" void tmu_mul_mat_k256(const void *A, const void *B, void *C) {
-    call_tmu_blob<256>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k256_host);
-}
-extern "C" void tmu_mul_mat_k512(const void *A, const void *B, void *C) {
-    call_tmu_blob<512>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k512_host);
-}
-extern "C" void tmu_mul_mat_k1024(const void *A, const void *B, void *C) {
-    call_tmu_blob<1024>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k1024_host);
-}
-extern "C" void tmu_mul_mat_k2048(const void *A, const void *B, void *C) {
-    call_tmu_blob<2048>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k2048_host);
-}
-
-// ============================================================================
-// DISPATCH (ONE PER K BUCKET) — points to ABI-safe wrappers above
-// ============================================================================
-
-typedef void (*tmu_mul_mat_tile_fn)(const void *A_tile, const void *B_tile, void *C_tile);
-
-struct tmu_bucket_dispatch {
-    int k;
-    tmu_mul_mat_tile_fn fn;
-};
-
-static const tmu_bucket_dispatch g_tmu_dispatch[] = {
-    // Larger K buckets are temporarily disabled (blob size > 64 KB).
-#if 0
-    { 2048, tmu_mul_mat_k2048 },
-    { 1024, tmu_mul_mat_k1024 },
-    {  512, tmu_mul_mat_k512  },
-    {  256, tmu_mul_mat_k256  },
-    {  128, tmu_mul_mat_k128  },
-    {   64, tmu_mul_mat_k64   },
-#endif
-    {   32, tmu_mul_mat_k32   },
-    {    0, nullptr           }
-};
-
-static inline const tmu_bucket_dispatch *tmu_find_bucket(int k) {
-    for (int i = 0; g_tmu_dispatch[i].k != 0; ++i) {
-        if (g_tmu_dispatch[i].k == k) return &g_tmu_dispatch[i];
-    }
-    return nullptr;
-}
-
-static inline int tmu_decompose_k(int64_t k, int *out, int max_parts) {
-    if (!out || max_parts <= 0) return -1;
-    if (k < 0) return -1;  // defensive: never allow negative K
-
-    int n = 0;
-
-    for (int i = 0; g_tmu_dispatch[i].k != 0 && n < max_parts; ++i) {
-        const int bucket = g_tmu_dispatch[i].k;
-
-        // Defensive: bucket must be positive
-        if (bucket <= 0) return -1;
-
-        while (k >= (int64_t) bucket && n < max_parts) {
-            out[n++] = bucket;
-            k -= (int64_t) bucket;
-            // Defensive: k should never go negative due to the loop condition
-            if (k < 0) return -1;
-        }
-    }
-
-    // Must decompose exactly; otherwise unsupported remainder
-    return (k == 0) ? n : -1;
-}
-
-// ============================================================================
-// PACKING HELPERS (FP32)
-// ============================================================================
-
-static inline void pack_A_tile_f32(
-    float *A_pack,             // [TMU_M_TILE_MAX * K_chunk]
-    const char *A_base_d23,     // src0->data already offset for d2/d3
-    int64_t m0,
-    int64_t m_tile,
-    int64_t k0,
-    int64_t K_chunk,
-    int64_t a_nb0,
-    int64_t a_nb1
-) {
-    memset(A_pack, 0, (size_t)(TMU_M_TILE_MAX * K_chunk) * sizeof(float));
-
-    for (int64_t r = 0; r < m_tile; ++r) {
-        const int64_t m = m0 + r;
-        float *dst = A_pack + r * K_chunk;
-
-        const char *src_row = A_base_d23 + m * a_nb1 + k0 * a_nb0;
-        for (int64_t kk = 0; kk < K_chunk; ++kk) {
-            dst[kk] = *(const float *)(src_row + kk * a_nb0);
-        }
-    }
-}
-
-static inline void pack_B_tile_f32(
-    float *B_pack,             // [TMU_N_BLOCK * K_chunk]
-    const char *B_base_d23,     // src1->data already offset for d2/d3
-    int64_t n0,
-    int64_t n_valid,
-    int64_t k0,
-    int64_t K_chunk,
-    int64_t b_nb0,
-    int64_t b_nb1
-) {
-    memset(B_pack, 0, (size_t)(TMU_N_BLOCK * K_chunk) * sizeof(float));
-
-    for (int64_t c = 0; c < n_valid; ++c) {
-        const int64_t n = n0 + c;
-        float *dst = B_pack + c * K_chunk;
-
-        const char *src_col = B_base_d23 + n * b_nb1 + k0 * b_nb0;
-        for (int64_t kk = 0; kk < K_chunk; ++kk) {
-            dst[kk] = *(const float *)(src_col + kk * b_nb0);
-        }
-    }
-}
-
-// ============================================================================
-// REUSABLE BUFFERS — allocated once per process
-// ============================================================================
-
-static float *g_A_pack = nullptr;   // 64 * 2048
-static float *g_B_pack = nullptr;   // 32 * 2048
-static float *g_C_tile = nullptr;   // 64 * 32
-static int    g_pack_maxK = 0;
-
-static std::once_flag g_tmu_buf_once;
-
-static inline void ensure_tmu_pack_buffers() {
-    std::call_once(g_tmu_buf_once, []() {
-        const int maxK = 2048; // fixed maximum bucket
-
-        g_pack_maxK = maxK;
-
-        g_A_pack = (float *) tsi_alloc((size_t)TMU_M_TILE_MAX * (size_t)maxK * sizeof(float));
-        g_B_pack = (float *) tsi_alloc((size_t)TMU_N_BLOCK     * (size_t)maxK * sizeof(float));
-        g_C_tile = (float *) tsi_alloc((size_t)TMU_M_TILE_MAX * (size_t)TMU_N_BLOCK * sizeof(float));
-
-        TSAVORITE_GGML_ASSERT(g_A_pack && g_B_pack && g_C_tile);
-    });
-}
-
-
-#if TRITON_MAT_MUL
 
 // -----------------------------------------------------------------------------
 // TMU MUL_MAT runner (called from ggml_tsavorite_graph_compute)
@@ -3772,8 +3616,161 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     return GGML_STATUS_SUCCESS;
 }
 
-
 #else
+
+extern "C" void tmu_mul_mat_k32 (const void *A, const void *B, void *C) {
+    call_tmu_blob<32>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k32_host);
+}
+extern "C" void tmu_mul_mat_k64 (const void *A, const void *B, void *C) {
+    call_tmu_blob<64>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k64_host);
+}
+extern "C" void tmu_mul_mat_k128(const void *A, const void *B, void *C) {
+    call_tmu_blob<128>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k128_host);
+}
+extern "C" void tmu_mul_mat_k256(const void *A, const void *B, void *C) {
+    call_tmu_blob<256>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k256_host);
+}
+extern "C" void tmu_mul_mat_k512(const void *A, const void *B, void *C) {
+    call_tmu_blob<512>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k512_host);
+}
+extern "C" void tmu_mul_mat_k1024(const void *A, const void *B, void *C) {
+    call_tmu_blob<1024>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k1024_host);
+}
+extern "C" void tmu_mul_mat_k2048(const void *A, const void *B, void *C) {
+    call_tmu_blob<2048>(A, B, C, _mlir_ciface_txe_mul_mat_tile_f32_k2048_host);
+}
+
+// ============================================================================
+// DISPATCH (ONE PER K BUCKET) — points to ABI-safe wrappers above
+// ============================================================================
+
+typedef void (*tmu_mul_mat_tile_fn)(const void *A_tile, const void *B_tile, void *C_tile);
+
+struct tmu_bucket_dispatch {
+    int k;
+    tmu_mul_mat_tile_fn fn;
+};
+
+static const tmu_bucket_dispatch g_tmu_dispatch[] = {
+    // Larger K buckets are temporarily disabled (blob size > 64 KB).
+#if 0
+    { 2048, tmu_mul_mat_k2048 },
+    { 1024, tmu_mul_mat_k1024 },
+    {  512, tmu_mul_mat_k512  },
+    {  256, tmu_mul_mat_k256  },
+    {  128, tmu_mul_mat_k128  },
+    {   64, tmu_mul_mat_k64   },
+#endif
+    {   32, tmu_mul_mat_k32   },
+    {    0, nullptr           }
+};
+
+static inline const tmu_bucket_dispatch *tmu_find_bucket(int k) {
+    for (int i = 0; g_tmu_dispatch[i].k != 0; ++i) {
+        if (g_tmu_dispatch[i].k == k) return &g_tmu_dispatch[i];
+    }
+    return nullptr;
+}
+
+static inline int tmu_decompose_k(int64_t k, int *out, int max_parts) {
+    if (!out || max_parts <= 0) return -1;
+    if (k < 0) return -1;  // defensive: never allow negative K
+
+    int n = 0;
+
+    for (int i = 0; g_tmu_dispatch[i].k != 0 && n < max_parts; ++i) {
+        const int bucket = g_tmu_dispatch[i].k;
+
+        // Defensive: bucket must be positive
+        if (bucket <= 0) return -1;
+
+        while (k >= (int64_t) bucket && n < max_parts) {
+            out[n++] = bucket;
+            k -= (int64_t) bucket;
+            // Defensive: k should never go negative due to the loop condition
+            if (k < 0) return -1;
+        }
+    }
+
+    // Must decompose exactly; otherwise unsupported remainder
+    return (k == 0) ? n : -1;
+}
+
+// ============================================================================
+// PACKING HELPERS (FP32)
+// ============================================================================
+
+static inline void pack_A_tile_f32(
+    float *A_pack,             // [TMU_M_TILE_MAX * K_chunk]
+    const char *A_base_d23,     // src0->data already offset for d2/d3
+    int64_t m0,
+    int64_t m_tile,
+    int64_t k0,
+    int64_t K_chunk,
+    int64_t a_nb0,
+    int64_t a_nb1
+) {
+    memset(A_pack, 0, (size_t)(TMU_M_TILE_MAX * K_chunk) * sizeof(float));
+
+    for (int64_t r = 0; r < m_tile; ++r) {
+        const int64_t m = m0 + r;
+        float *dst = A_pack + r * K_chunk;
+
+        const char *src_row = A_base_d23 + m * a_nb1 + k0 * a_nb0;
+        for (int64_t kk = 0; kk < K_chunk; ++kk) {
+            dst[kk] = *(const float *)(src_row + kk * a_nb0);
+        }
+    }
+}
+
+static inline void pack_B_tile_f32(
+    float *B_pack,             // [TMU_N_BLOCK * K_chunk]
+    const char *B_base_d23,     // src1->data already offset for d2/d3
+    int64_t n0,
+    int64_t n_valid,
+    int64_t k0,
+    int64_t K_chunk,
+    int64_t b_nb0,
+    int64_t b_nb1
+) {
+    memset(B_pack, 0, (size_t)(TMU_N_BLOCK * K_chunk) * sizeof(float));
+
+    for (int64_t c = 0; c < n_valid; ++c) {
+        const int64_t n = n0 + c;
+        float *dst = B_pack + c * K_chunk;
+
+        const char *src_col = B_base_d23 + n * b_nb1 + k0 * b_nb0;
+        for (int64_t kk = 0; kk < K_chunk; ++kk) {
+            dst[kk] = *(const float *)(src_col + kk * b_nb0);
+        }
+    }
+}
+
+// ============================================================================
+// REUSABLE BUFFERS — allocated once per process
+// ============================================================================
+
+static float *g_A_pack = nullptr;   // 64 * 2048
+static float *g_B_pack = nullptr;   // 32 * 2048
+static float *g_C_tile = nullptr;   // 64 * 32
+static int    g_pack_maxK = 0;
+
+static std::once_flag g_tmu_buf_once;
+
+static inline void ensure_tmu_pack_buffers() {
+    std::call_once(g_tmu_buf_once, []() {
+        const int maxK = 2048; // fixed maximum bucket
+
+        g_pack_maxK = maxK;
+
+        g_A_pack = (float *) tsi_alloc((size_t)TMU_M_TILE_MAX * (size_t)maxK * sizeof(float));
+        g_B_pack = (float *) tsi_alloc((size_t)TMU_N_BLOCK     * (size_t)maxK * sizeof(float));
+        g_C_tile = (float *) tsi_alloc((size_t)TMU_M_TILE_MAX * (size_t)TMU_N_BLOCK * sizeof(float));
+
+        TSAVORITE_GGML_ASSERT(g_A_pack && g_B_pack && g_C_tile);
+    });
+}
+
 static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     struct ggml_backend_tsavorite_context * /*ctx*/,
     txe_device_s device,
