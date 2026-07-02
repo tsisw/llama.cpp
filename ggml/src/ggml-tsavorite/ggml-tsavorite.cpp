@@ -2634,20 +2634,45 @@ void _mlir_ciface_txe_mul_mat_tile_f32_k2048_host  (void *A_tile, void *B_tile, 
 }
 
 // -----------------------------------------------------------------------------
-// Triton MATMUL minimal wrapper for static K=32
-// Keeps existing ggml_tsavorite_run_tmu_mul_mat() packing/copyback unchanged.
-// A pack : [1,1,TMU_M_TILE_MAX,32]
-// B pack : [1,1,TMU_N_BLOCK,32]   // row-major packed as N x K (same as current TMU path)
-// C tile : [1,1,TMU_M_TILE_MAX,TMU_N_BLOCK]
-// Scalars: M, N, K, grid1, grid2, grid3 (all memref-of-1xi32 style)
-// -----------------------------------------------------------------------------
+// Triton MAT_MUL implementation for dynamic matrix shapes.
 //
+// Current implementation targets the Triton 1x8 TXE shape. Supported matrix
+// shapes are handled by padding M and N to the Triton kernel alignment
+// requirements, then packing the full matrices into Triton-compatible buffers.
+//
+// K is dynamic and is passed at runtime. The only current K constraint is that
+// it must satisfy the Triton MAT_MUL alignment requirement.
+//
+// Packed buffers:
+//   A full : [M_pad x K]
+//   B full : [K x N_pad]
+//   C full : [M_pad x N_pad]
+//
+// Scalars:
+//   M_pad, N_pad, K, grid1, grid2, grid3 are passed through packed_args.
+//
+// Note:
+//   This implementation currently uses the Triton 1x8 TXE shape. Future TXE
+//   configurations such as 8x1, 4x2, and 2x4 can be added through
+//   shape-specific alignment, packing, and dispatch logic.
+// -----------------------------------------------------------------------------
+
+
+// TXE Shape specific
+#define TRITON_MATMUL_1X8_M_DIM      8
+#define TRITON_MATMUL_1X8_N_DIM     64
+
+
+// Data type specific
+#define TRITON_MATMUL_F32_K_DIM      32
+
+#define TRITON_MATMUL_ALIGNMENT_BYTES      128
+#define TRITON_MATMUL_ALIGNMENT_MASK      (TRITON_MATMUL_ALIGNMENT_BYTES - 1)
 
 static int32_t g_triton_cur_M_tile = TMU_M_TILE_MAX;
 static int32_t g_triton_cur_N_tile = TMU_N_BLOCK;
 
 
-// I will enable at next PR when multi threadig tested with 2 TXE
 extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
     void *A, void *B, void *C,
     void *M_scalar, void *N_scalar, void *K_scalar,
@@ -2691,9 +2716,6 @@ static inline void tsi_pack_triton_matmul_arg(
     }
 
     p[idx++] = tsi_shmem_handle_from_ptr(d->data);
-
-    //p[idx++] = (int64_t)(d->offset);
-
     p[idx++] = (int64_t)d->shape[0];
 
 #if TRITON_DEBUG
@@ -2843,7 +2865,7 @@ static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
     return commandList;
 }
 
-extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
+static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
     void *A_desc_v,
     void *B_desc_v,
     void *C_desc_v,
@@ -2949,9 +2971,6 @@ static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
     return ((v + a - 1) / a) * a;
 }
 
-//static constexpr int32_t TRITON_FULL_M_TILE = 64;
-//static constexpr int32_t TRITON_FULL_N_TILE = 64;
-
 static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
 static float *g_triton_B_full = nullptr; // [K_cap x N_cap]
 static float *g_triton_C_full = nullptr; // [M_cap x N_cap]
@@ -2965,13 +2984,13 @@ static inline void ensure_triton_full_buffers(int64_t M_pad, int64_t N_pad, int6
     TSAVORITE_GGML_ASSERT(N_pad > 0);
     TSAVORITE_GGML_ASSERT(K > 0);
 
-    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
-    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
-    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+    TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % TRITON_MATMUL_1X8_N_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((K % TRITON_MATMUL_F32_K_DIM) == 0);
 
     const int64_t need_M = M_pad;
     const int64_t need_N = N_pad;
-    const int64_t need_K = tsi_round_up_i64(K, 32);
+    const int64_t need_K = tsi_round_up_i64(K, TRITON_MATMUL_F32_K_DIM);
 
     if (!g_triton_A_full || !g_triton_B_full || !g_triton_C_full ||
         need_M > g_triton_M_cap ||
@@ -3001,9 +3020,9 @@ static inline void ensure_triton_full_buffers(int64_t M_pad, int64_t N_pad, int6
         TSAVORITE_GGML_ASSERT(g_triton_B_full);
         TSAVORITE_GGML_ASSERT(g_triton_C_full);
 
-        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_A_full) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_B_full) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & 127) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_A_full) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_B_full) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t) g_triton_C_full) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
     }
 }
 
@@ -3047,12 +3066,12 @@ static inline void call_triton_matmul_full_packed(
         grid2_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
         grid3_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
 
-        M_payload     = (int32_t *) tsi_alloc(128);
-        N_payload     = (int32_t *) tsi_alloc(128);
-        K_payload     = (int32_t *) tsi_alloc(128);
-        grid1_payload = (int32_t *) tsi_alloc(128);
-        grid2_payload = (int32_t *) tsi_alloc(128);
-        grid3_payload = (int32_t *) tsi_alloc(128);
+        M_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        N_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        K_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        grid1_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        grid2_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        grid3_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
 
         TSAVORITE_GGML_ASSERT(A_desc && B_desc && C_desc);
         TSAVORITE_GGML_ASSERT(M_desc && N_desc && K_desc);
@@ -3063,9 +3082,9 @@ static inline void call_triton_matmul_full_packed(
         inited = true;
     }
 
-    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
-    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
-    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+    TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % TRITON_MATMUL_1X8_N_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((K % TRITON_MATMUL_F32_K_DIM) == 0);
 
     init_rank1_memref_flat(
         A_desc,
@@ -3121,9 +3140,9 @@ static inline void ensure_triton_full_buffers_for_device(
     TSAVORITE_GGML_ASSERT(M_pad > 0);
     TSAVORITE_GGML_ASSERT(N_pad > 0);
     TSAVORITE_GGML_ASSERT(K > 0);
-    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
-    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
-    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+    TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % TRITON_MATMUL_1X8_N_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((K % TRITON_MATMUL_F32_K_DIM) == 0);
 
     std::lock_guard<std::mutex> lk(g_triton_mt_alloc_mutex);
 
@@ -3139,7 +3158,7 @@ static inline void ensure_triton_full_buffers_for_device(
 
     const int64_t need_M = M_pad;
     const int64_t need_N = N_pad;
-    const int64_t need_K = tsi_round_up_i64(K, 32);
+    const int64_t need_K = tsi_round_up_i64(K, TRITON_MATMUL_F32_K_DIM);
 
     if (!g_triton_A_full_mt[deviceId] ||
         !g_triton_B_full_mt[deviceId] ||
@@ -3165,9 +3184,9 @@ static inline void ensure_triton_full_buffers_for_device(
         TSAVORITE_GGML_ASSERT(g_triton_B_full_mt[deviceId]);
         TSAVORITE_GGML_ASSERT(g_triton_C_full_mt[deviceId]);
 
-        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_A_full_mt[deviceId]) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_B_full_mt[deviceId]) & 127) == 0);
-        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_C_full_mt[deviceId]) & 127) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_A_full_mt[deviceId]) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_B_full_mt[deviceId]) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
+        TSAVORITE_GGML_ASSERT((((uintptr_t)g_triton_C_full_mt[deviceId]) & TRITON_MATMUL_ALIGNMENT_MASK) == 0);
     }
 }
 
@@ -3217,12 +3236,12 @@ static inline triton_matmul_desc_set_t *ensure_triton_desc_for_device(int device
         s.grid2_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
         s.grid3_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
 
-        s.M_payload     = (int32_t *) tsi_alloc(128);
-        s.N_payload     = (int32_t *) tsi_alloc(128);
-        s.K_payload     = (int32_t *) tsi_alloc(128);
-        s.grid1_payload = (int32_t *) tsi_alloc(128);
-        s.grid2_payload = (int32_t *) tsi_alloc(128);
-        s.grid3_payload = (int32_t *) tsi_alloc(128);
+        s.M_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.N_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.K_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.grid1_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.grid2_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.grid3_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
 
         TSAVORITE_GGML_ASSERT(s.A_desc && s.B_desc && s.C_desc);
         TSAVORITE_GGML_ASSERT(s.M_desc && s.N_desc && s.K_desc);
@@ -3244,9 +3263,9 @@ static inline void call_triton_matmul_full_packed_on_device(
     int32_t K) {
     TSAVORITE_GGML_ASSERT(deviceId >= 0);
     TSAVORITE_GGML_ASSERT((uint32_t)deviceId < num_of_txes);
-    TSAVORITE_GGML_ASSERT((M_pad % 8) == 0);
-    TSAVORITE_GGML_ASSERT((N_pad % 64) == 0);
-    TSAVORITE_GGML_ASSERT((K % 32) == 0);
+    TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((N_pad % TRITON_MATMUL_1X8_N_DIM) == 0);
+    TSAVORITE_GGML_ASSERT((K % TRITON_MATMUL_F32_K_DIM) == 0);
 
     triton_matmul_desc_set_t *s = ensure_triton_desc_for_device(deviceId);
 
