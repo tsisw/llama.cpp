@@ -2725,132 +2725,6 @@ static inline void tsi_pack_triton_matmul_arg(
 //   Current implementation supports F32 only. BF16/F16 and mixed-precision
 //   are not supported in ggml-tsavorite.cpp.
 
-#if 0
-extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual(
-    void *A_desc_v,
-    void *B_desc_v,
-    void *C_desc_v,
-    void *M_desc_v,
-    void *N_desc_v,
-    void *K_desc_v,
-    void *grid1_desc_v,
-    void *grid2_desc_v,
-    void *grid3_desc_v) {
-    constexpr TSI_DeviceIdType kDeviceId = 0;
-    constexpr int64_t kPackedArgsI64     = 18;
-    constexpr int64_t kPackedArgsBytes   = kPackedArgsI64 * (int64_t)sizeof(int64_t);
-
-    tsi_init_per_txe_state_once();
-
-    if ((uint32_t)kDeviceId >= num_of_txes) {
-        fprintf(stderr,
-                "ERROR: Triton MAT_MUL deviceId=%d out of range num_of_txes=%u\n",
-                (int)kDeviceId, (unsigned)num_of_txes);
-        tsi_cleanup();
-        abort();
-    }
-
-    if (packed_args.size() != num_of_txes || !packed_args[kDeviceId]) {
-        fprintf(stderr,
-                "ERROR: Triton MAT_MUL packed_args not initialized deviceId=%d size=%zu num_of_txes=%u\n",
-                (int)kDeviceId,
-                packed_args.size(),
-                (unsigned)num_of_txes);
-        tsi_cleanup();
-        abort();
-    }
-
-    auto *grid1_desc = (MemRefDescriptor<Rank> *)grid1_desc_v;
-    auto *grid2_desc = (MemRefDescriptor<Rank> *)grid2_desc_v;
-    auto *grid3_desc = (MemRefDescriptor<Rank> *)grid3_desc_v;
-    auto *A_desc     = (MemRefDescriptor<Rank> *)A_desc_v;
-    auto *B_desc     = (MemRefDescriptor<Rank> *)B_desc_v;
-    auto *C_desc     = (MemRefDescriptor<Rank> *)C_desc_v;
-    auto *M_desc     = (MemRefDescriptor<Rank> *)M_desc_v;
-    auto *N_desc     = (MemRefDescriptor<Rank> *)N_desc_v;
-    auto *K_desc     = (MemRefDescriptor<Rank> *)K_desc_v;
-
-    std::lock_guard<std::mutex> lock(tsi_pack_mutex);
-
-    int64_t *p = static_cast<int64_t *>(packed_args[kDeviceId]);
-    memset(p, 0, (size_t)kPackedArgsBytes);
-
-    int idx = 0;
-
-    M_desc->offset = 0;
-    N_desc->offset = 0;
-    K_desc->offset = 0;
-    A_desc->offset = 0;
-    B_desc->offset = 0;
-    C_desc->offset = 0;
-    grid1_desc->offset = 0;
-    grid2_desc->offset = 0;
-    grid3_desc->offset = 0;
-
-// m,n,k,a,b,c,g1,g2,g3
-    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
-    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
-    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
-    tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
-    tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
-    tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
-    tsi_pack_triton_matmul_arg(p, idx, grid1_desc, "grid1");
-    tsi_pack_triton_matmul_arg(p, idx, grid2_desc, "grid2");
-    tsi_pack_triton_matmul_arg(p, idx, grid3_desc, "grid3");
-
-
-    if (idx != kPackedArgsI64) {
-        fprintf(stderr,
-                "ERROR: Triton MAT_MUL packed idx=%d expected=%ld\n",
-                idx, (long)kPackedArgsI64);
-        tsi_cleanup();
-        abort();
-    }
-
-    const int64_t packedHandle =
-        tsi_shmem_handle_from_ptr(packed_args[kDeviceId]);
-
-#if TRITON_DEBUG
-    fprintf(stderr,
-            "TRITON_MATMUL_LAUNCH: device=%d blob_desc=%p packed_args=%p packed_handle=%ld bytes=%ld\n",
-            (int)kDeviceId,
-            (void *)blobDescriptor_matmul[0],
-            packed_args[kDeviceId],
-            (long)packedHandle,
-            (long)kPackedArgsBytes);
-#endif
-
-    void *commandList = tsi_create_command_list(kDeviceId);
-    if (!commandList) {
-        fprintf(stderr,
-                "ERROR: tsi_create_command_list failed for Triton MAT_MUL device=%d\n",
-                (int)kDeviceId);
-        tsi_cleanup();
-        abort();
-    }
-
-    void *blobExecuteCmd = tsi_launch_blob(
-        blobDescriptor_matmul[0],
-        packedHandle,
-        kPackedArgsBytes);
-
-    if (!blobExecuteCmd) {
-        fprintf(stderr,
-                "ERROR: tsi_launch_blob failed for Triton MAT_MUL device=%d blob_desc=%p packedHandle=%ld bytes=%ld\n",
-                (int)kDeviceId,
-                (void *)blobDescriptor_matmul[0],
-                (long)packedHandle,
-                (long)kPackedArgsBytes);
-        tsi_cleanup();
-        abort();
-    }
-
-    tsi_add_command_to_list(commandList, blobExecuteCmd);
-    tsi_finalize_command_list(commandList);
-    tsi_wait(commandList);
-}
-#endif /* 0 */
-
 static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
     void *A_desc_v,
     void *B_desc_v,
@@ -3581,25 +3455,21 @@ static inline void ensure_tmu_pack_buffers() {
 static inline void triton_matmul_log_offloaded_shape_once(
     const struct ggml_tensor *A,
     const struct ggml_tensor *B,
-    const struct ggml_tensor *C,
-    int64_t K,
-    int64_t M,
-    int64_t N,
-    int64_t M_pad,
-    int64_t N_pad) {
+    const struct ggml_tensor *node) {
 #if TRITON_DEBUG
+    if (!A || !B || !node) {
+        return;
+    }
+
     static std::mutex s_log_mutex;
     static std::vector<std::string> s_seen;
 
     char key[512];
     snprintf(key, sizeof(key),
-             "K=%ld M=%ld N=%ld D2=%ld D3=%ld "
-             "A=[%ld,%ld,%ld,%ld] B=[%ld,%ld,%ld,%ld] C=[%ld,%ld,%ld,%ld]",
-             (long)K, (long)M, (long)N,
-             (long)C->ne[2], (long)C->ne[3],
-             (long)A->ne[0], (long)A->ne[1], (long)A->ne[2], (long)A->ne[3],
-             (long)B->ne[0], (long)B->ne[1], (long)B->ne[2], (long)B->ne[3],
-             (long)C->ne[0], (long)C->ne[1], (long)C->ne[2], (long)C->ne[3]);
+             "A=[%ld,%ld,%ld,%ld] B=[%ld,%ld,%ld,%ld] node=[%ld,%ld,%ld,%ld]",
+             (long)A->ne[0],    (long)A->ne[1],    (long)A->ne[2],    (long)A->ne[3],
+             (long)B->ne[0],    (long)B->ne[1],    (long)B->ne[2],    (long)B->ne[3],
+             (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3]);
 
     bool already_seen = false;
     {
@@ -3617,30 +3487,19 @@ static inline void triton_matmul_log_offloaded_shape_once(
 
     if (!already_seen) {
         fprintf(stderr,
-                "TRITON_MATMUL_OFFLOAD_SHAPE: "
-                "K=%ld M=%ld N=%ld M_pad=%ld N_pad=%ld D2=%ld D3=%ld "
-                "A_ne=[%ld,%ld,%ld,%ld] B_ne=[%ld,%ld,%ld,%ld] C_ne=[%ld,%ld,%ld,%ld] "
-                "A_nb=[%ld,%ld,%ld,%ld] B_nb=[%ld,%ld,%ld,%ld] C_nb=[%ld,%ld,%ld,%ld]\n",
-                (long)K, (long)M, (long)N,
-                (long)M_pad, (long)N_pad,
-                (long)C->ne[2], (long)C->ne[3],
-                (long)A->ne[0], (long)A->ne[1], (long)A->ne[2], (long)A->ne[3],
-                (long)B->ne[0], (long)B->ne[1], (long)B->ne[2], (long)B->ne[3],
-                (long)C->ne[0], (long)C->ne[1], (long)C->ne[2], (long)C->ne[3],
-                (long)A->nb[0], (long)A->nb[1], (long)A->nb[2], (long)A->nb[3],
-                (long)B->nb[0], (long)B->nb[1], (long)B->nb[2], (long)B->nb[3],
-                (long)C->nb[0], (long)C->nb[1], (long)C->nb[2], (long)C->nb[3]);
+                "TRITON_MATMUL_OFFLOADED_SHAPE: "
+                "A=[%ld,%ld,%ld,%ld] "
+                "B=[%ld,%ld,%ld,%ld] "
+                "node=[%ld,%ld,%ld,%ld]\n",
+                (long)A->ne[0],    (long)A->ne[1],    (long)A->ne[2],    (long)A->ne[3],
+                (long)B->ne[0],    (long)B->ne[1],    (long)B->ne[2],    (long)B->ne[3],
+                (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3]);
         fflush(stderr);
     }
 #else
     (void)A;
     (void)B;
-    (void)C;
-    (void)K;
-    (void)M;
-    (void)N;
-    (void)M_pad;
-    (void)N_pad;
+    (void)node;
 #endif
 }
 
@@ -3673,6 +3532,9 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
     const int64_t N_pad = ((N + 63) / 64) * 64;
 
+#if TRITON_DEBUG
+    triton_matmul_log_offloaded_shape_once(A, B, node);
+#endif
     const int64_t a_nb0 = nb_or_default(A, 0);
     const int64_t a_nb1 = nb_or_default(A, 1);
     const int64_t a_nb2 = nb_or_default(A, 2);
