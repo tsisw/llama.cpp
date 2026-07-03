@@ -1317,25 +1317,6 @@ static void tsi_blob_execution_internal(void *commandList) {
 }
 
 
-// NOTE:
-// Triton ADD kernel supports a host_wrapper-based invocation path today.
-// For Multi-TXE support, we plan to bypass the generated host_wrapper and
-// directly invoke the runtime shim API with manually packed arguments.
-//
-// However, the exact argument packing (ABI/layout) used by Triton-generated
-// kernels is currently not well understood. Due to this, the direct
-// pack-args + runtime shim path is temporarily disabled
-//
-// This will be revisited once we fully reverse-engineer or document the
-// Triton argument packing format through experiments and validation.
-//
-// Follow-up work tracked here:
-// https://tsavoritesi.atlassian.net/browse/FIR-1984
-#if TRITON_MULTI_TXE
-//lock goes out of scope
-// <--- function scope ends here mutex will be released
-//tsi_pack_mutex.unlock() is called automatically
-//std::lock_guard releases the mutex automatically when it goes out of scope.
 static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI_DeviceIdType deviceId) {
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
@@ -1399,7 +1380,7 @@ static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI
 
 static void _mlir_ciface_txe_add_host_new(void *a, void *b, void *res) {
     tsi_init_per_txe_state_once();
-
+    
     if (!multi_thread_enable) {
       // Temporarily disabled; will be enabled in the next release to avoid collateral impact
        #if NEW_HOST_CODE
@@ -1440,7 +1421,271 @@ static void _mlir_ciface_txe_add_host_new(void *a, void *b, void *res) {
        });
     }
 }
-#endif /* TRITON_MULTI_TXE */
+
+#if TRITON_ADD
+extern "C" void _mlir_ciface_add_kernel_memory_wrapper(
+    void *A,
+    void *B,
+    void *C,
+    void *scalar_loop,
+    void *scalar_grid1,
+    void *scalar_grid2,
+    void *scalar_grid3);
+
+static inline void init_triton_add_scalar_generated(
+    MemRefDescriptor<Rank> *d,
+    int32_t v) {
+    memset(d, 0, sizeof(MemRefDescriptor<Rank>));
+
+    d->base       = (void *)(d + 1);
+    d->data       = (void *)(d + 1);
+    d->offset     = 0;
+    d->shape[0]   = 1;
+    d->strides[0] = 1;
+
+    *((int32_t *)(d + 1)) = v;
+}
+
+static inline void init_triton_add_scalar_manual(
+    MemRefDescriptor<Rank> *d,
+    int32_t v) {
+    memset(d, 0, sizeof(MemRefDescriptor<Rank>));
+
+    d->base       = (void *)(d + 1);
+    d->data       = (void *)(d + 1);
+    d->offset     = 0;
+    d->shape[0]   = v;
+    d->strides[0] = 1;
+
+    *((int32_t *)(d + 1)) = v;
+}
+
+static inline void tsi_pack_triton_add_arg(
+    int64_t *p,
+    int &idx,
+    MemRefDescriptor<Rank> *d,
+    const char *name) {
+    if (!d || !d->data) {
+        fprintf(stderr,
+                "ERROR: Triton ADD arg %s NULL desc/data desc=%p data=%p\n",
+                name,
+                (void *)d,
+                d ? d->data : nullptr);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    p[idx++] = tsi_shmem_handle_from_ptr(d->data);
+    p[idx++] = (int64_t)d->shape[0];
+}
+
+static void *_mlir_ciface_txe_add_host_triton_internal(
+    void *a,
+    void *b,
+    void *res,
+    void *scalar_loop_v,
+    void *scalar_grid1_v,
+    void *scalar_grid2_v,
+    void *scalar_grid3_v,
+    TSI_DeviceIdType deviceId) {
+    constexpr int64_t kPackedArgsI64   = 14;
+    constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
+
+    std::lock_guard<std::mutex> lock(tsi_pack_mutex);
+
+    if ((uint32_t)deviceId >= num_of_txes) {
+        fprintf(stderr,
+                "ERROR: Triton ADD deviceId=%d out of range num_of_txes=%u\n",
+                (int)deviceId,
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    if (packed_args.size() != num_of_txes || !packed_args[deviceId]) {
+        fprintf(stderr,
+                "ERROR: Triton ADD packed_args not initialized deviceId=%d size=%zu num_of_txes=%u\n",
+                (int)deviceId,
+                packed_args.size(),
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    MemRefDescriptor<Rank> *A = (MemRefDescriptor<Rank> *)a;
+    MemRefDescriptor<Rank> *B = (MemRefDescriptor<Rank> *)b;
+    MemRefDescriptor<Rank> *C = (MemRefDescriptor<Rank> *)res;
+
+    MemRefDescriptor<Rank> *scalar_loop  = (MemRefDescriptor<Rank> *)scalar_loop_v;
+    MemRefDescriptor<Rank> *scalar_grid1 = (MemRefDescriptor<Rank> *)scalar_grid1_v;
+    MemRefDescriptor<Rank> *scalar_grid2 = (MemRefDescriptor<Rank> *)scalar_grid2_v;
+    MemRefDescriptor<Rank> *scalar_grid3 = (MemRefDescriptor<Rank> *)scalar_grid3_v;
+
+    A->offset = 0;
+    B->offset = 0;
+    C->offset = 0;
+
+    scalar_loop->offset  = 0;
+    scalar_grid1->offset = 0;
+    scalar_grid2->offset = 0;
+    scalar_grid3->offset = 0;
+
+    int64_t *p = static_cast<int64_t *>(packed_args[deviceId]);
+    memset(p, 0, (size_t)kPackedArgsBytes);
+
+    int idx = 0;
+
+    // Triton ADD pack-args layout:
+    // A, B, C, scalar_loop, grid1, grid2, grid3
+    // each arg = 2 x int64: data_handle, shape0/value
+    tsi_pack_triton_add_arg(p, idx, A,            "A");
+    tsi_pack_triton_add_arg(p, idx, B,            "B");
+    tsi_pack_triton_add_arg(p, idx, C,            "C");
+    tsi_pack_triton_add_arg(p, idx, scalar_loop,  "scalar_loop");
+    tsi_pack_triton_add_arg(p, idx, scalar_grid1, "grid1");
+    tsi_pack_triton_add_arg(p, idx, scalar_grid2, "grid2");
+    tsi_pack_triton_add_arg(p, idx, scalar_grid3, "grid3");
+
+    if (idx != kPackedArgsI64) {
+        fprintf(stderr,
+                "ERROR: Triton ADD packed idx=%d expected=%ld\n",
+                idx,
+                (long)kPackedArgsI64);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    void *commandList = tsi_create_command_list(deviceId);
+    if (!commandList) {
+        fprintf(stderr,
+                "ERROR: tsi_create_command_list failed for Triton ADD device=%d\n",
+                (int)deviceId);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    const int64_t packedHandle = tsi_shmem_handle_from_ptr(packed_args[deviceId]);
+
+    void *blobExecuteCmd = tsi_launch_blob(
+        blobDescriptor_add[0],
+        packedHandle,
+        kPackedArgsBytes);
+
+    if (!blobExecuteCmd) {
+        fprintf(stderr,
+                "ERROR: tsi_launch_blob failed for Triton ADD device=%d blob_desc=%p packedHandle=%ld bytes=%ld\n",
+                (int)deviceId,
+                (void *)blobDescriptor_add[0],
+                (long)packedHandle,
+                (long)kPackedArgsBytes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    tsi_add_command_to_list(commandList, blobExecuteCmd);
+    return commandList;
+}
+
+static void _mlir_ciface_txe_add_host_triton(void *a, void *b, void *res) {
+    tsi_init_per_txe_state_once();
+
+    MemRefDescriptor<Rank> *srcP0 = (MemRefDescriptor<Rank> *)a;
+    MemRefDescriptor<Rank> *srcP1 = (MemRefDescriptor<Rank> *)b;
+    MemRefDescriptor<Rank> *nodeP = (MemRefDescriptor<Rank> *)res;
+
+    srcP0->strides[0] = 1;
+    srcP1->strides[0] = 1;
+    nodeP->strides[0] = 1;
+
+    if (!multi_thread_enable || num_of_txes <= 1) {
+        MemRefDescriptor<Rank> *scalar_loop  = (MemRefDescriptor<Rank> *)scalar_loop_args[0];
+        MemRefDescriptor<Rank> *scalar_grid1 = (MemRefDescriptor<Rank> *)scalar_grid1_args[0];
+        MemRefDescriptor<Rank> *scalar_grid2 = (MemRefDescriptor<Rank> *)scalar_grid2_args[0];
+        MemRefDescriptor<Rank> *scalar_grid3 = (MemRefDescriptor<Rank> *)scalar_grid3_args[0];
+
+        init_triton_add_scalar_generated(scalar_loop,  (int32_t)srcP0->shape[0]);
+        init_triton_add_scalar_generated(scalar_grid1, 1);
+        init_triton_add_scalar_generated(scalar_grid2, 1);
+        init_triton_add_scalar_generated(scalar_grid3, 1);
+
+        _mlir_ciface_add_kernel_memory_wrapper(
+            srcP0,
+            srcP1,
+            nodeP,
+            scalar_loop,
+            scalar_grid1,
+            scalar_grid2,
+            scalar_grid3);
+
+        return;
+    }
+
+    const int deviceId = acquire_device_blocking();
+
+    if (deviceId < 0 || (uint32_t)deviceId >= num_of_txes) {
+        fprintf(stderr,
+                "ERROR: failed to acquire valid device for Triton ADD deviceId=%d num_of_txes=%u\n",
+                deviceId,
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    MemRefDescriptor<Rank> *scalar_loop  = (MemRefDescriptor<Rank> *)scalar_loop_args[deviceId];
+    MemRefDescriptor<Rank> *scalar_grid1 = (MemRefDescriptor<Rank> *)scalar_grid1_args[deviceId];
+    MemRefDescriptor<Rank> *scalar_grid2 = (MemRefDescriptor<Rank> *)scalar_grid2_args[deviceId];
+    MemRefDescriptor<Rank> *scalar_grid3 = (MemRefDescriptor<Rank> *)scalar_grid3_args[deviceId];
+
+    init_triton_add_scalar_manual(scalar_loop,  (int32_t)srcP0->shape[0]);
+    init_triton_add_scalar_manual(scalar_grid1, 1);
+    init_triton_add_scalar_manual(scalar_grid2, 1);
+    init_triton_add_scalar_manual(scalar_grid3, 1);
+
+    void *commandList = _mlir_ciface_txe_add_host_triton_internal(
+        srcP0,
+        srcP1,
+        nodeP,
+        scalar_loop,
+        scalar_grid1,
+        scalar_grid2,
+        scalar_grid3,
+        (TSI_DeviceIdType)deviceId);
+
+    if (!commandList) {
+        fprintf(stderr,
+                "Command List Empty for Triton ADD on device %d\n",
+                deviceId);
+        fflush(stderr);
+        release_device(deviceId);
+        tsi_cleanup();
+        abort();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex);
+          workers.emplace_back([=]() {
+            tsi_blob_execution_internal(commandList);
+            release_device(deviceId);
+        });
+    }
+}
+
+#endif /* TRITON_ADD */
+
+static void _mlir_ciface_txe_add_host_all_kind(void *a, void *b, void *res) {
+#if TRITON_ADD
+    _mlir_ciface_txe_add_host_triton(a, b, res);
+#else
+     _mlir_ciface_txe_add_host_new(a, b, res);
+#endif
+}
 
 static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TSI_DeviceIdType deviceId) {
     constexpr int64_t kPackedArgsI64   = 9;
@@ -1654,20 +1899,12 @@ static txe_compute_pipeline_state_s tsi_kernel_setup(enum ggml_tsavorite_kernel_
 
   switch (kernel_type) {
       case GGML_TSAVORITE_KERNEL_TYPE_ADD:
-          if (ggml_tsavorite_kernel_mode_flag == GGML_TSAVORITE_KERNEL_MODE_CPU)
+          if (ggml_tsavorite_kernel_mode_flag == GGML_TSAVORITE_KERNEL_MODE_CPU) {
               kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_test;
-          else {
-// TODO(FIR-1984): Will be addressed as part of Triton multi-TXE packed-args support
-#if TRITON_MULTI_TXE
-              #ifdef GGML_TARGET_POSIX
-                  kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host;
-              #else
-                  kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host_new;
-              #endif /* GGML_TARGET_POSIX */
-#endif /* TRITON_MULTI_TXE */
-              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host;
+          } else {
+              kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F32_INDEX] = &_mlir_ciface_txe_add_host_all_kind;
               kernel_pipeline->_mlir_fptr_2_input[DATA_TYPE_F16_INDEX] = &_mlir_ciface_txe_add_16_host;
-	  }
+          }
           kernel_pipeline->kernel_name = "TXE_ADD";
           flag = true;
           break;
@@ -4522,65 +4759,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
                     nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
                     // kernel call
-#if TRITON_ADD
-                    if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
-                        // MemRefDescriptor
-                        int32_t *scalar_val; 
-                        srcP0->strides[0] = 1;
-                        srcP1->strides[0] = 1;
-                        nodeP->strides[0] = 1;
-                        MemRefDescriptor<Rank> *scalar_loop;
-                        MemRefDescriptor<Rank> *scalar_grid1;
-                        MemRefDescriptor<Rank> *scalar_grid2;
-                        MemRefDescriptor<Rank> *scalar_grid3;
-
-                        scalar_loop = (MemRefDescriptor<Rank> *)scalar_loop_args[0];
-                        scalar_grid1 = (MemRefDescriptor<Rank> *)scalar_grid1_args[0];
-                        scalar_grid2 = (MemRefDescriptor<Rank> *)scalar_grid2_args[0];
-                        scalar_grid3 = (MemRefDescriptor<Rank> *)scalar_grid3_args[0];
-
-                        memset(scalar_loop, 0, sizeof(MemRefDescriptor<Rank>));
-                        memset(scalar_grid1, 0, sizeof(MemRefDescriptor<Rank>));
-                        memset(scalar_grid2, 0, sizeof(MemRefDescriptor<Rank>));
-                        memset(scalar_grid3, 0, sizeof(MemRefDescriptor<Rank>));
-
-                        scalar_loop->shape[0] = 1;
-                        scalar_loop->data = scalar_loop->base = (void *)(scalar_loop+1);
-                        scalar_loop->offset = 0;
-
-                        scalar_val = (int32_t *)(scalar_loop+1);
-                        *scalar_val = (int32_t)srcP0->shape[0];
-
-                        scalar_grid1->shape[0] = 1;
-                        scalar_grid1->data = scalar_grid1->base = (void *)(scalar_grid1 +1);
-                        scalar_grid1->offset = 0;
-
-                        scalar_val = (int32_t *)(scalar_grid1+1);
-                        *scalar_val = 1;
-
-                        scalar_grid2->shape[0] = 1;
-                        scalar_grid2->data = scalar_grid2->base = (void *)(scalar_grid2 +1);
-                        scalar_grid2->offset = 0;
-
-                        scalar_val = (int32_t *)(scalar_grid2+1);
-                        *scalar_val = 1;
-
-                        scalar_grid3->shape[0] = 1;
-                        scalar_grid3->data = scalar_grid3->base = (void *)(scalar_grid3 +1);
-                        scalar_grid3->offset = 0;
-
-                        scalar_val = (int32_t *)(scalar_grid3+1);
-                        *scalar_val = 1;
-
-                        //ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, scalar_loop);
-                        _mlir_ciface_add_kernel_memory_wrapper(srcP0, srcP1, nodeP,
-                                        scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3);
-                    } else {
-#endif /* TRITON_ADD */
-                        ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
-#if TRITON_ADD
-                    }
-#endif /* TRITON_ADD */
+                    ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                     ++node->tsi_kernel_runs;
                 }
