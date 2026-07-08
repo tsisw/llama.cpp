@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-tsavorite.h"
+#include "mat-mul-tsi-test-case.cpp"
 
 #include <cassert>
 #include <cmath>
@@ -634,6 +635,12 @@ int main(int argc, char *argv[]) {
     int num_of_input_tensors;
 
     if (argc > 1) {
+        // New MAT_MUL standalone test case.
+        // Keep existing add/sub/mult/div/unary tests unchanged.
+        if (!strcmp(argv[1], "mat-mul") || !strcmp(argv[1], "mul-mat")) {
+            return matmul_tsi_test(argc, argv);
+        }
+
     	ops_type = convert_testcase_to_ops_type(argv[1]);
 	if (argc > 2 && !strcmp(argv[2], "scale"))
 		data_scale = true;
