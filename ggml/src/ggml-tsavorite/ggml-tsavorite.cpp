@@ -2814,12 +2814,12 @@ static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
     int idx = 0;
 
     // M,N,K,A,B,C,grid1,grid2,grid3
-    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
-    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
-    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
     tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
     tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
     tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
+    tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
+    tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
+    tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
     tsi_pack_triton_matmul_arg(p, idx, grid1_desc, "grid1");
     tsi_pack_triton_matmul_arg(p, idx, grid2_desc, "grid2");
     tsi_pack_triton_matmul_arg(p, idx, grid3_desc, "grid3");
