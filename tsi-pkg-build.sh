@@ -1004,13 +1004,12 @@ bundle_fpga() {
   local build_dir="$1"
   log_info "creating tar bundle for fpga (${build_dir})"
 
-  # REQUIRED CHANGE: local version now comes from SDK_VERSION (default 0.4.0)
   local TSI_GGML_VERSION="${SDK_VERSION}"
-
   local TSI_GGML_BUNDLE_INSTALL_DIR=tsi-ggml
   local GGML_TSI_INSTALL_DIR=ggml-tsi-kernel
   local TSI_GGML_RELEASE_DIR=/proj/rel/sw/ggml
   local TSI_BLOB_INSTALL_DIR
+
   TSI_BLOB_INSTALL_DIR="$(pwd)/${GGML_TSI_INSTALL_DIR}/fpga-kernel/build-fpga"
 
   [ -f "${build_dir}/bin/llama-cli" ] || die "package requested but ${build_dir}/bin/llama-cli not found. Run an FPGA build first."
@@ -1020,7 +1019,88 @@ bundle_fpga() {
 
 cat > "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh" <<'EOL'
 #!/bin/bash
+
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
+
+TAOS_CONFIG_PATH="/etc/taos/taos.json"
+
+update_one_tsavorite_deployment_yaml() {
+  local deployment_yaml_path="$1"
+  local txe_count="$2"
+
+  mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
+
+  cat > "${deployment_yaml_path}" <<EOF
+# Tsavorite deployment config
+txe_count:${txe_count}
+multi_thread_enable: true
+EOF
+
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true"
+  return 0
+}
+
+read_txe_count_from_taos_json() {
+  if [ ! -f "${TAOS_CONFIG_PATH}" ]; then
+    echo "WARNING: ${TAOS_CONFIG_PATH} not found; using conservative default txe_count=1" >&2
+    echo "1"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: ${TAOS_CONFIG_PATH} exists but python3 was not found; cannot parse JSON." >&2
+    return 1
+  fi
+
+  python3 - <<'PY'
+import json
+import sys
+
+path = "/etc/taos/taos.json"
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"ERROR: failed to parse {path}: {e}", file=sys.stderr)
+    sys.exit(2)
+
+if not isinstance(data, dict):
+    print(f"ERROR: {path} must contain a JSON object like {{\"txe_count\": 20}}", file=sys.stderr)
+    sys.exit(2)
+
+if set(data.keys()) != {"txe_count"}:
+    print(f"ERROR: {path} must contain exactly one field: txe_count", file=sys.stderr)
+    sys.exit(2)
+
+txe_count = data.get("txe_count")
+
+if isinstance(txe_count, bool) or not isinstance(txe_count, int) or txe_count < 1:
+    print(f"ERROR: {path} field txe_count must be an integer >= 1", file=sys.stderr)
+    sys.exit(2)
+
+print(txe_count)
+PY
+}
+
+update_tsavorite_deployment_yaml_from_taos() {
+  local txe_count=""
+  local script_dir=""
+
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+  txe_count="$(read_txe_count_from_taos_json)" || return 1
+
+  update_one_tsavorite_deployment_yaml "${script_dir}/tsavorite-model-deployment.yaml" "${txe_count}" || return 1
+
+  if [ -d "${script_dir}/../bin" ] || [ -f "${script_dir}/../bin/tsavorite-model-deployment.yaml" ]; then
+    update_one_tsavorite_deployment_yaml "${script_dir}/../bin/tsavorite-model-deployment.yaml" "${txe_count}" || return 1
+  fi
+
+  return 0
+}
+
+update_tsavorite_deployment_yaml_from_taos || exit 1
 
 tsi_kernels=(
   "add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu"
@@ -1063,32 +1143,26 @@ EOL
   cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
-  # REQUIRED ADDITION: include tsavorite-model-deployment.yaml in same dir as .so
-  local yaml_src=""
-  if [ -n "${TSAVORITE_DEPLOYMENT_YAML_SRC:-}" ]; then
-    yaml_src="${TSAVORITE_DEPLOYMENT_YAML_SRC}"
-  elif [ -f "./tsavorite-model-deployment.yaml" ]; then
-    yaml_src="./tsavorite-model-deployment.yaml"
-  elif [ -n "${__TSI_SCRIPT_DIR}" ] && [ -f "${__TSI_SCRIPT_DIR}/tsavorite-model-deployment.yaml" ]; then
-    yaml_src="${__TSI_SCRIPT_DIR}/tsavorite-model-deployment.yaml"
-  fi
+  cat > "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" <<'EOF'
+# Tsavorite deployment config
+txe_count:1
+multi_thread_enable: true
+EOF
 
-  if [ -n "${yaml_src}" ]; then
-    cp "${yaml_src}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" || return 1
-    log_info "included tsavorite-model-deployment.yaml from: ${yaml_src}"
-  else
-    log_info "WARNING: tsavorite-model-deployment.yaml not found; bundle will not include it (set TSAVORITE_DEPLOYMENT_YAML_SRC to override)."
-  fi
+  log_info "included default tsavorite-model-deployment.yaml with txe_count:1 and multi_thread_enable:true; ggml.sh updates same-dir yaml and ../bin yaml when present."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 
   if [ "$(tolower "$BUILD_TYPE")" = "release" ]; then
     cp "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_RELEASE_DIR}/" || return 1
+
     local LATEST_TZ="${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz"
     local LATEST_FULL_PATH="${TSI_GGML_RELEASE_DIR}/$(basename "$LATEST_TZ")"
+
     rm -f "${TSI_GGML_RELEASE_DIR}/tsi-ggml-aws-latest.tz" "${TSI_GGML_RELEASE_DIR}/tsi-ggml-latest.tz"
     ln -s "/aws${LATEST_FULL_PATH}" "${TSI_GGML_RELEASE_DIR}/tsi-ggml-aws-latest.tz"
     ln -s "${LATEST_FULL_PATH}" "${TSI_GGML_RELEASE_DIR}/tsi-ggml-latest.tz"
+
     log_info "Symlinks updated to point to $(basename "$LATEST_FULL_PATH")"
   fi
 
