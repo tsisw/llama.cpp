@@ -57,10 +57,8 @@
 
 using namespace tsi::runtime;
 
-// This will  go in deployment file at next PR
-//#define MAX_TXES_SUPPORTED 2
-// Compile-time maximum capacity for fixed per-TXE arrays.
-// Runtime active TXE count still comes from tsavorite-model-deployment.yaml: txe_count.
+// The application currently supports up to 20 TXEs. Initialization will fail if txe_count
+// in the deployment configuration exceeds this limit.
 #define MAX_TXES_SUPPORTED 20
 
 
@@ -852,7 +850,6 @@ static void ensure_tsi_runtime_initialized() {
         GGML_TSAVORITE_LOG_INFO("\n tsavorite backend already initialized \n");
         return;
     }
-
     tsi_blob_free_tables();
 
     std::string mainProfilerName = "OPU ";
@@ -919,7 +916,6 @@ static void ensure_tsi_runtime_initialized() {
         tsi_finalize();
         abort();
     }
-
     workers.reserve(num_of_txes);
     runtime_initialized = true;
 
@@ -2162,32 +2158,12 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
      *   a/src0 : [K, M, A2, A3]
      *   b/src1 : [K, N, B2, B3]
      *   op/dst : [M, N, D2, D3]
-     *
-     * Triton blob itself is 2D.
-     * ggml-tsavorite.cpp loops over D2/D3 and launches 2D slices.
      */
     const int64_t K = a->ne[0];
     const int64_t M = a->ne[1];
     const int64_t N = b->ne[1];
 
     if (K <= 0 || M <= 0 || N <= 0) {
-        return false;
-    }
-
-    /*
-     * Keep this restriction for now until N==1 / GEMV-style output
-     * is explicitly validated on Triton MAT_MUL.
-     */
-    if (N == 1) {
-#if TRITON_DEBUG
-        fprintf(stderr,
-                "MUL_MAT_REJECT_N_EQ_1: K=%ld M=%ld N=%ld "
-                "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                (long)K, (long)M, (long)N,
-                (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
-#endif
         return false;
     }
 
@@ -2209,7 +2185,7 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     /*
      * Triton F32 MAT_MUL K alignment requirement.
      */
-    if ((K % TRITON_MATMUL_F32_K_DIM) != 0) {
+    if ((K % 32) != 0) {
 #if TRITON_DEBUG
         fprintf(stderr,
                 "MUL_MAT_REJECT_K_ALIGN: K=%ld "
@@ -2224,14 +2200,6 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 
     /*
      * Validate 3D/4D broadcast semantics.
-     *
-     * Valid cases:
-     *   A2 == 1 or A2 == D2
-     *   B2 == 1 or B2 == D2
-     *   A3 == 1 or A3 == D3
-     *   B3 == 1 or B3 == D3
-     *
-     * Actual per-slice pointer mapping is handled later by ggml-tsavorite.cpp.
      */
     const int64_t A2 = a->ne[2] > 0 ? a->ne[2] : 1;
     const int64_t A3 = a->ne[3] > 0 ? a->ne[3] : 1;
@@ -2265,28 +2233,50 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
         return false;
     }
 
-    /*
-     * Baseline 2D path is always allowed.
-     * Advanced 3D/4D/broadcast path is controlled by deployment YAML:
-     *   advanced_matmul_shape_offload: true
-     */
     const bool is_baseline_2d =
         A2 == 1 && A3 == 1 &&
         B2 == 1 && B3 == 1 &&
         D2 == 1 && D3 == 1;
 
-    if (!is_baseline_2d && !advanced_matmul_shape_offload) {
+    /*
+     * advanced_matmul_shape_offload == false:
+     *   Preserve original July-13 behavior:
+     *     - strict logical 2D only
+     *     - reject N == 1
+     *
+     * advanced_matmul_shape_offload == true:
+     *   Allow advanced 3D/4D/broadcast shapes.
+     *   Do NOT reject N == 1 here, because many advanced shapes are N==1.
+     */
+    if (!advanced_matmul_shape_offload) {
+        if (!is_baseline_2d) {
 #if TRITON_DEBUG
-        fprintf(stderr,
-                "MUL_MAT_REJECT_ADVANCED_FLAG_OFF: "
-                "K=%ld M=%ld N=%ld D2=%ld D3=%ld "
-                "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                (long)K, (long)M, (long)N, (long)D2, (long)D3,
-                (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+            fprintf(stderr,
+                    "MUL_MAT_REJECT_ADVANCED_FLAG_OFF: "
+                    "K=%ld M=%ld N=%ld D2=%ld D3=%ld "
+                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                    (long)K, (long)M, (long)N, (long)D2, (long)D3,
+                    (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
+                    (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
+                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
 #endif
-        return false;
+            return false;
+        }
+
+        if (N == 1) {
+#if TRITON_DEBUG
+            fprintf(stderr,
+                    "MUL_MAT_REJECT_N_EQ_1_BASELINE: K=%ld M=%ld N=%ld "
+                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                    (long)K, (long)M, (long)N,
+                    (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
+                    (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
+                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+#endif
+            return false;
+        }
+
+        return true;
     }
 
     /*
@@ -3721,259 +3711,6 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     node->tsi_kernel_runs += launched_kernel_calls;
     return GGML_STATUS_SUCCESS;
 }
-
-// After test i will remove this
-#ifdef 0
-static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
-    struct ggml_backend_tsavorite_context * ctx,
-    txe_device_s device,
-    struct ggml_tensor * node,
-    enum ggml_tsavorite_kernel_type kernel_type,
-    int kernel_sub_type) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(kernel_sub_type);
-
-    if (!node || !node->src[0] || !node->src[1] || !node->data) {
-        return GGML_STATUS_FAILED;
-    }
-
-    const struct ggml_tensor *A = node->src[0];
-    const struct ggml_tensor *B = node->src[1];
-
-    const int64_t K = A->ne[0];
-    const int64_t M = A->ne[1];
-    const int64_t N = B->ne[1];
-
-    if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
-    if (B->ne[0] != K) return GGML_STATUS_FAILED;
-    if ((K % 32) != 0) return GGML_STATUS_FAILED;
-
-    const int64_t D2 = node->ne[2];
-    const int64_t D3 = node->ne[3];
-
-    const int64_t N_pad = ((N + 63) / 64) * 64;
-
-#if TRITON_DEBUG
-    triton_matmul_log_offloaded_shape_once(A, B, node);
-#endif
-    const int64_t a_nb0 = nb_or_default(A, 0);
-    const int64_t a_nb1 = nb_or_default(A, 1);
-    const int64_t a_nb2 = nb_or_default(A, 2);
-    const int64_t a_nb3 = nb_or_default(A, 3);
-
-    const int64_t b_nb0 = nb_or_default(B, 0);
-    const int64_t b_nb1 = nb_or_default(B, 1);
-    const int64_t b_nb2 = nb_or_default(B, 2);
-    const int64_t b_nb3 = nb_or_default(B, 3);
-
-    const int64_t c_nb0 = nb_or_default(node, 0);
-    const int64_t c_nb1 = nb_or_default(node, 1);
-    const int64_t c_nb2 = nb_or_default(node, 2);
-    const int64_t c_nb3 = nb_or_default(node, 3);
-
-    char *A_base = (char *)A->data;
-    char *B_base = (char *)B->data;
-    char *C_base = (char *)node->data;
-
-    // ============================================================
-    // Single-TXE / generated-host-wrapper path.
-    // Keep old behavior when multi_thread_enable=false or txe_count<=1.
-    // ============================================================
-    if (!multi_thread_enable || num_of_txes <= 1) {
-        const int64_t M_pad = ((M + 7) / 8) * 8;
-
-        ensure_triton_full_buffers(M_pad, N_pad, K);
-
-        for (int64_t d3 = 0; d3 < D3; ++d3) {
-            for (int64_t d2 = 0; d2 < D2; ++d2) {
-                char *A_ptr = A_base + d2 * a_nb2 + d3 * a_nb3;
-                char *B_ptr = B_base + d2 * b_nb2 + d3 * b_nb3;
-                char *C_ptr = C_base + d2 * c_nb2 + d3 * c_nb3;
-
-                memset(g_triton_A_full, 0, (size_t)M_pad * (size_t)K * sizeof(float));
-
-                for (int64_t r = 0; r < M; ++r) {
-                    const char *row = A_ptr + r * a_nb1;
-                    float *dst = g_triton_A_full + r * K;
-
-                    if (a_nb0 == sizeof(float)) {
-                        memcpy(dst, row, (size_t)K * sizeof(float));
-                    } else {
-                        for (int64_t k = 0; k < K; ++k) {
-                            dst[k] = *(float *)(row + k * a_nb0);
-                        }
-                    }
-                }
-
-                memset(g_triton_B_full, 0, (size_t)K * (size_t)N_pad * sizeof(float));
-
-                for (int64_t c = 0; c < N; ++c) {
-                    const char *col = B_ptr + c * b_nb1;
-                    for (int64_t k = 0; k < K; ++k) {
-                        g_triton_B_full[k * N_pad + c] =
-                            *(float *)(col + k * b_nb0);
-                    }
-                }
-
-                memset(g_triton_C_full, 0, (size_t)M_pad * (size_t)N_pad * sizeof(float));
-
-                call_triton_matmul_full_packed(
-                    g_triton_A_full,
-                    g_triton_B_full,
-                    g_triton_C_full,
-                    (int32_t)M_pad,
-                    (int32_t)N_pad,
-                    (int32_t)K);
-
-                if (multi_thread_enable) {
-                    join_all_workers();
-                }
-
-                for (int64_t r = 0; r < M; ++r) {
-                    for (int64_t c = 0; c < N; ++c) {
-                        *(float *)(C_ptr + r * c_nb0 + c * c_nb1) =
-                            g_triton_C_full[r * N_pad + c];
-                    }
-                }
-
-                if (device) {
-                    ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                }
-                ++node->tsi_kernel_runs;
-            }
-        }
-
-        return GGML_STATUS_SUCCESS;
-    }
-
-    // ============================================================
-    // Multi-TXE path: split M dimension across available TXEs.
-    // ============================================================
-    const int64_t active_txes = (int64_t)num_of_txes;
-    const int64_t rows_per_txe_unaligned = (M + active_txes - 1) / active_txes;
-    const int64_t rows_per_txe = ((rows_per_txe_unaligned + 7) / 8) * 8;
-
-    uint64_t launched_kernel_calls = 0;
-
-    for (int64_t d3 = 0; d3 < D3; ++d3) {
-        for (int64_t d2 = 0; d2 < D2; ++d2) {
-            char *A_ptr = A_base + d2 * a_nb2 + d3 * a_nb3;
-            char *B_ptr = B_base + d2 * b_nb2 + d3 * b_nb3;
-            char *C_ptr = C_base + d2 * c_nb2 + d3 * c_nb3;
-
-            for (int64_t m0 = 0; m0 < M; m0 += rows_per_txe * active_txes) {
-                uint64_t batch_launched = 0;
-
-                for (int64_t t = 0; t < active_txes; ++t) {
-                    const int64_t tile_m0 = m0 + t * rows_per_txe;
-                    if (tile_m0 >= M) {
-                        break;
-                    }
-
-                    const int64_t M_valid =
-                        (M - tile_m0 > rows_per_txe) ? rows_per_txe : (M - tile_m0);
-
-                    const int64_t M_tile_pad =
-                        ((M_valid + 7) / 8) * 8;
-
-                    const int deviceId = acquire_device_blocking();
-
-                    if (deviceId < 0 || (uint32_t)deviceId >= num_of_txes) {
-                        fprintf(stderr,
-                                "ERROR: Triton MAT_MUL failed to acquire valid deviceId=%d num_of_txes=%u\n",
-                                deviceId,
-                                (unsigned)num_of_txes);
-                        fflush(stderr);
-                        tsi_cleanup();
-                        abort();
-                    }
-
-                    ensure_triton_full_buffers_for_device(
-                        deviceId,
-                        M_tile_pad,
-                        N_pad,
-                        K);
-
-                    float *A_tile = g_triton_A_full_mt[deviceId];
-                    float *B_tile = g_triton_B_full_mt[deviceId];
-                    float *C_tile = g_triton_C_full_mt[deviceId];
-
-                    {
-                        std::lock_guard<std::mutex> lk(workers_mutex);
-                        workers.emplace_back([=] () {
-                            // Pack A tile: [M_tile_pad x K]
-                            memset(A_tile, 0, (size_t)M_tile_pad * (size_t)K * sizeof(float));
-
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t src_r = tile_m0 + r;
-                                const char *row = A_ptr + src_r * a_nb1;
-                                float *dst = A_tile + r * K;
-
-                                if (a_nb0 == sizeof(float)) {
-                                    memcpy(dst, row, (size_t)K * sizeof(float));
-                                } else {
-                                    for (int64_t k = 0; k < K; ++k) {
-                                        dst[k] = *(const float *)(row + k * a_nb0);
-                                    }
-                                }
-                            }
-
-                            // Pack B full: [K x N_pad]
-                            memset(B_tile, 0, (size_t)K * (size_t)N_pad * sizeof(float));
-
-                            for (int64_t c = 0; c < N; ++c) {
-                                const char *col = B_ptr + c * b_nb1;
-                                for (int64_t k = 0; k < K; ++k) {
-                                    B_tile[k * N_pad + c] =
-                                        *(const float *)(col + k * b_nb0);
-                                }
-                            }
-
-                            // Clear C tile
-                            memset(C_tile, 0, (size_t)M_tile_pad * (size_t)N_pad * sizeof(float));
-
-                            // Run Triton MAT_MUL on this device
-                            call_triton_matmul_full_packed_on_device(
-                                deviceId,
-                                A_tile,
-                                B_tile,
-                                C_tile,
-                                (int32_t)M_tile_pad,
-                                (int32_t)N_pad,
-                                (int32_t)K);
-
-                            // Copy valid rows back
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t dst_r = tile_m0 + r;
-                                for (int64_t c = 0; c < N; ++c) {
-                                    *(float *)(C_ptr + dst_r * c_nb0 + c * c_nb1) =
-                                        C_tile[r * N_pad + c];
-                                }
-                            }
-
-                            release_device(deviceId);
-                        });
-                    }
-
-                    ++batch_launched;
-                    ++launched_kernel_calls;
-                }
-
-                if (batch_launched > 0) {
-                    join_all_workers();
-                }
-            }
-        }
-    }
-
-    if (device) {
-        device->stats.op_run_count[kernel_type].num_of_kernel_call += launched_kernel_calls;
-    }
-    node->tsi_kernel_runs += launched_kernel_calls;
-
-    return GGML_STATUS_SUCCESS;
-}
-#endif /* 0 */
 
 #else
 

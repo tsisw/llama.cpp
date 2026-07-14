@@ -1027,16 +1027,38 @@ TAOS_CONFIG_PATH="/etc/taos/taos.json"
 update_one_tsavorite_deployment_yaml() {
   local deployment_yaml_path="$1"
   local txe_count="$2"
+  local advanced_matmul_shape_offload="false"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
+  if [ -f "${deployment_yaml_path}" ]; then
+    local existing_advanced
+    existing_advanced="$(awk -F: '
+      /^[[:space:]]*advanced_matmul_shape_offload[[:space:]]*:/ {
+        v=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    ' "${deployment_yaml_path}")"
+
+    if [ -n "${existing_advanced}" ]; then
+      advanced_matmul_shape_offload="${existing_advanced}"
+    fi
+  fi
+
   cat > "${deployment_yaml_path}" <<EOF
 # Tsavorite deployment config
-txe_count:${txe_count}
+txe_count: ${txe_count}
 multi_thread_enable: true
+
+# Enable additional Triton MAT_MUL shapes beyond stable baseline.
+# false = old behavior
+# true  = new offload shapes
+advanced_matmul_shape_offload: ${advanced_matmul_shape_offload}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}"
   return 0
 }
 
@@ -1145,11 +1167,16 @@ EOL
 
   cat > "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" <<'EOF'
 # Tsavorite deployment config
-txe_count:1
+txe_count: 1
 multi_thread_enable: true
+
+# Enable additional Triton MAT_MUL shapes beyond stable baseline.
+# false = old behavior
+# true  = new offload shapes
+advanced_matmul_shape_offload: false
 EOF
 
-  log_info "included default tsavorite-model-deployment.yaml with txe_count:1 and multi_thread_enable:true; ggml.sh updates same-dir yaml and ../bin yaml when present."
+  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false; ggml.sh updates txe_count and preserves advanced_matmul_shape_offload."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 
