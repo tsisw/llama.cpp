@@ -1,3 +1,8 @@
 # Tsavorite deployment config
 txe_count: 1
 multi_thread_enable: false
+
+# Enable additional Triton MAT_MUL shapes beyond stable baseline.
+# false = old behavior
+# true  = new offload shapes
+advanced_matmul_shape_offload: false
