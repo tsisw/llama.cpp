@@ -7438,60 +7438,308 @@ FILE * ggml_perf_log_open(const char *filename) {
     return fp;
 }
 
-void ggml_perf_write_detailed_csv(struct ggml_cgraph * cgraph, FILE *fp) {
-    if (!fp) return;
 
-    int64_t total_time_us = 0;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (cgraph->nodes[i]->perf_runs > 0) {
-            total_time_us += cgraph->nodes[i]->perf_time_us;
-        }
+void ggml_perf_write_detailed_csv(struct ggml_cgraph * cgraph, FILE *fp) {
+    if (!fp || !cgraph) return;
+
+    struct ggml_perf_shape_agg {
+        bool used;
+
+        enum ggml_op op;
+        int unary_subop;
+
+        enum ggml_compute_backend_type backend;
+        enum ggml_type type;
+
+        int64_t ne[GGML_MAX_DIMS];
+
+        bool src_used[GGML_MAX_SRC];
+        enum ggml_type src_type[GGML_MAX_SRC];
+        int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+
+        int64_t runs;
+        int64_t tsi_kernel_runs;
+        int64_t perf_time_us;
+    };
+
+    struct ggml_perf_shape_agg * aggs =
+        (struct ggml_perf_shape_agg *) calloc((size_t) cgraph->n_nodes, sizeof(struct ggml_perf_shape_agg));
+
+    if (!aggs) {
+        return;
     }
 
-    fprintf(fp, "\n=== GGML Detailed Op Perf (%.3f ms total) ===\n", total_time_us / 1000.0);
-    fprintf(fp,
-        "%-12s %-20s %10s %12s %10s %10s %10s %10s %10s\n",
-        "Backend", "Op", "Runs", "Total ms", "Avg ms", "ne[0]", "ne[1]", "ne[2]", "ne[3]");
+    int n_aggs = 0;
+    int64_t total_time_us = 0;
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
-        if (node->perf_runs == 0) continue;
-	#ifdef TMU_DEBUG
-            if (node->op != GGML_OP_MUL_MAT) continue;
-	#endif /* TMU_DEBUG */
 
-        double t_ms   = node->perf_time_us / 1000.0;
-        double avg_ms = t_ms / node->perf_runs;
-
-        const char * op_name = ggml_op_name(node->op);
-        char full_op[64];
-        if (node->op == GGML_OP_UNARY) {
-            enum ggml_unary_op subop = ggml_get_unary_op(node);
-            snprintf(full_op, sizeof(full_op), "UNARY(%s)", ggml_unary_op_name(subop));
-            op_name = full_op;
+        if (!node) {
+            continue;
         }
 
-        fprintf(fp,
-            "%-12s %-20s %10" PRId64 " %12.3f %10.3f %10ld %10ld %10ld %10ld\n",
-            ggml_backend_type(node->ggml_compute_backend),
-            op_name,
-            node->perf_runs,
-            t_ms,
-            avg_ms,
-            node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+        if (node->perf_runs == 0) {
+            continue;
+        }
 
-        // Loop over all possible source tensors
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            struct ggml_tensor * src = node->src[s];
-            if (src) {
+#ifdef TMU_DEBUG
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+#endif /* TMU_DEBUG */
+
+        total_time_us += node->perf_time_us;
+
+        int unary_subop = -1;
+        if (node->op == GGML_OP_UNARY) {
+            unary_subop = (int) ggml_get_unary_op(node);
+        }
+
+        int found = -1;
+
+        for (int a = 0; a < n_aggs; ++a) {
+            if (!aggs[a].used) {
+                continue;
+            }
+
+            if (aggs[a].op != node->op) {
+                continue;
+            }
+
+            if (aggs[a].unary_subop != unary_subop) {
+                continue;
+            }
+
+            if (aggs[a].backend != node->ggml_compute_backend) {
+                continue;
+            }
+
+            if (aggs[a].type != node->type) {
+                continue;
+            }
+
+            bool same = true;
+
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (aggs[a].ne[d] != node->ne[d]) {
+                    same = false;
+                    break;
+                }
+            }
+
+            if (!same) {
+                continue;
+            }
+
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                struct ggml_tensor * src = node->src[s];
+                bool src_used = src != NULL;
+
+                if (aggs[a].src_used[s] != src_used) {
+                    same = false;
+                    break;
+                }
+
+                if (!src_used) {
+                    continue;
+                }
+
+                if (aggs[a].src_type[s] != src->type) {
+                    same = false;
+                    break;
+                }
+
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (aggs[a].src_ne[s][d] != src->ne[d]) {
+                        same = false;
+                        break;
+                    }
+                }
+
+                if (!same) {
+                    break;
+                }
+            }
+
+            if (same) {
+                found = a;
+                break;
+            }
+        }
+
+        if (found < 0) {
+            found = n_aggs++;
+
+            aggs[found].used = true;
+            aggs[found].op = node->op;
+            aggs[found].unary_subop = unary_subop;
+            aggs[found].backend = node->ggml_compute_backend;
+            aggs[found].type = node->type;
+
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                aggs[found].ne[d] = node->ne[d];
+            }
+
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                struct ggml_tensor * src = node->src[s];
+
+                aggs[found].src_used[s] = src != NULL;
+
+                if (src) {
+                    aggs[found].src_type[s] = src->type;
+
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        aggs[found].src_ne[s][d] = src->ne[d];
+                    }
+                }
+            }
+        }
+
+        aggs[found].runs += node->perf_runs;
+        aggs[found].tsi_kernel_runs += node->tsi_kernel_runs;
+        aggs[found].perf_time_us += node->perf_time_us;
+    }
+
+    fprintf(fp,
+            "\n=== GGML Detailed Op Perf Aggregated By Shape (%.3f ms total) ===\n",
+            total_time_us / 1000.0);
+
+    fprintf(fp,
+            "%-10s %-16s %-8s %8s %14s %12s %10s     %s\n",
+            "Backend",
+            "Op",
+            "Type",
+            "Runs",
+            "TSI_KERNEL",
+            "Total ms",
+            "Avg ms",
+            "Dimensions");
+
+    const enum ggml_compute_backend_type backend_order[] = {
+        GGML_COMPUTE_BACKEND_TSAVORITE,
+        GGML_COMPUTE_BACKEND_CPU,
+    };
+
+    for (int op_idx = 0; op_idx < GGML_OP_COUNT; ++op_idx) {
+        bool has_op_printed = false;
+
+        for (int bidx = 0; bidx < (int)(sizeof(backend_order) / sizeof(backend_order[0])); ++bidx) {
+            enum ggml_compute_backend_type backend = backend_order[bidx];
+
+            bool has_backend_shapes = false;
+
+            for (int a = 0; a < n_aggs; ++a) {
+                if (!aggs[a].used) {
+                    continue;
+                }
+
+                if ((int) aggs[a].op != op_idx) {
+                    continue;
+                }
+
+                if (aggs[a].backend != backend) {
+                    continue;
+                }
+
+                has_backend_shapes = true;
+                break;
+            }
+
+            if (!has_backend_shapes) {
+                continue;
+            }
+
+            if (!has_op_printed) {
                 fprintf(fp,
-                    "             src%-2d:                             ne[0]=%6ld  ne[1]=%6ld  ne[2]=%6ld  ne[3]=%6ld\n",
-                    s,
-                    src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+                        "\n--- OP GROUP: %s ---\n",
+                        ggml_op_name((enum ggml_op) op_idx));
+                has_op_printed = true;
+            }
+
+            fprintf(fp,
+                    "--- BACKEND: %s ---\n",
+                    ggml_backend_type(backend));
+
+            for (int a = 0; a < n_aggs; ++a) {
+                if (!aggs[a].used) {
+                    continue;
+                }
+
+                if ((int) aggs[a].op != op_idx) {
+                    continue;
+                }
+
+                if (aggs[a].backend != backend) {
+                    continue;
+                }
+
+                const char * op_name = ggml_op_name(aggs[a].op);
+                char full_op[64];
+
+                if (aggs[a].op == GGML_OP_UNARY && aggs[a].unary_subop >= 0) {
+                    snprintf(full_op, sizeof(full_op),
+                            "UNARY(%s)",
+                            ggml_unary_op_name((enum ggml_unary_op) aggs[a].unary_subop));
+                    op_name = full_op;
+                }
+
+                double t_ms   = aggs[a].perf_time_us / 1000.0;
+                double avg_ms = aggs[a].runs ? t_ms / aggs[a].runs : 0.0;
+
+                fprintf(fp,
+                        "%-10s %-16s %-8s %8" PRId64 " %14" PRId64 " %12.3f %10.3f     [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                        ggml_backend_type(aggs[a].backend),
+                        op_name,
+                        ggml_type_name(aggs[a].type),
+                        aggs[a].runs,
+                        aggs[a].tsi_kernel_runs,
+                        t_ms,
+                        avg_ms,
+                        aggs[a].ne[0],
+                        aggs[a].ne[1],
+                        aggs[a].ne[2],
+                        aggs[a].ne[3]);
+
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (!aggs[a].src_used[s]) {
+                        continue;
+                    }
+
+                    fprintf(fp,
+                            "%-10s %-16s %-8s %8s %14s %12s %10s         [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                            "",
+                            (s == 0) ? "    src0" :
+                            (s == 1) ? "    src1" :
+                            (s == 2) ? "    src2" :
+                            (s == 3) ? "    src3" :
+                            (s == 4) ? "    src4" :
+                            (s == 5) ? "    src5" :
+                            (s == 6) ? "    src6" :
+                            (s == 7) ? "    src7" :
+                            (s == 8) ? "    src8" :
+                                       "    src9",
+                            ggml_type_name(aggs[a].src_type[s]),
+                            "",
+                            "",
+                            "",
+                            "",
+                            aggs[a].src_ne[s][0],
+                            aggs[a].src_ne[s][1],
+                            aggs[a].src_ne[s][2],
+                            aggs[a].src_ne[s][3]);
+                }
             }
         }
     }
 
-    fprintf(fp, "--------------------------------------------------------------------------------------------------------\n\n");
+    fprintf(fp,
+            "--------------------------------------------------------------------------------------------------------\n\n");
+
+    free(aggs);
 }
+
+
+
+
 #endif /* GGML_PERF_DETAIL */
