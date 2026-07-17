@@ -1064,8 +1064,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     int64_t n_outputs_prev = 0;
+
 #ifdef GGML_PERF_DETAIL
-    FILE *perf_all_shape_fp = ggml_perf_log_open("ggml_perf-all-shape.log");
+    static FILE * perf_all_shape_fp = nullptr;
+    static bool perf_all_shape_written_once = false;
+
+    if (!perf_all_shape_fp) {
+        perf_all_shape_fp = ggml_perf_log_open("ggml_perf-all-shape.log");
+    }
 #endif /* GGML_PERF_DETAIL */
 
     do {
@@ -1097,7 +1103,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 #elif defined(GGML_PERF_DETAIL)
     if (res) {
         ggml_perf_accumulate(perf_totals, res->get_gf());
-        ggml_perf_write_detailed_csv(res->get_gf(), perf_all_shape_fp);
+        if (!perf_all_shape_written_once && perf_all_shape_fp) {
+            ggml_perf_write_detailed_csv(res->get_gf(), perf_all_shape_fp);
+            fflush(perf_all_shape_fp);
+            perf_all_shape_written_once = true;
+        } 
     } 
 #endif /* GML_PERF-related flags */
 
