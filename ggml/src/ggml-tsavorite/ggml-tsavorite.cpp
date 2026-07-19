@@ -102,8 +102,32 @@ struct TsavoriteRuntimeState {
     void **loadResult_rms_norm = nullptr;
 #if TRITON_MAT_MUL
     void **loadResult_matmul = nullptr;
+
+    /*
+     * Knob model:
+     *
+     * advanced_matmul_shape_offload:
+     *   Master enable for new incremental MAT_MUL expansion.
+     *
+     * advanced_matmul_f32_2d_offload:
+     *   Enables expanded clean F32 2D shapes, including N == 1.
+     *
+     * advanced_matmul_broadcast_offload:
+     *   Enables supported 3D/4D broadcast shapes.
+     *
+     * advanced_matmul_mixed_precision_offload:
+     *   Reserved for F16/F32 mixed precision. Parsed now, not enabled in support yet.
+     *
+     * Backward compatibility:
+     *   Even when all advanced knobs are false, legacy clean F32 2D shapes with N != 1
+     *   remain supported. This preserves the old small MAT_MUL offload behavior.
+     */
     bool advanced_matmul_shape_offload = false;
+    bool advanced_matmul_f32_2d_offload = false;
+    bool advanced_matmul_broadcast_offload = false;
+    bool advanced_matmul_mixed_precision_offload = false;
 #endif
+
 
     // blob lifetime state machine
     enum BlobState : uint8_t {
@@ -153,6 +177,9 @@ auto &loadResult_rms_norm     = g_rt.loadResult_rms_norm;
 #if TRITON_MAT_MUL
 auto &loadResult_matmul       = g_rt.loadResult_matmul;
 auto &advanced_matmul_shape_offload = g_rt.advanced_matmul_shape_offload;
+auto &advanced_matmul_f32_2d_offload = g_rt.advanced_matmul_f32_2d_offload;
+auto &advanced_matmul_broadcast_offload = g_rt.advanced_matmul_broadcast_offload;
+auto &advanced_matmul_mixed_precision_offload = g_rt.advanced_matmul_mixed_precision_offload;
 #endif
 } // anonymous namespace
 
@@ -247,6 +274,15 @@ struct tsi_deploy_cfg_t {
 #if TRITON_MAT_MUL
     bool advanced_matmul_shape_offload = false;
     bool has_advanced_matmul_shape_offload = false;
+
+    bool advanced_matmul_f32_2d_offload = false;
+    bool has_advanced_matmul_f32_2d_offload = false;
+
+    bool advanced_matmul_broadcast_offload = false;
+    bool has_advanced_matmul_broadcast_offload = false;
+
+    bool advanced_matmul_mixed_precision_offload = false;
+    bool has_advanced_matmul_mixed_precision_offload = false;
 #endif
 };
 
@@ -306,6 +342,33 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
             if (tsi_parse_bool_after_colon(t, &b)) {
                 cfg.advanced_matmul_shape_offload = b;
                 cfg.has_advanced_matmul_shape_offload = true;
+            }
+        }
+
+        if (t.find("advanced_matmul_f32_2d_offload") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            bool b = false;
+            if (tsi_parse_bool_after_colon(t, &b)) {
+                cfg.advanced_matmul_f32_2d_offload = b;
+                cfg.has_advanced_matmul_f32_2d_offload = true;
+            }
+        }
+
+        if (t.find("advanced_matmul_broadcast_offload") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            bool b = false;
+            if (tsi_parse_bool_after_colon(t, &b)) {
+                cfg.advanced_matmul_broadcast_offload = b;
+                cfg.has_advanced_matmul_broadcast_offload = true;
+            }
+        }
+
+        if (t.find("advanced_matmul_mixed_precision_offload") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            bool b = false;
+            if (tsi_parse_bool_after_colon(t, &b)) {
+                cfg.advanced_matmul_mixed_precision_offload = b;
+                cfg.has_advanced_matmul_mixed_precision_offload = true;
             }
         }
 #endif
@@ -883,6 +946,21 @@ static void ensure_tsi_runtime_initialized() {
         cfg.has_advanced_matmul_shape_offload ?
         cfg.advanced_matmul_shape_offload :
         false;
+
+    advanced_matmul_f32_2d_offload =
+        cfg.has_advanced_matmul_f32_2d_offload ?
+        cfg.advanced_matmul_f32_2d_offload :
+        false;
+
+    advanced_matmul_broadcast_offload =
+        cfg.has_advanced_matmul_broadcast_offload ?
+        cfg.advanced_matmul_broadcast_offload :
+        false;
+
+    advanced_matmul_mixed_precision_offload =
+        cfg.has_advanced_matmul_mixed_precision_offload ?
+        cfg.advanced_matmul_mixed_precision_offload :
+        false;
 #endif
 
     printf("\n TSI deploy yaml=%s txe_count=%u multi_thread_enable=%d",
@@ -891,8 +969,14 @@ static void ensure_tsi_runtime_initialized() {
            (int)multi_thread_enable);
 
 #if TRITON_MAT_MUL
-    printf(" advanced_matmul_shape_offload=%d",
-           (int)advanced_matmul_shape_offload);
+    printf(" advanced_matmul_shape_offload=%d"
+           " advanced_matmul_f32_2d_offload=%d"
+           " advanced_matmul_broadcast_offload=%d"
+           " advanced_matmul_mixed_precision_offload=%d",
+           (int)advanced_matmul_shape_offload,
+           (int)advanced_matmul_f32_2d_offload,
+           (int)advanced_matmul_broadcast_offload,
+           (int)advanced_matmul_mixed_precision_offload);
 #endif
 
     printf("\n");
@@ -2125,36 +2209,43 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
   return true;
 }
 
-
 #if TRITON_MAT_MUL
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
-    if (!op) return false;
+    if (!op || !op->src[0] || !op->src[1]) {
+        return false;
+    }
 
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
 
-    if (!a || !b) return false;
-
     /*
-     * Triton MAT_MUL supports F32-only for now.
+     * Current Triton path is F32-only.
+     * Mixed precision is parsed as a knob but not enabled here yet.
      */
     if (a->type != GGML_TYPE_F32 ||
         b->type != GGML_TYPE_F32 ||
         op->type != GGML_TYPE_F32) {
 #if TRITON_DEBUG
-        fprintf(stderr,
-                "MUL_MAT_REJECT_DTYPE: a_type=%d b_type=%d op_type=%d "
-                "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                (int)a->type, (int)b->type, (int)op->type,
-                (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+        if (advanced_matmul_mixed_precision_offload) {
+            fprintf(stderr,
+                    "MUL_MAT_REJECT_MIXED_PRECISION_NOT_IMPLEMENTED: "
+                    "a_type=%d b_type=%d op_type=%d "
+                    "a=[%ld,%ld,%ld,%ld] "
+                    "b=[%ld,%ld,%ld,%ld] "
+                    "op=[%ld,%ld,%ld,%ld]\n",
+                    (int)a->type,
+                    (int)b->type,
+                    (int)op->type,
+                    (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
+                    (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
+                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+        }
 #endif
         return false;
     }
 
     /*
-     * GGML MUL_MAT layout:
+     * GGML MUL_MAT layout used by this backend:
      *   a/src0 : [K, M, A2, A3]
      *   b/src1 : [K, N, B2, B3]
      *   op/dst : [M, N, D2, D3]
@@ -2167,40 +2258,18 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
         return false;
     }
 
-    /*
-     * Basic shape consistency.
-     */
     if (b->ne[0] != K) {
         return false;
     }
 
-    if (op->ne[0] != M) {
+    if (op->ne[0] != M || op->ne[1] != N) {
         return false;
     }
 
-    if (op->ne[1] != N) {
-        return false;
-    }
-
-    /*
-     * Triton F32 MAT_MUL K alignment requirement.
-     */
     if ((K % 32) != 0) {
-#if TRITON_DEBUG
-        fprintf(stderr,
-                "MUL_MAT_REJECT_K_ALIGN: K=%ld "
-                "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                (long)K,
-                (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
-#endif
         return false;
     }
 
-    /*
-     * Validate 3D/4D broadcast semantics.
-     */
     const int64_t A2 = a->ne[2] > 0 ? a->ne[2] : 1;
     const int64_t A3 = a->ne[3] > 0 ? a->ne[3] : 1;
     const int64_t B2 = b->ne[2] > 0 ? b->ne[2] : 1;
@@ -2209,11 +2278,7 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     const int64_t D2 = (A2 > B2) ? A2 : B2;
     const int64_t D3 = (A3 > B3) ? A3 : B3;
 
-    if (op->ne[2] != D2) {
-        return false;
-    }
-
-    if (op->ne[3] != D3) {
+    if (op->ne[2] != D2 || op->ne[3] != D3) {
         return false;
     }
 
@@ -2233,46 +2298,50 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
         return false;
     }
 
-    const bool is_baseline_2d =
+    const bool is_clean_2d =
         A2 == 1 && A3 == 1 &&
         B2 == 1 && B3 == 1 &&
         D2 == 1 && D3 == 1;
 
+    const bool is_broadcast_shape =
+        !is_clean_2d;
+
     /*
-     * advanced_matmul_shape_offload == false:
-     *   Preserve original July-13 behavior:
-     *     - strict logical 2D only
-     *     - reject N == 1
-     *
-     * advanced_matmul_shape_offload == true:
-     *   Allow advanced 3D/4D/broadcast shapes.
-     *   Do NOT reject N == 1 here, because many advanced shapes are N==1.
+     * Safety caps for current Triton F32 path.
      */
-    if (!advanced_matmul_shape_offload) {
-        if (!is_baseline_2d) {
-#if TRITON_DEBUG
-            fprintf(stderr,
-                    "MUL_MAT_REJECT_ADVANCED_FLAG_OFF: "
-                    "K=%ld M=%ld N=%ld D2=%ld D3=%ld "
-                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                    (long)K, (long)M, (long)N, (long)D2, (long)D3,
-                    (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                    (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
-#endif
+    if (K > 8192) {
+        return false;
+    }
+
+    if (M > 32768) {
+        return false;
+    }
+
+    if (N > 4096) {
+        return false;
+    }
+
+    /*
+     * Legacy behavior:
+     *   Keep the old small baseline offload alive even when all advanced knobs are false.
+     *   This preserves previous behavior where advanced_matmul_shape_offload=false still
+     *   allowed clean F32 2D MUL_MAT with N != 1.
+     */
+    if (is_clean_2d && N != 1) {
+        return true;
+    }
+
+    /*
+     * Increment 1:
+     *   Expanded F32 2D support, including N == 1.
+     *   Requires master knob + specific F32 2D knob.
+     */
+    if (is_clean_2d) {
+        if (!advanced_matmul_shape_offload) {
             return false;
         }
 
-        if (N == 1) {
-#if TRITON_DEBUG
-            fprintf(stderr,
-                    "MUL_MAT_REJECT_N_EQ_1_BASELINE: K=%ld M=%ld N=%ld "
-                    "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-                    (long)K, (long)M, (long)N,
-                    (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-                    (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-                    (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
-#endif
+        if (!advanced_matmul_f32_2d_offload) {
             return false;
         }
 
@@ -2280,48 +2349,23 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     }
 
     /*
-     * Current 1x8 Triton shape padding.
+     * Increment 2:
+     *   Broadcast / 3D / 4D support.
+     *   Requires master knob + broadcast knob.
      */
-    const int64_t M_pad = ((M + 7)  / 8)  * 8;
-    const int64_t N_pad = ((N + 63) / 64) * 64;
+    if (is_broadcast_shape) {
+        if (!advanced_matmul_shape_offload) {
+            return false;
+        }
 
-    const int64_t elems_A = M_pad * K;
-    const int64_t elems_B = K * N_pad;
-    const int64_t elems_C = M_pad * N_pad;
+        if (!advanced_matmul_broadcast_offload) {
+            return false;
+        }
 
-    if (elems_A <= 0 || elems_B <= 0 || elems_C <= 0) {
-        return false;
+        return true;
     }
 
-    const int64_t total_bytes =
-        (elems_A + elems_B + elems_C) * (int64_t)sizeof(float);
-
-    /*
-     * Broad sanity caps only.
-     */
-    if (K > 8192)  return false;
-    if (M > 32768) return false;
-    if (N > 4096)  return false;
-
-#if TRITON_DEBUG
-    fprintf(stderr,
-            "MUL_MAT_TRITON_ENABLE: K=%ld M=%ld N=%ld D2=%ld D3=%ld "
-            "baseline_2d=%d advanced_flag=%d "
-            "M_pad=%ld N_pad=%ld total_bytes=%ld "
-            "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
-            (long)K, (long)M, (long)N,
-            (long)D2, (long)D3,
-            (int)is_baseline_2d,
-            (int)advanced_matmul_shape_offload,
-            (long)M_pad,
-            (long)N_pad,
-            (long)total_bytes,
-            (long)a->ne[0],  (long)a->ne[1],  (long)a->ne[2],  (long)a->ne[3],
-            (long)b->ne[0],  (long)b->ne[1],  (long)b->ne[2],  (long)b->ne[3],
-            (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
-#endif
-
-    return true;
+    return false;
 }
 
 #else
@@ -3514,6 +3558,49 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     const int64_t K = A->ne[0];
     const int64_t M = A->ne[1];
     const int64_t N = B->ne[1];
+
+    {
+        static std::mutex s_mul_mat_exec_mutex;
+        static std::vector<std::string> s_mul_mat_exec_keys;
+
+        char key[512];
+        snprintf(key, sizeof(key),
+             "node=[%ld,%ld,%ld,%ld] "
+             "src0=[%ld,%ld,%ld,%ld] "
+             "src1=[%ld,%ld,%ld,%ld] "
+             "K=%ld M=%ld N=%ld",
+             (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
+             (long)A->ne[0],    (long)A->ne[1],    (long)A->ne[2],    (long)A->ne[3],
+             (long)B->ne[0],    (long)B->ne[1],    (long)B->ne[2],    (long)B->ne[3],
+             (long)K,
+             (long)M,
+             (long)N);
+
+        bool already_seen = false;
+
+        {
+            std::lock_guard<std::mutex> lock(s_mul_mat_exec_mutex);
+
+            for (const std::string &seen_key : s_mul_mat_exec_keys) {
+                if (seen_key == key) {
+                    already_seen = true;
+                    break;
+                }
+            }
+
+            if (!already_seen) {
+                s_mul_mat_exec_keys.push_back(std::string(key));
+            }
+        }
+
+        if (!already_seen) {
+            fprintf(stderr,
+                "MUL_MAT_EXECUTE_OPU_ONCE: %s\n",
+                key);
+            fflush(stderr);
+        }
+    }
+
     if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
     if (B->ne[0] != K) return GGML_STATUS_FAILED;
     if ((K % 32) != 0) return GGML_STATUS_FAILED;
