@@ -1,8 +1,17 @@
-# Tsavorite deployment config
+# Legacy behavior is always preserved in code:
+# clean F32 2D MAT_MUL with N != 1 can still offload even when all advanced knobs are false.
+
 txe_count: 1
 multi_thread_enable: false
 
-# Enable additional Triton MAT_MUL shapes beyond stable baseline.
-# false = old behavior
-# true  = new offload shapes
+# Master knob for incremental Triton MAT_MUL expansion.
 advanced_matmul_shape_offload: false
+
+# Increment 1: expanded clean F32 2D shapes, including N == 1.
+advanced_matmul_f32_2d_offload: false
+
+# Increment 2: 3D/4D broadcast shapes.
+advanced_matmul_broadcast_offload: false
+
+# Increment 3: reserved for F16/F32 mixed precision.
+advanced_matmul_mixed_precision_offload: false
