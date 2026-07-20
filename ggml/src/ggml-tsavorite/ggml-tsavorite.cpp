@@ -54,6 +54,7 @@
 #include  <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <map>
 
 using namespace tsi::runtime;
 
@@ -451,6 +452,301 @@ FILE *tsi_op_log_file;
 bool runtime_initialized = false;
 uint64_t num_of_op;
 #define TSI_RUN_TIME_INSTANCE 1
+
+// ============================================================================
+// Tsavorite MAT_MUL detailed profiling
+//
+// Output files are written once at shutdown:
+//   1) ggml_tmu_matmul_profile_summary.tsv
+//      Small table intended for Confluence / quick review.
+//   2) ggml_tmu_matmul_profile_detail.txt
+//      Human-readable section report, one section per matrix shape.
+//
+// Hot path policy:
+//   MAT_MUL only updates global in-memory counters. No per-run file writes.
+// ============================================================================
+struct tsavorite_matmul_profile_sample_t {
+    int64_t matrix_total_us = 0;
+    int64_t pack_a_us = 0;
+    int64_t pack_b_us = 0;
+    int64_t padding_memset_us = 0;
+    int64_t launch_us = 0;
+    int64_t txe_wait_critical_us = 0;
+    int64_t txe_wait_sum_us = 0;
+    int64_t copyback_us = 0;
+    int64_t postprocess_us = 0;
+    int64_t kernel_calls = 0;
+};
+
+static inline int64_t tsavorite_now_us() {
+    return ggml_time_us();
+}
+
+static inline int64_t tsavorite_elapsed_us(int64_t start_us) {
+    const int64_t end_us = tsavorite_now_us();
+    if (end_us >= start_us) {
+        return end_us - start_us;
+    }
+    return 0;
+}
+
+#ifdef TMU_DEBUG
+
+struct tsavorite_matmul_profile_bucket_t {
+    int64_t runs = 0;
+    int64_t kernel_calls = 0;
+
+    int64_t matrix_total_us = 0;
+    int64_t pack_a_us = 0;
+    int64_t pack_b_us = 0;
+    int64_t padding_memset_us = 0;
+    int64_t launch_us = 0;
+    int64_t txe_wait_critical_us = 0;
+    int64_t txe_wait_sum_us = 0;
+    int64_t copyback_us = 0;
+    int64_t postprocess_us = 0;
+
+    char op_dims[128] = {0};
+    char src0_dims[128] = {0};
+    char src1_dims[128] = {0};
+    char type_name[32] = {0};
+};
+
+static std::mutex g_tsavorite_matmul_profile_mutex;
+static std::map<std::string, tsavorite_matmul_profile_bucket_t> g_tsavorite_matmul_profile;
+
+static inline double tsavorite_us_to_ms(int64_t us) {
+    return (double)us / 1000.0;
+}
+
+static inline double tsavorite_pct(double numerator, double denominator) {
+    if (denominator <= 0.0) {
+        return 0.0;
+    }
+    return (numerator * 100.0) / denominator;
+}
+
+static inline void tsavorite_dims_to_string(const struct ggml_tensor *t, char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return;
+    }
+
+    if (!t) {
+        snprintf(buf, buf_size, "[0,0,0,0]");
+        return;
+    }
+
+    snprintf(buf, buf_size,
+             "[%ld,%ld,%ld,%ld]",
+             (long)t->ne[0],
+             (long)t->ne[1],
+             (long)t->ne[2],
+             (long)t->ne[3]);
+}
+
+static void tsavorite_matmul_profile_record(
+    const struct ggml_tensor *node,
+    const tsavorite_matmul_profile_sample_t &sample) {
+
+    if (!node || !node->src[0] || !node->src[1]) {
+        return;
+    }
+
+    char op_dims[128];
+    char src0_dims[128];
+    char src1_dims[128];
+
+    tsavorite_dims_to_string(node, op_dims, sizeof(op_dims));
+    tsavorite_dims_to_string(node->src[0], src0_dims, sizeof(src0_dims));
+    tsavorite_dims_to_string(node->src[1], src1_dims, sizeof(src1_dims));
+
+    char key[512];
+    snprintf(key, sizeof(key),
+             "op=%s|src0=%s|src1=%s|type=%s",
+             op_dims,
+             src0_dims,
+             src1_dims,
+             ggml_type_name(node->type));
+
+    std::lock_guard<std::mutex> lock(g_tsavorite_matmul_profile_mutex);
+
+    tsavorite_matmul_profile_bucket_t &b = g_tsavorite_matmul_profile[std::string(key)];
+
+    if (b.runs == 0) {
+        snprintf(b.op_dims, sizeof(b.op_dims), "%s", op_dims);
+        snprintf(b.src0_dims, sizeof(b.src0_dims), "%s", src0_dims);
+        snprintf(b.src1_dims, sizeof(b.src1_dims), "%s", src1_dims);
+        snprintf(b.type_name, sizeof(b.type_name), "%s", ggml_type_name(node->type));
+    }
+
+    b.runs += 1;
+    b.kernel_calls += sample.kernel_calls;
+
+    b.matrix_total_us += sample.matrix_total_us;
+    b.pack_a_us += sample.pack_a_us;
+    b.pack_b_us += sample.pack_b_us;
+    b.padding_memset_us += sample.padding_memset_us;
+    b.launch_us += sample.launch_us;
+    b.txe_wait_critical_us += sample.txe_wait_critical_us;
+    b.txe_wait_sum_us += sample.txe_wait_sum_us;
+    b.copyback_us += sample.copyback_us;
+    b.postprocess_us += sample.postprocess_us;
+}
+
+static void tsavorite_matmul_profile_dump_summary_locked() {
+    FILE *f = fopen("ggml_tmu_matmul_profile_summary.tsv", "w");
+    if (!f) {
+        fprintf(stderr, "ERROR: failed to open ggml_tmu_matmul_profile_summary.tsv for write\n");
+        return;
+    }
+
+    fprintf(f,
+            "Backend\tOp\tType\tRuns\tTSI_KERNEL\t"
+            "MatrixTotal_ms\tMatrixAvg_ms\t"
+            "TXEWaitCritical_ms\tTXEWaitSum_ms\t"
+            "HostTotal_ms\tHostPct\t"
+            "Dimensions\tSrc0\tSrc1\n");
+
+    for (const auto &kv : g_tsavorite_matmul_profile) {
+        const tsavorite_matmul_profile_bucket_t &b = kv.second;
+
+        const double matrix_total_ms = tsavorite_us_to_ms(b.matrix_total_us);
+        const double matrix_avg_ms = b.runs > 0 ? matrix_total_ms / (double)b.runs : 0.0;
+        const double wait_critical_ms = tsavorite_us_to_ms(b.txe_wait_critical_us);
+        const double wait_sum_ms = tsavorite_us_to_ms(b.txe_wait_sum_us);
+
+        double host_total_ms = matrix_total_ms - wait_critical_ms;
+        if (host_total_ms < 0.0) {
+            host_total_ms = 0.0;
+        }
+
+        fprintf(f,
+                "OPU\tMUL_MAT\t%s\t%ld\t%ld\t"
+                "%.3f\t%.3f\t"
+                "%.3f\t%.3f\t"
+                "%.3f\t%.2f\t"
+                "%s\t%s\t%s\n",
+                b.type_name,
+                (long)b.runs,
+                (long)b.kernel_calls,
+                matrix_total_ms,
+                matrix_avg_ms,
+                wait_critical_ms,
+                wait_sum_ms,
+                host_total_ms,
+                tsavorite_pct(host_total_ms, matrix_total_ms),
+                b.op_dims,
+                b.src0_dims,
+                b.src1_dims);
+    }
+
+    fclose(f);
+}
+
+static void tsavorite_matmul_profile_dump_detail_locked() {
+    FILE *f = fopen("ggml_tmu_matmul_profile_detail.txt", "w");
+    if (!f) {
+        fprintf(stderr, "ERROR: failed to open ggml_tmu_matmul_profile_detail.txt for write\n");
+        return;
+    }
+
+    fprintf(f, "Tsavorite MAT_MUL Detailed Profile Report\n");
+    fprintf(f, "=========================================\n\n");
+    fprintf(f, "This report is aggregated in memory and written once at shutdown.\n");
+    fprintf(f, "MatrixTotal is wall-clock time for the OPU MUL_MAT path.\n");
+    fprintf(f, "TXEWaitCritical approximates parallel TXE wait wall time.\n");
+    fprintf(f, "TXEWaitSum is accumulated wait across TXEs and may exceed wall time.\n\n");
+
+    int shape_index = 1;
+    for (const auto &kv : g_tsavorite_matmul_profile) {
+        const tsavorite_matmul_profile_bucket_t &b = kv.second;
+
+        const double matrix_total_ms = tsavorite_us_to_ms(b.matrix_total_us);
+        const double matrix_avg_ms = b.runs > 0 ? matrix_total_ms / (double)b.runs : 0.0;
+        const double pack_a_ms = tsavorite_us_to_ms(b.pack_a_us);
+        const double pack_b_ms = tsavorite_us_to_ms(b.pack_b_us);
+        const double padding_ms = tsavorite_us_to_ms(b.padding_memset_us);
+        const double launch_ms = tsavorite_us_to_ms(b.launch_us);
+        const double wait_critical_ms = tsavorite_us_to_ms(b.txe_wait_critical_us);
+        const double wait_sum_ms = tsavorite_us_to_ms(b.txe_wait_sum_us);
+        const double copyback_ms = tsavorite_us_to_ms(b.copyback_us);
+        const double post_ms = tsavorite_us_to_ms(b.postprocess_us);
+
+        double host_total_ms = matrix_total_ms - wait_critical_ms;
+        if (host_total_ms < 0.0) {
+            host_total_ms = 0.0;
+        }
+
+        fprintf(f, "============================================================\n");
+        fprintf(f, "Matrix Shape #%d\n", shape_index++);
+        fprintf(f, "============================================================\n");
+        fprintf(f, "Backend              : OPU\n");
+        fprintf(f, "Op                   : MUL_MAT\n");
+        fprintf(f, "Type                 : %s\n", b.type_name);
+        fprintf(f, "Runs                 : %ld\n", (long)b.runs);
+        fprintf(f, "TSI_KERNEL           : %ld\n\n", (long)b.kernel_calls);
+
+        fprintf(f, "Shape\n");
+        fprintf(f, "-----\n");
+        fprintf(f, "Dimensions           : %s\n", b.op_dims);
+        fprintf(f, "Src0                 : %s\n", b.src0_dims);
+        fprintf(f, "Src1                 : %s\n\n", b.src1_dims);
+
+        fprintf(f, "Timing Summary\n");
+        fprintf(f, "--------------\n");
+        fprintf(f, "MatrixTotal_ms       : %.3f\n", matrix_total_ms);
+        fprintf(f, "MatrixAvg_ms         : %.3f\n", matrix_avg_ms);
+        fprintf(f, "TXEWaitCritical_ms   : %.3f  %.2f%%\n", wait_critical_ms, tsavorite_pct(wait_critical_ms, matrix_total_ms));
+        fprintf(f, "TXEWaitSum_ms        : %.3f\n", wait_sum_ms);
+        fprintf(f, "HostTotal_ms         : %.3f  %.2f%%\n\n", host_total_ms, tsavorite_pct(host_total_ms, matrix_total_ms));
+
+        fprintf(f, "Detailed Breakdown\n");
+        fprintf(f, "------------------\n");
+        fprintf(f, "PackA_ms             : %.3f  %.2f%%\n", pack_a_ms, tsavorite_pct(pack_a_ms, matrix_total_ms));
+        fprintf(f, "PackB_ms             : %.3f  %.2f%%\n", pack_b_ms, tsavorite_pct(pack_b_ms, matrix_total_ms));
+        fprintf(f, "PaddingMemset_ms     : %.3f  %.2f%%\n", padding_ms, tsavorite_pct(padding_ms, matrix_total_ms));
+        fprintf(f, "LaunchOrWrapper_ms   : %.3f  %.2f%%\n", launch_ms, tsavorite_pct(launch_ms, matrix_total_ms));
+        fprintf(f, "CopyBack_ms          : %.3f  %.2f%%\n", copyback_ms, tsavorite_pct(copyback_ms, matrix_total_ms));
+        fprintf(f, "PostProcess_ms       : %.3f  %.2f%%\n\n", post_ms, tsavorite_pct(post_ms, matrix_total_ms));
+
+        fprintf(f, "Interpretation\n");
+        fprintf(f, "--------------\n");
+        if (matrix_total_ms <= 0.0) {
+            fprintf(f, "No measurable matrix time was recorded for this shape.\n");
+        } else if (wait_critical_ms > 0.0 && tsavorite_pct(wait_critical_ms, matrix_total_ms) >= 70.0) {
+            fprintf(f, "Most matrix time is in TXE/blob wait critical path. Check TXE/blob execution or simulation time.\n");
+        } else if (launch_ms > 0.0 && tsavorite_pct(launch_ms, matrix_total_ms) >= 70.0 && wait_critical_ms <= 0.0) {
+            fprintf(f, "Most matrix time is charged to Launch_ms while TXE wait is zero. For the single-TXE/generated-wrapper path, Launch_ms includes the blocking generated wrapper execution, so TXE wait is not separately visible in this path.\n");
+        } else if (tsavorite_pct(host_total_ms, matrix_total_ms) >= 70.0) {
+            fprintf(f, "Most matrix time is outside TXE critical wait. Check packing, padding, launch wrapper, copy-back, and post-processing.\n");
+        } else {
+            fprintf(f, "Time is split across host and TXE wait buckets. Review the breakdown above.\n");
+        }
+        fprintf(f, "\n\n");
+    }
+
+    fclose(f);
+}
+
+static void tsavorite_matmul_profile_dump() {
+    std::lock_guard<std::mutex> lock(g_tsavorite_matmul_profile_mutex);
+    tsavorite_matmul_profile_dump_summary_locked();
+    tsavorite_matmul_profile_dump_detail_locked();
+}
+
+#else
+
+static void tsavorite_matmul_profile_record(
+    const struct ggml_tensor *node,
+    const tsavorite_matmul_profile_sample_t &sample) {
+    (void)node;
+    (void)sample;
+}
+
+static void tsavorite_matmul_profile_dump() {
+}
+
+#endif /* TMU_DEBUG */
 
 // ============================================================
 // (makes blob names unique per device to avoid collisions)
@@ -1353,11 +1649,17 @@ static inline void join_all_workers() {
     }
 }
 
-static void tsi_blob_execution_internal(void *commandList) {
-  // Enqueue & run
-  tsi_finalize_command_list(commandList);
-  tsi_wait(commandList);
-  return;
+
+static int64_t tsi_blob_execution_internal(void *commandList) {
+    if (!commandList) {
+        return 0;
+    }
+
+    tsi_finalize_command_list(commandList);
+
+    const int64_t wait_start_us = tsavorite_now_us();
+    tsi_wait(commandList);
+    return tsavorite_elapsed_us(wait_start_us);
 }
 
 
@@ -2043,10 +2345,12 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
       tsirt::utils::TSIProfiler::finalize();
       sleep(2);
   }
+  tsavorite_matmul_profile_dump();
+
   std::cout << "\nOPU Profiling Results:" << std::endl;
   std::cout << tsirt::utils::TSIProfiler::getFormattedResults(
-                   /*truncateFuncNames*/ true)
-            << std::endl;
+                 /*truncateFuncNames*/ true)
+          << std::endl;
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
   return;
 }
@@ -3385,7 +3689,12 @@ static inline triton_matmul_desc_set_t *ensure_triton_desc_for_device(int device
     return &s;
 }
 
-static inline void call_triton_matmul_full_packed_on_device(
+struct triton_matmul_dispatch_profile_t {
+    int64_t launch_us = 0;
+    int64_t wait_us = 0;
+};
+
+static inline triton_matmul_dispatch_profile_t call_triton_matmul_full_packed_on_device(
     int deviceId,
     float *A_full,
     float *B_full,
@@ -3393,6 +3702,8 @@ static inline void call_triton_matmul_full_packed_on_device(
     int32_t M_pad,
     int32_t N_pad,
     int32_t K) {
+    triton_matmul_dispatch_profile_t prof;
+
     TSAVORITE_GGML_ASSERT(deviceId >= 0);
     TSAVORITE_GGML_ASSERT((uint32_t)deviceId < num_of_txes);
     TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
@@ -3412,6 +3723,8 @@ static inline void call_triton_matmul_full_packed_on_device(
     init_scalar_i32_memref_aligned(s->grid2_desc, s->grid2_payload, 1);
     init_scalar_i32_memref_aligned(s->grid3_desc, s->grid3_payload, 1);
 
+    const int64_t launch_start_us = tsavorite_now_us();
+
     void *commandList =
         _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
             s->A_desc,
@@ -3425,6 +3738,8 @@ static inline void call_triton_matmul_full_packed_on_device(
             s->grid3_desc,
             (TSI_DeviceIdType)deviceId);
 
+    prof.launch_us = tsavorite_elapsed_us(launch_start_us);
+
     if (!commandList) {
         fprintf(stderr,
                 "Command List Empty for Triton MAT_MUL on device %d\n",
@@ -3434,7 +3749,8 @@ static inline void call_triton_matmul_full_packed_on_device(
         abort();
     }
 
-    tsi_blob_execution_internal(commandList);
+    prof.wait_us = tsi_blob_execution_internal(commandList);
+    return prof;
 }
 
 
@@ -3499,69 +3815,105 @@ static inline void triton_matmul_log_offloaded_shape_once(
 
 
 static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
-    struct ggml_backend_tsavorite_context * ctx,
+    struct ggml_backend_tsavorite_context *ctx,
     txe_device_s device,
-    struct ggml_tensor * node,
+    struct ggml_tensor *node,
     enum ggml_tsavorite_kernel_type kernel_type,
     int kernel_sub_type) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(kernel_sub_type);
+
     if (!node || !node->src[0] || !node->src[1] || !node->data) {
         return GGML_STATUS_FAILED;
     }
+
+    const int64_t matrix_start_us = tsavorite_now_us();
+    tsavorite_matmul_profile_sample_t profile;
+
     const struct ggml_tensor *A = node->src[0];
     const struct ggml_tensor *B = node->src[1];
+
     const int64_t K = A->ne[0];
     const int64_t M = A->ne[1];
     const int64_t N = B->ne[1];
-    if (K <= 0 || M <= 0 || N <= 0) return GGML_STATUS_FAILED;
-    if (B->ne[0] != K) return GGML_STATUS_FAILED;
-    if ((K % 32) != 0) return GGML_STATUS_FAILED;
+
+    if (K <= 0 || M <= 0 || N <= 0) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if (B->ne[0] != K) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if ((K % 32) != 0) {
+        return GGML_STATUS_FAILED;
+    }
+
     const int64_t D2 = node->ne[2];
     const int64_t D3 = node->ne[3];
     const int64_t N_pad = ((N + 63) / 64) * 64;
+
 #if TRITON_DEBUG
     triton_matmul_log_offloaded_shape_once(A, B, node);
 #endif
+
     const int64_t a_nb0 = nb_or_default(A, 0);
     const int64_t a_nb1 = nb_or_default(A, 1);
     const int64_t a_nb2 = nb_or_default(A, 2);
     const int64_t a_nb3 = nb_or_default(A, 3);
+
     const int64_t b_nb0 = nb_or_default(B, 0);
     const int64_t b_nb1 = nb_or_default(B, 1);
     const int64_t b_nb2 = nb_or_default(B, 2);
     const int64_t b_nb3 = nb_or_default(B, 3);
+
     const int64_t c_nb0 = nb_or_default(node, 0);
     const int64_t c_nb1 = nb_or_default(node, 1);
     const int64_t c_nb2 = nb_or_default(node, 2);
     const int64_t c_nb3 = nb_or_default(node, 3);
+
     const int64_t A2 = A->ne[2] > 0 ? A->ne[2] : 1;
     const int64_t A3 = A->ne[3] > 0 ? A->ne[3] : 1;
     const int64_t B2 = B->ne[2] > 0 ? B->ne[2] : 1;
     const int64_t B3 = B->ne[3] > 0 ? B->ne[3] : 1;
+
     char *A_base = (char *)A->data;
     char *B_base = (char *)B->data;
     char *C_base = (char *)node->data;
+
     // ============================================================
     // Single-TXE / generated-host-wrapper path.
-    // Keep old behavior when multi_thread_enable=false or txe_count<=1.
+    //
+    // Note:
+    //   This path calls the generated wrapper. It does not expose tsi_wait()
+    //   directly, so the wrapper elapsed time is recorded as Launch_ms.
+    //   Multi-TXE manual path below gives true tsi_wait() timing.
     // ============================================================
     if (!multi_thread_enable || num_of_txes <= 1) {
         const int64_t M_pad = ((M + 7) / 8) * 8;
+
         ensure_triton_full_buffers(M_pad, N_pad, K);
+
         for (int64_t d3 = 0; d3 < D3; ++d3) {
             for (int64_t d2 = 0; d2 < D2; ++d2) {
                 const int64_t a_d2 = map_repeat_i64(d2, A2);
                 const int64_t a_d3 = map_repeat_i64(d3, A3);
                 const int64_t b_d2 = map_repeat_i64(d2, B2);
                 const int64_t b_d3 = map_repeat_i64(d3, B3);
+
                 char *A_ptr = A_base + a_d2 * a_nb2 + a_d3 * a_nb3;
                 char *B_ptr = B_base + b_d2 * b_nb2 + b_d3 * b_nb3;
                 char *C_ptr = C_base + d2 * c_nb2 + d3 * c_nb3;
+
+                int64_t t0 = tsavorite_now_us();
                 memset(g_triton_A_full, 0, (size_t)M_pad * (size_t)K * sizeof(float));
+                profile.padding_memset_us += tsavorite_elapsed_us(t0);
+
+                t0 = tsavorite_now_us();
                 for (int64_t r = 0; r < M; ++r) {
                     const char *row = A_ptr + r * a_nb1;
                     float *dst = g_triton_A_full + r * K;
+
                     if (a_nb0 == sizeof(float)) {
                         memcpy(dst, row, (size_t)K * sizeof(float));
                     } else {
@@ -3570,7 +3922,13 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         }
                     }
                 }
+                profile.pack_a_us += tsavorite_elapsed_us(t0);
+
+                t0 = tsavorite_now_us();
                 memset(g_triton_B_full, 0, (size_t)K * (size_t)N_pad * sizeof(float));
+                profile.padding_memset_us += tsavorite_elapsed_us(t0);
+
+                t0 = tsavorite_now_us();
                 for (int64_t c = 0; c < N; ++c) {
                     const char *col = B_ptr + c * b_nb1;
                     for (int64_t k = 0; k < K; ++k) {
@@ -3578,7 +3936,13 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                             *(float *)(col + k * b_nb0);
                     }
                 }
+                profile.pack_b_us += tsavorite_elapsed_us(t0);
+
+                t0 = tsavorite_now_us();
                 memset(g_triton_C_full, 0, (size_t)M_pad * (size_t)N_pad * sizeof(float));
+                profile.padding_memset_us += tsavorite_elapsed_us(t0);
+
+                t0 = tsavorite_now_us();
                 call_triton_matmul_full_packed(
                     g_triton_A_full,
                     g_triton_B_full,
@@ -3586,51 +3950,90 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     (int32_t)M_pad,
                     (int32_t)N_pad,
                     (int32_t)K);
+                profile.launch_us += tsavorite_elapsed_us(t0);
+
                 if (multi_thread_enable) {
                     join_all_workers();
                 }
+
+                t0 = tsavorite_now_us();
                 for (int64_t r = 0; r < M; ++r) {
                     for (int64_t c = 0; c < N; ++c) {
                         *(float *)(C_ptr + r * c_nb0 + c * c_nb1) =
                             g_triton_C_full[r * N_pad + c];
                     }
                 }
+                profile.copyback_us += tsavorite_elapsed_us(t0);
+
                 if (device) {
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                 }
+
                 ++node->tsi_kernel_runs;
+                ++profile.kernel_calls;
             }
         }
+
+        profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
+        tsavorite_matmul_profile_record(node, profile);
+
         return GGML_STATUS_SUCCESS;
     }
+
     // ============================================================
     // Multi-TXE path: split M dimension across available TXEs.
+    //
+    // TXEWaitCritical:
+    //   For each m0 wave, max(wait_us across launched TXEs).
+    //   Sum this max across waves.
+    //
+    // TXEWaitSum:
+    //   Sum wait_us across every launched TXE.
     // ============================================================
     const int64_t active_txes = (int64_t)num_of_txes;
     const int64_t rows_per_txe_unaligned = (M + active_txes - 1) / active_txes;
     const int64_t rows_per_txe = ((rows_per_txe_unaligned + 7) / 8) * 8;
+
     uint64_t launched_kernel_calls = 0;
+
     for (int64_t d3 = 0; d3 < D3; ++d3) {
         for (int64_t d2 = 0; d2 < D2; ++d2) {
             const int64_t a_d2 = map_repeat_i64(d2, A2);
             const int64_t a_d3 = map_repeat_i64(d3, A3);
             const int64_t b_d2 = map_repeat_i64(d2, B2);
             const int64_t b_d3 = map_repeat_i64(d3, B3);
+
             char *A_ptr = A_base + a_d2 * a_nb2 + a_d3 * a_nb3;
             char *B_ptr = B_base + b_d2 * b_nb2 + b_d3 * b_nb3;
             char *C_ptr = C_base + d2 * c_nb2 + d3 * c_nb3;
+
             for (int64_t m0 = 0; m0 < M; m0 += rows_per_txe * active_txes) {
                 uint64_t batch_launched = 0;
+
+                int64_t batch_wait_sum_us = 0;
+                int64_t batch_wait_max_us = 0;
+                int64_t batch_pack_a_us = 0;
+                int64_t batch_pack_b_us = 0;
+                int64_t batch_padding_us = 0;
+                int64_t batch_launch_us = 0;
+                int64_t batch_copyback_us = 0;
+
+                std::mutex batch_profile_mutex;
+
                 for (int64_t t = 0; t < active_txes; ++t) {
                     const int64_t tile_m0 = m0 + t * rows_per_txe;
+
                     if (tile_m0 >= M) {
                         break;
                     }
+
                     const int64_t M_valid =
                         (M - tile_m0 > rows_per_txe) ? rows_per_txe : (M - tile_m0);
                     const int64_t M_tile_pad =
                         ((M_valid + 7) / 8) * 8;
+
                     const int deviceId = acquire_device_blocking();
+
                     if (deviceId < 0 || (uint32_t)deviceId >= num_of_txes) {
                         fprintf(stderr,
                                 "ERROR: Triton MAT_MUL failed to acquire valid deviceId=%d num_of_txes=%u\n",
@@ -3640,75 +4043,159 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         tsi_cleanup();
                         abort();
                     }
+
                     ensure_triton_full_buffers_for_device(
                         deviceId,
                         M_tile_pad,
                         N_pad,
                         K);
+
                     float *A_tile = g_triton_A_full_mt[deviceId];
                     float *B_tile = g_triton_B_full_mt[deviceId];
                     float *C_tile = g_triton_C_full_mt[deviceId];
+
                     {
                         std::lock_guard<std::mutex> lk(workers_mutex);
-                        workers.emplace_back([=] () {
-                            // Pack A tile: [M_tile_pad x K]
-                            memset(A_tile, 0, (size_t)M_tile_pad * (size_t)K * sizeof(float));
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t src_r = tile_m0 + r;
-                                const char *row = A_ptr + src_r * a_nb1;
-                                float *dst = A_tile + r * K;
-                                if (a_nb0 == sizeof(float)) {
-                                    memcpy(dst, row, (size_t)K * sizeof(float));
-                                } else {
-                                    for (int64_t k = 0; k < K; ++k) {
-                                        dst[k] = *(const float *)(row + k * a_nb0);
-                                    }
-                                }
-                            }
-                            // Pack B full: [K x N_pad]
-                            memset(B_tile, 0, (size_t)K * (size_t)N_pad * sizeof(float));
-                            for (int64_t c = 0; c < N; ++c) {
-                                const char *col = B_ptr + c * b_nb1;
-                                for (int64_t k = 0; k < K; ++k) {
-                                    B_tile[k * N_pad + c] =
-                                        *(const float *)(col + k * b_nb0);
-                                }
-                            }
-                            // Clear C tile
-                            memset(C_tile, 0, (size_t)M_tile_pad * (size_t)N_pad * sizeof(float));
-                            // Run Triton MAT_MUL on this device
-                            call_triton_matmul_full_packed_on_device(
-                                deviceId,
-                                A_tile,
-                                B_tile,
-                                C_tile,
-                                (int32_t)M_tile_pad,
-                                (int32_t)N_pad,
-                                (int32_t)K);
-                            // Copy valid rows back
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t dst_r = tile_m0 + r;
-                                for (int64_t c = 0; c < N; ++c) {
-                                    *(float *)(C_ptr + dst_r * c_nb0 + c * c_nb1) =
-                                        C_tile[r * N_pad + c];
-                                }
-                            }
-                            release_device(deviceId);
-                        });
-                    }
+
+                        workers.emplace_back([=,
+                            &batch_profile_mutex,
+                            &batch_wait_sum_us,
+                            &batch_wait_max_us,
+                            &batch_pack_a_us,
+                            &batch_pack_b_us,
+                            &batch_padding_us,
+                            &batch_launch_us,
+                            &batch_copyback_us] {
+
+                            int64_t local_pack_a_us = 0;
+                            int64_t local_pack_b_us = 0;
+                            int64_t local_padding_us = 0;
+                            int64_t local_launch_us = 0;
+                            int64_t local_wait_us = 0;
+        int64_t local_copyback_us = 0;
+
+        int64_t t0 = tsavorite_now_us();
+
+        memset(A_tile, 0, (size_t)M_tile_pad * (size_t)K * sizeof(float));
+        local_padding_us += tsavorite_elapsed_us(t0);
+
+        t0 = tsavorite_now_us();
+
+        for (int64_t r = 0; r < M_valid; ++r) {
+            const int64_t src_r = tile_m0 + r;
+            const char *row = A_ptr + src_r * a_nb1;
+            float *dst = A_tile + r * K;
+
+            if (a_nb0 == sizeof(float)) {
+                memcpy(dst, row, (size_t)K * sizeof(float));
+            } else {
+                for (int64_t k = 0; k < K; ++k) {
+                    dst[k] = *(const float *)(row + k * a_nb0);
+                }
+            }
+        }
+
+        local_pack_a_us += tsavorite_elapsed_us(t0);
+
+        t0 = tsavorite_now_us();
+
+        memset(B_tile, 0, (size_t)K * (size_t)N_pad * sizeof(float));
+        local_padding_us += tsavorite_elapsed_us(t0);
+
+        t0 = tsavorite_now_us();
+
+        for (int64_t c = 0; c < N; ++c) {
+            const char *col = B_ptr + c * b_nb1;
+
+            for (int64_t k = 0; k < K; ++k) {
+                B_tile[k * N_pad + c] =
+                    *(const float *)(col + k * b_nb0);
+            }
+        }
+
+        local_pack_b_us += tsavorite_elapsed_us(t0);
+
+        t0 = tsavorite_now_us();
+
+        memset(C_tile, 0, (size_t)M_tile_pad * (size_t)N_pad * sizeof(float));
+        local_padding_us += tsavorite_elapsed_us(t0);
+
+        triton_matmul_dispatch_profile_t dispatch_prof =
+            call_triton_matmul_full_packed_on_device(
+                deviceId,
+                A_tile,
+                B_tile,
+                C_tile,
+                (int32_t)M_tile_pad,
+                (int32_t)N_pad,
+                (int32_t)K);
+
+        local_launch_us += dispatch_prof.launch_us;
+        local_wait_us += dispatch_prof.wait_us;
+
+        t0 = tsavorite_now_us();
+
+        for (int64_t r = 0; r < M_valid; ++r) {
+            const int64_t dst_r = tile_m0 + r;
+
+            for (int64_t c = 0; c < N; ++c) {
+                *(float *)(C_ptr + dst_r * c_nb0 + c * c_nb1) =
+                    C_tile[r * N_pad + c];
+            }
+        }
+
+        local_copyback_us += tsavorite_elapsed_us(t0);
+
+        {
+            std::lock_guard<std::mutex> lk2(batch_profile_mutex);
+
+            batch_pack_a_us += local_pack_a_us;
+            batch_pack_b_us += local_pack_b_us;
+            batch_padding_us += local_padding_us;
+            batch_launch_us += local_launch_us;
+            batch_copyback_us += local_copyback_us;
+
+            batch_wait_sum_us += local_wait_us;
+
+            if (local_wait_us > batch_wait_max_us) {
+                batch_wait_max_us = local_wait_us;
+            }
+        }
+
+        release_device(deviceId);
+    });
+}
+
                     ++batch_launched;
                     ++launched_kernel_calls;
                 }
+
                 if (batch_launched > 0) {
                     join_all_workers();
+
+                    profile.pack_a_us += batch_pack_a_us;
+                    profile.pack_b_us += batch_pack_b_us;
+                    profile.padding_memset_us += batch_padding_us;
+                    profile.launch_us += batch_launch_us;
+                    profile.copyback_us += batch_copyback_us;
+
+                    profile.txe_wait_sum_us += batch_wait_sum_us;
+                    profile.txe_wait_critical_us += batch_wait_max_us;
                 }
             }
         }
     }
+
     if (device) {
         device->stats.op_run_count[kernel_type].num_of_kernel_call += launched_kernel_calls;
     }
+
     node->tsi_kernel_runs += launched_kernel_calls;
+    profile.kernel_calls += (int64_t)launched_kernel_calls;
+
+    profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
+    tsavorite_matmul_profile_record(node, profile);
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5874,3 +6361,4 @@ ggml_backend_reg_t ggml_backend_tsavorite_reg(void) {
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_tsavorite_reg)
+
