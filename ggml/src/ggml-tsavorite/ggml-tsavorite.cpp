@@ -62,6 +62,12 @@ using namespace tsi::runtime;
 // in the deployment configuration exceeds this limit.
 #define MAX_TXES_SUPPORTED 20
 
+#define TSAV_DIMS_STR_LEN 128
+#define TSAV_TYPE_NAME_LEN 32
+#define TSAV_PROFILE_KEY_LEN 512
+#define TSAV_MATMUL_ALIGN_N 64
+#define TSAV_MATMUL_ALIGN_N_MASK (TSAV_MATMUL_ALIGN_N - 1)
+
 
 // ggml-tsavorite.cpp
 namespace {
@@ -506,10 +512,10 @@ struct tsavorite_matmul_profile_bucket_t {
     int64_t copyback_us = 0;
     int64_t postprocess_us = 0;
 
-    char op_dims[128] = {0};
-    char src0_dims[128] = {0};
-    char src1_dims[128] = {0};
-    char type_name[32] = {0};
+    char op_dims[TSAV_DIMS_STR_LEN]    = {0};
+    char src0_dims[TSAV_DIMS_STR_LEN]  = {0};
+    char src1_dims[TSAV_DIMS_STR_LEN]  = {0};
+    char type_name[TSAV_TYPE_NAME_LEN] = {0};
 };
 
 static std::mutex g_tsavorite_matmul_profile_mutex;
@@ -552,15 +558,15 @@ static void tsavorite_matmul_profile_record(
         return;
     }
 
-    char op_dims[128];
-    char src0_dims[128];
-    char src1_dims[128];
+    char op_dims[TSAV_DIMS_STR_LEN];
+    char src0_dims[TSAV_DIMS_STR_LEN];
+    char src1_dims[TSAV_DIMS_STR_LEN];
 
     tsavorite_dims_to_string(node, op_dims, sizeof(op_dims));
     tsavorite_dims_to_string(node->src[0], src0_dims, sizeof(src0_dims));
     tsavorite_dims_to_string(node->src[1], src1_dims, sizeof(src1_dims));
 
-    char key[512];
+    char key[TSAV_PROFILE_KEY_LEN];
     snprintf(key, sizeof(key),
              "op=%s|src0=%s|src1=%s|type=%s",
              op_dims,
@@ -593,6 +599,7 @@ static void tsavorite_matmul_profile_record(
     b.postprocess_us += sample.postprocess_us;
 }
 
+
 static void tsavorite_matmul_profile_dump_summary_locked() {
     FILE *f = fopen("ggml_tmu_matmul_profile_summary.tsv", "w");
     if (!f) {
@@ -604,7 +611,8 @@ static void tsavorite_matmul_profile_dump_summary_locked() {
             "Backend\tOp\tType\tRuns\tTSI_KERNEL\t"
             "MatrixTotal_ms\tMatrixAvg_ms\t"
             "TXEWaitCritical_ms\tTXEWaitSum_ms\t"
-            "HostTotal_ms\tHostPct\t"
+            "HostWallResidual_ms\tHostWallResidualPct\t"
+            "HostAccumulatedAcrossTXE_ms\tHostAccumulatedPct\t"
             "Dimensions\tSrc0\tSrc1\n");
 
     for (const auto &kv : g_tsavorite_matmul_profile) {
@@ -615,15 +623,24 @@ static void tsavorite_matmul_profile_dump_summary_locked() {
         const double wait_critical_ms = tsavorite_us_to_ms(b.txe_wait_critical_us);
         const double wait_sum_ms = tsavorite_us_to_ms(b.txe_wait_sum_us);
 
-        double host_total_ms = matrix_total_ms - wait_critical_ms;
-        if (host_total_ms < 0.0) {
-            host_total_ms = 0.0;
+        double host_wall_residual_ms = matrix_total_ms - wait_critical_ms;
+        if (host_wall_residual_ms < 0.0) {
+            host_wall_residual_ms = 0.0;
         }
+
+        const double host_accumulated_ms =
+            tsavorite_us_to_ms(b.pack_a_us) +
+            tsavorite_us_to_ms(b.pack_b_us) +
+            tsavorite_us_to_ms(b.padding_memset_us) +
+            tsavorite_us_to_ms(b.launch_us) +
+            tsavorite_us_to_ms(b.copyback_us) +
+            tsavorite_us_to_ms(b.postprocess_us);
 
         fprintf(f,
                 "OPU\tMUL_MAT\t%s\t%ld\t%ld\t"
                 "%.3f\t%.3f\t"
                 "%.3f\t%.3f\t"
+                "%.3f\t%.2f\t"
                 "%.3f\t%.2f\t"
                 "%s\t%s\t%s\n",
                 b.type_name,
@@ -633,8 +650,10 @@ static void tsavorite_matmul_profile_dump_summary_locked() {
                 matrix_avg_ms,
                 wait_critical_ms,
                 wait_sum_ms,
-                host_total_ms,
-                tsavorite_pct(host_total_ms, matrix_total_ms),
+                host_wall_residual_ms,
+                tsavorite_pct(host_wall_residual_ms, matrix_total_ms),
+                host_accumulated_ms,
+                tsavorite_pct(host_accumulated_ms, matrix_total_ms),
                 b.op_dims,
                 b.src0_dims,
                 b.src1_dims);
@@ -655,7 +674,11 @@ static void tsavorite_matmul_profile_dump_detail_locked() {
     fprintf(f, "This report is aggregated in memory and written once at shutdown.\n");
     fprintf(f, "MatrixTotal is wall-clock time for the OPU MUL_MAT path.\n");
     fprintf(f, "TXEWaitCritical approximates parallel TXE wait wall time.\n");
-    fprintf(f, "TXEWaitSum is accumulated wait across TXEs and may exceed wall time.\n\n");
+    fprintf(f, "TXEWaitSum is accumulated wait across TXEs and may exceed wall time.\n");
+    fprintf(f, "HostWallResidual is MatrixTotal minus TXEWaitCritical.\n");
+    fprintf(f, "HostAccumulatedAcrossTXE is the sum of host-side worker timings across TXEs.\n");
+    fprintf(f, "In multi-TXE mode, HostAccumulatedAcrossTXE is not expected to equal HostWallResidual.\n");
+    fprintf(f, "tsi_finalize_command_list time is included in MatrixTotal and HostWallResidual, not in TXEWaitCritical.\n\n");
 
     int shape_index = 1;
     for (const auto &kv : g_tsavorite_matmul_profile) {
@@ -672,10 +695,18 @@ static void tsavorite_matmul_profile_dump_detail_locked() {
         const double copyback_ms = tsavorite_us_to_ms(b.copyback_us);
         const double post_ms = tsavorite_us_to_ms(b.postprocess_us);
 
-        double host_total_ms = matrix_total_ms - wait_critical_ms;
-        if (host_total_ms < 0.0) {
-            host_total_ms = 0.0;
+        double host_wall_residual_ms = matrix_total_ms - wait_critical_ms;
+        if (host_wall_residual_ms < 0.0) {
+            host_wall_residual_ms = 0.0;
         }
+
+        const double host_accumulated_ms =
+            pack_a_ms +
+            pack_b_ms +
+            padding_ms +
+            launch_ms +
+            copyback_ms +
+            post_ms;
 
         fprintf(f, "============================================================\n");
         fprintf(f, "Matrix Shape #%d\n", shape_index++);
@@ -694,34 +725,60 @@ static void tsavorite_matmul_profile_dump_detail_locked() {
 
         fprintf(f, "Timing Summary\n");
         fprintf(f, "--------------\n");
-        fprintf(f, "MatrixTotal_ms       : %.3f\n", matrix_total_ms);
-        fprintf(f, "MatrixAvg_ms         : %.3f\n", matrix_avg_ms);
-        fprintf(f, "TXEWaitCritical_ms   : %.3f  %.2f%%\n", wait_critical_ms, tsavorite_pct(wait_critical_ms, matrix_total_ms));
-        fprintf(f, "TXEWaitSum_ms        : %.3f\n", wait_sum_ms);
-        fprintf(f, "HostTotal_ms         : %.3f  %.2f%%\n\n", host_total_ms, tsavorite_pct(host_total_ms, matrix_total_ms));
+        fprintf(f, "MatrixTotal_ms              : %.3f\n", matrix_total_ms);
+        fprintf(f, "MatrixAvg_ms                : %.3f\n", matrix_avg_ms);
+        fprintf(f, "TXEWaitCritical_ms          : %.3f  %.2f%%\n",
+                wait_critical_ms,
+                tsavorite_pct(wait_critical_ms, matrix_total_ms));
+        fprintf(f, "TXEWaitSum_ms               : %.3f\n", wait_sum_ms);
+        fprintf(f, "HostWallResidual_ms         : %.3f  %.2f%%\n",
+                host_wall_residual_ms,
+                tsavorite_pct(host_wall_residual_ms, matrix_total_ms));
+        fprintf(f, "HostAccumulatedAcrossTXE_ms : %.3f  %.2f%%\n\n",
+                host_accumulated_ms,
+                tsavorite_pct(host_accumulated_ms, matrix_total_ms));
 
-        fprintf(f, "Detailed Breakdown\n");
-        fprintf(f, "------------------\n");
-        fprintf(f, "PackA_ms             : %.3f  %.2f%%\n", pack_a_ms, tsavorite_pct(pack_a_ms, matrix_total_ms));
-        fprintf(f, "PackB_ms             : %.3f  %.2f%%\n", pack_b_ms, tsavorite_pct(pack_b_ms, matrix_total_ms));
-        fprintf(f, "PaddingMemset_ms     : %.3f  %.2f%%\n", padding_ms, tsavorite_pct(padding_ms, matrix_total_ms));
-        fprintf(f, "LaunchOrWrapper_ms   : %.3f  %.2f%%\n", launch_ms, tsavorite_pct(launch_ms, matrix_total_ms));
-        fprintf(f, "CopyBack_ms          : %.3f  %.2f%%\n", copyback_ms, tsavorite_pct(copyback_ms, matrix_total_ms));
-        fprintf(f, "PostProcess_ms       : %.3f  %.2f%%\n\n", post_ms, tsavorite_pct(post_ms, matrix_total_ms));
+        fprintf(f, "Accumulated Per-TXE Breakdown\n");
+        fprintf(f, "-----------------------------\n");
+        fprintf(f, "PackA_ms             : %.3f  %.2f%%\n",
+                pack_a_ms,
+                tsavorite_pct(pack_a_ms, matrix_total_ms));
+        fprintf(f, "PackB_ms             : %.3f  %.2f%%\n",
+                pack_b_ms,
+                tsavorite_pct(pack_b_ms, matrix_total_ms));
+        fprintf(f, "PaddingMemset_ms     : %.3f  %.2f%%\n",
+                padding_ms,
+                tsavorite_pct(padding_ms, matrix_total_ms));
+        fprintf(f, "LaunchOrWrapper_ms   : %.3f  %.2f%%\n",
+                launch_ms,
+                tsavorite_pct(launch_ms, matrix_total_ms));
+        fprintf(f, "CopyBack_ms          : %.3f  %.2f%%\n",
+                copyback_ms,
+                tsavorite_pct(copyback_ms, matrix_total_ms));
+        fprintf(f, "PostProcess_ms       : %.3f  %.2f%%\n\n",
+                post_ms,
+                tsavorite_pct(post_ms, matrix_total_ms));
+
+        fprintf(f, "Accounting Note\n");
+        fprintf(f, "---------------\n");
+        fprintf(f, "HostWallResidual_ms is wall-clock residual time: MatrixTotal_ms - TXEWaitCritical_ms.\n");
+        fprintf(f, "The accumulated per-TXE breakdown above is summed across worker TXEs in multi-TXE mode.\n");
+        fprintf(f, "Therefore PackA_ms + PackB_ms + PaddingMemset_ms + LaunchOrWrapper_ms + CopyBack_ms + PostProcess_ms is not expected to equal HostWallResidual_ms when multiple TXEs run in parallel.\n\n");
 
         fprintf(f, "Interpretation\n");
         fprintf(f, "--------------\n");
         if (matrix_total_ms <= 0.0) {
             fprintf(f, "No measurable matrix time was recorded for this shape.\n");
         } else if (wait_critical_ms > 0.0 && tsavorite_pct(wait_critical_ms, matrix_total_ms) >= 70.0) {
-            fprintf(f, "Most matrix time is in TXE/blob wait critical path. Check TXE/blob execution or simulation time.\n");
+            fprintf(f, "Most wall-clock matrix time is in the TXE/blob wait critical path. Check TXE/blob execution or simulation time.\n");
         } else if (launch_ms > 0.0 && tsavorite_pct(launch_ms, matrix_total_ms) >= 70.0 && wait_critical_ms <= 0.0) {
-            fprintf(f, "Most matrix time is charged to Launch_ms while TXE wait is zero. For the single-TXE/generated-wrapper path, Launch_ms includes the blocking generated wrapper execution, so TXE wait is not separately visible in this path.\n");
-        } else if (tsavorite_pct(host_total_ms, matrix_total_ms) >= 70.0) {
-            fprintf(f, "Most matrix time is outside TXE critical wait. Check packing, padding, launch wrapper, copy-back, and post-processing.\n");
+            fprintf(f, "Most matrix time is charged to LaunchOrWrapper_ms while TXE wait is zero. For the single-TXE/generated-wrapper path, LaunchOrWrapper_ms includes blocking generated wrapper execution, so TXE wait is not separately visible in this path.\n");
+        } else if (tsavorite_pct(host_wall_residual_ms, matrix_total_ms) >= 70.0) {
+            fprintf(f, "Most wall-clock matrix time is outside TXE critical wait. Check packing, padding, launch wrapper, finalize, copy-back, and post-processing.\n");
         } else {
-            fprintf(f, "Time is split across host and TXE wait buckets. Review the breakdown above.\n");
+            fprintf(f, "Time is split across host wall-clock residual and TXE wait buckets. Review the timing summary and accumulated per-TXE breakdown above.\n");
         }
+
         fprintf(f, "\n\n");
     }
 
