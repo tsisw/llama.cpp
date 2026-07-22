@@ -805,6 +805,222 @@ static void tsavorite_matmul_profile_dump() {
 
 #endif /* TMU_DEBUG */
 
+#if defined(GGML_PERF) || defined(GGML_PERF_DETAIL)
+
+// ============================================================================
+// Tsavorite op shape/dtype catalog profiling
+//
+// Output file is written once at shutdown:
+//   ggml_op_shape_dtype_catalog.tsv
+//
+// Purpose:
+//   Capture model-level op patterns, including result/src0/src1 dtype,
+//   tensor shapes, count, support decision, and reject/support reason.
+//
+// This is intentionally not gated by TMU_DEBUG because it is not MAT_MUL-only.
+// It is enabled for debug/perf builds and disabled for release builds.
+// ============================================================================
+
+struct tsavorite_op_shape_dtype_bucket_t {
+    int64_t count = 0;
+
+    char op_name[TSAV_TYPE_NAME_LEN] = {0};
+    char decision[TSAV_TYPE_NAME_LEN] = {0};
+    char reason[TSAV_PROFILE_KEY_LEN] = {0};
+
+    char result_type[TSAV_TYPE_NAME_LEN] = {0};
+    char result_dims[TSAV_DIMS_STR_LEN] = {0};
+
+    char src0_type[TSAV_TYPE_NAME_LEN] = {0};
+    char src0_dims[TSAV_DIMS_STR_LEN] = {0};
+
+    char src1_type[TSAV_TYPE_NAME_LEN] = {0};
+    char src1_dims[TSAV_DIMS_STR_LEN] = {0};
+};
+
+static std::mutex g_tsavorite_op_shape_dtype_catalog_mutex;
+static std::map<std::string, tsavorite_op_shape_dtype_bucket_t> g_tsavorite_op_shape_dtype_catalog;
+static std::map<std::string, bool> g_tsavorite_op_shape_dtype_catalog_seen;
+
+static inline void tsavorite_catalog_dims_to_string(
+    const struct ggml_tensor *t,
+    char *buf,
+    size_t buf_size) {
+
+    if (!buf || buf_size == 0) {
+        return;
+    }
+
+    if (!t) {
+        snprintf(buf, buf_size, "[0,0,0,0]");
+        return;
+    }
+
+    snprintf(buf, buf_size,
+             "[%ld,%ld,%ld,%ld]",
+             (long)t->ne[0],
+             (long)t->ne[1],
+             (long)t->ne[2],
+             (long)t->ne[3]);
+}
+
+static inline const char *tsavorite_catalog_type_name_safe(const struct ggml_tensor *t) {
+    if (!t) {
+        return "none";
+    }
+
+    return ggml_type_name(t->type);
+}
+
+static void tsavorite_op_shape_dtype_catalog_record(
+    const struct ggml_tensor *op,
+    const char *decision,
+    const char *reason) {
+
+    if (!op) {
+        return;
+    }
+
+    if (!decision) {
+        decision = "UNKNOWN";
+    }
+
+    if (!reason) {
+        reason = "none";
+    }
+
+    char result_dims[TSAV_DIMS_STR_LEN];
+    char src0_dims[TSAV_DIMS_STR_LEN];
+    char src1_dims[TSAV_DIMS_STR_LEN];
+
+    tsavorite_catalog_dims_to_string(op, result_dims, sizeof(result_dims));
+    tsavorite_catalog_dims_to_string(op->src[0], src0_dims, sizeof(src0_dims));
+    tsavorite_catalog_dims_to_string(op->src[1], src1_dims, sizeof(src1_dims));
+
+    const char *op_name = ggml_op_name(op->op);
+    const char *result_type = tsavorite_catalog_type_name_safe(op);
+    const char *src0_type = tsavorite_catalog_type_name_safe(op->src[0]);
+    const char *src1_type = tsavorite_catalog_type_name_safe(op->src[1]);
+
+    char key[TSAV_PROFILE_KEY_LEN * 2];
+    snprintf(key, sizeof(key),
+             "op=%s|decision=%s|reason=%s|result=%s:%s|src0=%s:%s|src1=%s:%s",
+             op_name,
+             decision,
+             reason,
+             result_type,
+             result_dims,
+             src0_type,
+             src0_dims,
+             src1_type,
+             src1_dims);
+
+    std::lock_guard<std::mutex> lock(g_tsavorite_op_shape_dtype_catalog_mutex);
+
+    char seen_key[TSAV_PROFILE_KEY_LEN];
+    snprintf(seen_key, sizeof(seen_key),
+             "tensor=%p|decision=%s|reason=%s",
+             (const void *)op,
+             decision,
+             reason);
+
+    const std::string seen_key_str(seen_key);
+    if (g_tsavorite_op_shape_dtype_catalog_seen.find(seen_key_str) !=
+        g_tsavorite_op_shape_dtype_catalog_seen.end()) {
+        return;
+    }
+
+    g_tsavorite_op_shape_dtype_catalog_seen[seen_key_str] = true;
+
+    tsavorite_op_shape_dtype_bucket_t &b =
+        g_tsavorite_op_shape_dtype_catalog[std::string(key)];
+
+    if (b.count == 0) {
+        snprintf(b.op_name, sizeof(b.op_name), "%s", op_name);
+        snprintf(b.decision, sizeof(b.decision), "%s", decision);
+        snprintf(b.reason, sizeof(b.reason), "%s", reason);
+
+        snprintf(b.result_type, sizeof(b.result_type), "%s", result_type);
+        snprintf(b.result_dims, sizeof(b.result_dims), "%s", result_dims);
+
+        snprintf(b.src0_type, sizeof(b.src0_type), "%s", src0_type);
+        snprintf(b.src0_dims, sizeof(b.src0_dims), "%s", src0_dims);
+
+        snprintf(b.src1_type, sizeof(b.src1_type), "%s", src1_type);
+        snprintf(b.src1_dims, sizeof(b.src1_dims), "%s", src1_dims);
+    }
+
+    b.count += 1;
+}
+
+static void tsavorite_op_shape_dtype_catalog_dump() {
+    std::lock_guard<std::mutex> lock(g_tsavorite_op_shape_dtype_catalog_mutex);
+
+    FILE *f = fopen("ggml_op_shape_dtype_catalog.tsv", "w");
+    if (!f) {
+        fprintf(stderr, "ERROR: failed to open ggml_op_shape_dtype_catalog.tsv for write\n");
+        return;
+    }
+
+    fprintf(f,
+            "%-18s %-10s %8s %-32s %-32s %-32s\n",
+            "Op",
+            "Decision",
+            "Count",
+            "Result",
+            "Src0",
+            "Src1");
+
+    fprintf(f,
+            "%-18s %-10s %8s %-32s %-32s %-32s\n",
+            "------------------",
+            "----------",
+            "--------",
+            "--------------------------------",
+            "--------------------------------",
+            "--------------------------------");
+
+
+    for (const auto &kv : g_tsavorite_op_shape_dtype_catalog) {
+        const tsavorite_op_shape_dtype_bucket_t &b = kv.second;
+
+        char result[TSAV_PROFILE_KEY_LEN];
+        char src0[TSAV_PROFILE_KEY_LEN];
+        char src1[TSAV_PROFILE_KEY_LEN];
+
+        snprintf(result, sizeof(result), "%s %s", b.result_type, b.result_dims);
+        snprintf(src0, sizeof(src0), "%s %s", b.src0_type, b.src0_dims);
+        snprintf(src1, sizeof(src1), "%s %s", b.src1_type, b.src1_dims);
+
+        fprintf(f,
+                "%-18s %-10s %8ld %-32s %-32s %-32s\n",
+                b.op_name,
+                b.decision,
+                (long)b.count,
+                result,
+                src0,
+                src1);
+    }
+
+    fclose(f);
+}
+
+#else
+
+static void tsavorite_op_shape_dtype_catalog_record(
+    const struct ggml_tensor *op,
+    const char *decision,
+    const char *reason) {
+    (void)op;
+    (void)decision;
+    (void)reason;
+}
+
+static void tsavorite_op_shape_dtype_catalog_dump() {
+}
+
+#endif /* GGML_PERF || GGML_PERF_DETAIL */
+
 // ============================================================
 // (makes blob names unique per device to avoid collisions)
 //  - tsi_load_blob() expects a FILE PREFIX, not a directory.
@@ -2403,6 +2619,7 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
       sleep(2);
   }
   tsavorite_matmul_profile_dump();
+  tsavorite_op_shape_dtype_catalog_dump();
 
   std::cout << "\nOPU Profiling Results:" << std::endl;
   std::cout << tsirt::utils::TSIProfiler::getFormattedResults(
@@ -2775,55 +2992,97 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
   }
 #endif
 
-  if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
+  if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+    tsavorite_op_shape_dtype_catalog_record(
+        op,
+        "REJECTED",
+        "result_dtype_not_f32_or_f16");
     return false;
+  }
 
   switch (op->op) {
-  case GGML_OP_SET_ROWS:
+      case GGML_OP_SET_ROWS:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_set_rows");
           return true;
-  case GGML_OP_GET_ROWS:
+    case GGML_OP_GET_ROWS:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_get_rows");
           return true;
 #ifdef GGML_MUL_MAT_CPU_OPS
-  case GGML_OP_MUL_MAT:
-          if (!is_op_dtype_consistent_with_src(op))
+    case GGML_OP_MUL_MAT:
+          if (!is_op_dtype_consistent_with_src(op)) {
+             tsavorite_op_shape_dtype_catalog_record(
+                 op,
+                 "REJECTED",
+                 "mixed_dtype_rejected_before_cpu_mul_mat");
              return false;
+          }
+          tsavorite_op_shape_dtype_catalog_record(
+              op,
+              "SUPPORTED",
+              "mul_mat_cpu_ops_enabled");
           return true;
 #endif
-  case GGML_OP_FLASH_ATTN_EXT:
+    case GGML_OP_FLASH_ATTN_EXT:
+          tsavorite_op_shape_dtype_catalog_record(op, "REJECTED", "flash_attn_ext_not_supported");
 	  return false;
-  case GGML_OP_SOFT_MAX:
+    case GGML_OP_SOFT_MAX:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_soft_max");
           return true;
-  case GGML_OP_GET_ROWS_BACK:
+    case GGML_OP_GET_ROWS_BACK:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_get_rows_back");
           return true;
-  case GGML_OP_ROPE:
+    case GGML_OP_ROPE:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_rope");
           return true;
-  case GGML_OP_ROPE_BACK:
+    case GGML_OP_ROPE_BACK:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_rope_back");
           return true;
-  case GGML_OP_RESHAPE:
+    case GGML_OP_RESHAPE:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_reshape");
           return true;
-  case GGML_OP_VIEW:
+    case GGML_OP_VIEW:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_view");
           return true;
-  case GGML_OP_TRANSPOSE:
+    case GGML_OP_TRANSPOSE:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_transpose");
           return true;
-  case GGML_OP_CPY:
+    case GGML_OP_CPY:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_cpy");
           return true;
-  case GGML_OP_SET:
+    case GGML_OP_SET:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_set");
           return true;
-  case GGML_OP_CONT:
+    case GGML_OP_CONT:
+          tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_cont");
           return true;
-  default:
+    default:
 	  break;
-	}
-  if (!is_op_dtype_consistent_with_src(op))
+  }
+
+  if (!is_op_dtype_consistent_with_src(op)) {
+    tsavorite_op_shape_dtype_catalog_record(
+        op,
+        "REJECTED",
+        "mixed_dtype_rejected_by_dtype_consistency");
     return false;
+  }
 
   switch (op->op) {
   case GGML_OP_NONE:
 	  break;
 #ifdef TMU_SUPPORTED
   case GGML_OP_MUL_MAT:
-	  if (!mul_mat_supported_size(op))
+	  if (!mul_mat_supported_size(op)) {
+		  tsavorite_op_shape_dtype_catalog_record(
+		      op,
+		      "REJECTED",
+		      "mul_mat_shape_not_supported");
 		  return false;
+	  }
+	  tsavorite_op_shape_dtype_catalog_record(
+	      op,
+	      "SUPPORTED",
+	      "mul_mat_shape_supported");
     break;
 #endif /* TMU_SUPPORTED */
 
@@ -2848,8 +3107,13 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
   case GGML_OP_GLU:
     {
         const ggml_glu_op op_ext = ggml_get_glu_op(op);
-        if (op_ext != GGML_GLU_OP_SWIGLU)
+        if (op_ext != GGML_GLU_OP_SWIGLU) {
+            tsavorite_op_shape_dtype_catalog_record(
+                op,
+                "REJECTED",
+                "glu_subtype_not_supported");
             return false;
+        }
         break;
     }
   case GGML_OP_UNARY:
@@ -2860,13 +3124,26 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
     case GGML_UNARY_OP_SILU:
       break;
     default:
+      tsavorite_op_shape_dtype_catalog_record(
+          op,
+          "REJECTED",
+          "unary_subtype_not_supported");
       return false;
     }
     break;
 #endif /* TVU_SUPPORTED */
   default:
+    tsavorite_op_shape_dtype_catalog_record(
+        op,
+        "REJECTED",
+        "op_not_supported");
     return false;
   }
+  tsavorite_op_shape_dtype_catalog_record(
+      op,
+      "SUPPORTED",
+      "op_supported");
+
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
   return true;
 }
