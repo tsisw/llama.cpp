@@ -31,6 +31,12 @@ else()
     endif()
     add_subdirectory(simple)
     if (NOT DEFINED GGML_TSAVORITE)
+    # mlir-export tooling is host-side (the exporter execs link ggml; the kernel
+    # generator has no deps). It must NOT be part of the cross-compiled TSI backend
+    # build (tsi-pkg-build.sh) - build it standalone on the host instead.
+    add_subdirectory(mlir-export)
+    endif()
+    if (NOT DEFINED GGML_TSAVORITE)
     add_subdirectory(simple-chat)
     add_subdirectory(speculative)
     add_subdirectory(speculative-simple)

@@ -22,6 +22,7 @@
 #include <signal.h>
 
 #include "ggml-tsavorite.h"
+#include "tsi_wholegraph.h"
 #include <unistd.h>
 #include <inttypes.h>
 #include <math.h>
@@ -649,7 +650,10 @@ static void tsi_load_all_blobs() {
 #endif
         failed_txe = i;
 
-        // ADD
+#if !TRITON_ADD
+        // ADD - only when add is NOT provided by the Triton kernel. With -DTRITON_ADD=1 the
+        // add op runs via _mlir_ciface_add_kernel_memory_wrapper (see the TRITON_ADD path in
+        // the compute loop), so there is no txe_add.blob to load here; loading it would fail.
         loadResult_add[i] = tsi_load_blob(
             i,
             name_add,
@@ -663,6 +667,7 @@ static void tsi_load_all_blobs() {
         }
         blobDescriptor_add[i] =
             static_cast<BlobDescriptor *>(loadResult_add[i]);
+#endif /* !TRITON_ADD */
 
         // MULT
         loadResult_mult[i] = tsi_load_blob(
@@ -4183,6 +4188,10 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     return GGML_STATUS_FAILED;
   }
 
+  // Whole-graph interception is not done here: the scheduler splits the forward across backends, so
+  // this only sees a per-backend sub-graph. It hooks in llama_context::graph_compute instead, above
+  // the scheduler where the full graph is intact (tsi_wholegraph.cpp).
+
 #if 0
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads, ctx->threadpool);
 
@@ -4567,7 +4576,12 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
                         float *val = (float *)glob_buf->data;
                         val[0] = scale;
-                        ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, glob_buf);
+                        // Arg order (a, mask, buf, out): the MLIR-exporter soft_max kernel is a
+                        // functional func(a,b,buf)->tensor, so its result (out) is the LAST ciface
+                        // arg. The hand-written DSL kernel used (a, mask, out, buf); both are called
+                        // through this 4-ptr _mlir_fptr_3_input slot. Passing glob_buf before nodeP
+                        // matches the exporter kernel; a DSL soft_max would need the old order.
+                        ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, glob_buf, nodeP);
                         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                         ++node->tsi_kernel_runs;
 	            }

@@ -1,0 +1,44 @@
+{
+    "enable_tvu": true,
+    "enable_tmu": true,
+    "tmu_mma_shape": [1, 1],
+    "txe_target": "Ten",
+    "debug": false,
+    "log_mlir": true,
+    "mlir_translate": "${MLIR_SDK_VERSION}/compiler/bin/mlir-translate",
+    "single_blob_library": false,
+    "host_backend": {
+        "ar": "ar",
+        "ll_compiler": {
+            "executable": "${MLIR_SDK_VERSION}/compiler/bin/llc",
+            "flags": "--relocation-model=pic  -filetype=obj --mtriple=aarch64-none-linux-gnu",
+            "postcommand": ""
+        },
+        "c_compiler": {
+            "executable": "g++",
+            "flags": ""
+        },
+        "linker": {
+            "executable": "g++",
+            "flags" : ""
+        }
+    },
+    "blob_backend": {
+        "ll_compiler": {
+            "executable": "${XT_TOOLS_DIR}/bin/xt-clang",
+            "flags": "--xtensa-core=TENcore_nx_v05_fpga_tie -O0 --xtensa-system=${XT_SYSTEM_DIR} -std=c11 -c -DXOS_OPT_UM=1 -DXCHAL_HAVE_XEA3 -DNDEBUG -DFEX_XOS_TARGET -DXOS_TARGET -fasm-blocks -ffunction-sections -mlongcalls -mlsp=pimultload -Wall -Wno-int-conversion -I/proj/rel/sw/ralutil -DFLEXIO",
+            "postcommand": "${TOOLBOX_DIR}/scripts/post_ll_build.sh"
+        },
+        "c_compiler": {
+            "executable": "${XT_TOOLS_DIR}/bin/xt-clang",
+            "flags": "--xtensa-core=TENcore_nx_v05_fpga_tie -O0 --xtensa-system=${XT_SYSTEM_DIR} -std=c11 -c -DXOS_OPT_UM=1 -DXCHAL_HAVE_XEA3 -DNDEBUG -DFEX_XOS_TARGET -DXOS_TARGET -fasm-blocks -ffunction-sections -mlongcalls -mlsp=pimultload -Wall -Wno-int-conversion -I/proj/rel/sw/ralutil -DFLEXIO -I${XT_TOOLS_DIR}/xtensa-elf/src/xos/src -I${XT_TOOLS_DIR}/xtensa-elf/include/xtensa"
+        },
+        "linker": {
+            "executable": "${XT_TOOLS_DIR}/bin/xt-clang",
+            "flags": "--xtensa-core=TENcore_nx_v05_fpga_tie --xtensa-system=${XT_SYSTEM_DIR} -fasm-blocks -ffunction-sections -shared -std=c11 -Wall -Werror -mlongcalls -Wl,--multi-section-pil -Wl,--shared-pagesize=128 -Wl,--no-relax -Wl,-pie -Wl,--gc-sections -mlsp=pimultload",
+            "postcommand": "${TOOLBOX_DIR}/scripts/post_blob_so_link.sh"
+        },
+        "extra_srcs": "",
+        "libs": "-L${TSI_RT_LIB_DIR} -lblob_utils -lxtutil -lxos -lxmem -lmloader -lm -lhal -ldynlib -lc"
+    }
+}

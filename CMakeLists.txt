@@ -6,7 +6,10 @@ include(CheckIncludeFileCXX)
 set(CMAKE_WARN_UNUSED_CLI YES)
 
 if (GGML_TSAVORITE)
-    
+
+    # let llama.cpp core (llama-context.cpp) guard the whole-graph interception hook
+    add_compile_definitions(GGML_USE_TSAVORITE)
+
     if  (NOT DEFINED GGML_TSAVORITE_TARGET)
         set(GGML_TSAVORITE_TARGET "posix")
     endif()

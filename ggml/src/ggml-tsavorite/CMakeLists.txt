@@ -3,8 +3,11 @@ message(STATUS "Tsavorite framework is found")
 # tsavorite Kernel Library
 add_compile_options(--std=c++20)
 include_directories(../ggml-cpu)
+# whole-graph interception (tsi_wholegraph.cpp) reuses the exporter emitter
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/mlir-export)
 ggml_add_backend_library(ggml-tsavorite
                          ggml-tsavorite.cpp
+                         tsi_wholegraph.cpp
                         )
 
 # Add compiler lib directory to link path for FFM libraries

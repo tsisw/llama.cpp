@@ -1165,6 +1165,33 @@ EOL
   cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
+  # whole-graph tooling (TSI_WHOLEGRAPH capture/compile/run inside llama-cli): ship the driver +
+  # compile step + fpga compiler config next to llama-cli so B can capture->compile->run locally.
+  # Warn-only: a missing file must never break a normal package build.
+  __wg_src="${__TSI_SCRIPT_DIR}/examples/mlir-export"
+  for __wg in wholegraph.sh compile_graph_fpga.py; do
+    if [ -f "${__wg_src}/${__wg}" ]; then
+      cp "${__wg_src}/${__wg}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" && \
+        log_info "bundled whole-graph tool: ${__wg}"
+    else
+      log_info "whole-graph tool not found (skipped): ${__wg_src}/${__wg}"
+    fi
+  done
+  chmod +x "${TSI_GGML_BUNDLE_INSTALL_DIR}/wholegraph.sh" 2>/dev/null || true
+  # stock x86 config lives in the ggml-tsi-kernel submodule; the tsisim/arm config (txe_arm.json)
+  # lives with the whole-graph tools in examples/mlir-export.
+  for __cfg_pair in \
+      "${__TSI_SCRIPT_DIR}/ggml-tsi-kernel/fpga-kernel/txe_compiler_config.json:txe_compiler_config.json" \
+      "${__wg_src}/txe_arm.json:txe_arm.json"; do
+    __wg_cfg="${__cfg_pair%%:*}"; __cfg_name="${__cfg_pair##*:}"
+    if [ -f "${__wg_cfg}" ]; then
+      cp "${__wg_cfg}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/${__cfg_name}" && \
+        log_info "bundled whole-graph fpga compiler config: ${__cfg_name}"
+    else
+      log_info "whole-graph fpga compiler config not found (skipped): ${__wg_cfg}"
+    fi
+  done
+
   cat > "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" <<'EOF'
 # Tsavorite deployment config
 txe_count: 1
