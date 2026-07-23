@@ -904,6 +904,8 @@ build_posix_impl() {
     -DCMAKE_C_COMPILER="${CC}" -DCMAKE_CXX_COMPILER="${CXX}" \
     -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} ${cflags_base}" \
     -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} ${cflags_base}" \
+-DCMAKE_EXE_LINKER_FLAGS="-L/proj/local/gcc-13.3.0/lib64 -Wl,-rpath-link,/proj/local/gcc-13.3.0/lib64 -Wl,-rpath,/proj/local/gcc-13.3.0/lib64 -L/usr/lib64 -lomp -lgcc_s" \
+-DCMAKE_SHARED_LINKER_FLAGS="-L/proj/local/gcc-13.3.0/lib64 -Wl,-rpath-link,/proj/local/gcc-13.3.0/lib64 -Wl,-rpath,/proj/local/gcc-13.3.0/lib64 -L/usr/lib64 -lomp -lgcc_s" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
@@ -971,6 +973,8 @@ build_fpga_impl() {
     -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DLLAMA_CURL=OFF \
     -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
     -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
+-DCMAKE_EXE_LINKER_FLAGS="-L/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath-link,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -lomp" \
+-DCMAKE_SHARED_LINKER_FLAGS="-L/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath-link,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -lomp" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
