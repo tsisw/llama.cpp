@@ -13,12 +13,18 @@ The flow has three steps (capture → compile → verify/run), wrapped by `whole
 |---|---|
 | `-m` | model gguf path |
 | `-p` | prompt |
-| `-n` | number of tokens |
-| `--mode` | `capture` \| `dump` \| `verify` \| `run` |
+| `-n` | number of tokens (used by `gen`) |
+| `--mode` | `capture` \| `dump` \| `verify` \| `run` \| `gen` |
 
 Modes: `capture` exports `forward.mlir`; `dump` writes `graph.txt`; `verify` runs the compiled
 forward and diffs its next-token argmax against the per-op reference; `run` also samples the
-compiled token.
+compiled token; `gen` generates `-n` tokens, each from the compiled forward (prefill-only:
+re-capture + recompile over the growing sequence per token — a correctness demo, not the fast path).
+
+Example — generate 16 tokens on the compiled forward:
+```
+./wholegraph.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" -n 16 --mode gen
+```
 
 ---
 

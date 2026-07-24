@@ -11,9 +11,17 @@
 # config-setup.sh is NOT auto-sourced (it runs git-submodule + venv side effects); pass --setup
 # <path/to/config-setup.sh> if you want the full SDK env sourced instead of these direct exports.
 #
+# Modes (--mode):
+#   verify  run the compiled forward once, diff its next token vs the per-op reference (default)
+#   run     like verify, but also let llama sample the compiled token
+#   dump    write graph.txt only (no compile)
+#   gen     generate N tokens, each from the compiled forward (prefill-only: re-capture + recompile
+#           over the growing sequence per token; O(n^2), no KV cache reuse -- see the doc's §12).
+#           Add --verify-each to also diff compiled vs per-op on every token (slower, prints MATCH).
+#
 # Usage:
-#   ./wholegraph.sh [-m MODEL] [-p PROMPT] [-n N] [-d DIR] [-c CONFIG] [--mode verify|run|dump]
-#                   [--host tsisim|x86] [--sdk SDK_ROOT] [--venv VENV] [--cli LLAMA_CLI]
+#   ./wholegraph.sh [-m MODEL] [-p PROMPT] [-n N] [-d DIR] [-c CONFIG] [--mode verify|run|dump|gen]
+#                   [--verify-each] [--host tsisim|x86] [--sdk SDK_ROOT] [--venv VENV] [--cli LLAMA_CLI]
 #                   [--force] [--setup FILE]
 #
 # --host tsisim (default): compile natively on the aarch64 tsisim box  -> txe_arm.json
@@ -22,7 +30,7 @@
 # Examples:
 #   ./wholegraph.sh -p "hello world"                         # verify, 1 token, default model
 #   ./wholegraph.sh -m /root/tinyllama-v0-f32.gguf -p "what is 1+1" -n 1 --mode verify
-#   ./wholegraph.sh -p "hello world" --mode run -n 4         # sample the compiled token(s)
+#   ./wholegraph.sh -p "hello world" --mode gen -n 16        # generate 16 tokens on the compiled forward
 #   ./wholegraph.sh -p "hi" --mode dump                      # just dump graph.txt (no compile)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,6 +53,7 @@ SDK=""               # MLIR_SDK_VERSION; default depends on --host
 VENV=""              # python venv dir (uses <venv>/bin/python3); default: python3 on PATH
 LLAMA_CLI=""         # default: sibling ./llama-cli, else on PATH
 FORCE=0
+VERIFY_EACH=0        # gen mode: also diff compiled vs per-op each token (slower)
 SETUP=""             # optional config-setup.sh to source
 LLAMA_FLAGS="${LLAMA_FLAGS:--ctk f32 -ctv f32 -fa off}"
 TSI_WG_SKIP="${TSI_WG_SKIP:-0}"
@@ -65,12 +74,13 @@ while [ $# -gt 0 ]; do
         --venv)       VENV="$2"; shift 2 ;;
         --cli)        LLAMA_CLI="$2"; shift 2 ;;
         --force)      FORCE=1; shift ;;
+        --verify-each) VERIFY_EACH=1; shift ;;
         --setup)      SETUP="$2"; shift 2 ;;
         -h|--help)    grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1  (use -h)" ;;
     esac
 done
-case "$MODE" in verify|run|dump) ;; *) die "--mode must be verify|run|dump (got '$MODE')" ;; esac
+case "$MODE" in verify|run|dump|gen) ;; *) die "--mode must be verify|run|dump|gen (got '$MODE')" ;; esac
 case "$HOST" in tsisim|x86) ;; *) die "--host must be tsisim|x86 (got '$HOST')" ;; esac
 
 # ---------------------------------------------------------------- environment
@@ -136,6 +146,56 @@ if [ "$MODE" = dump ]; then
     TSI_WHOLEGRAPH=dump TSI_WG_DIR="$DIR" TSI_WG_SKIP="$TSI_WG_SKIP" \
         "$LLAMA_CLI" -m "$MODEL" -p "$PROMPT" -n 1 --no-warmup $LLAMA_FLAGS
     echo "=== done (dump) -> $DIR/graph.txt ==="
+    exit 0
+fi
+
+# ---------------------------------------------------------------- gen mode: prefill-only, N tokens
+# Each token is produced by the compiled whole-graph forward. Because the compiled host.so is fixed
+# to one sequence length, we re-capture + recompile over the growing sequence every step (no KV
+# cache reuse), then sample the compiled token and append it. O(n^2) and recompiles per token, so
+# it's a correctness/throughput demo, not the fast path (see the design doc's §12).
+if [ "$MODE" = gen ]; then
+    [ -f "$CONFIG" ] || die "fpga config not found: $CONFIG  (pass -c)"
+    "$PY" -c "import os,sys; sys.exit(0 if '\${' not in os.path.expandvars(open(sys.argv[1]).read()) else 1)" "$CONFIG" \
+        || die "unresolved \${...} in $CONFIG (pass --setup or export the SDK env)"
+    echo "--- gen: $N tokens, prefill-only (recompile per step) ---"
+    seq="$PROMPT"
+    printf '%s' "$PROMPT"
+    for ((i = 1; i <= N; i++)); do
+        echo "  [step $i/$N] capture+compile+run over $(printf %s "$seq" | wc -c | tr -d ' ') prompt chars" >&2
+        TSI_WHOLEGRAPH=capture TSI_WG_DIR="$DIR" TSI_WG_SKIP="$TSI_WG_SKIP" \
+            "$LLAMA_CLI" -m "$MODEL" -p "$seq" -n 1 --no-warmup $LLAMA_FLAGS >"$DIR/gen.capture.log" 2>&1 \
+            || { tail -20 "$DIR/gen.capture.log" >&2; die "step $i: capture failed"; }
+        grep -q 'func.func @forward' "$DIR/forward.mlir" || die "step $i: capture produced no @forward"
+        "$PY" "$COMPILE_PY" --target fpga --config "$CONFIG" "$DIR/forward.mlir" "$DIR/out_fpga" \
+            >"$DIR/gen.compile.log" 2>&1 || { tail -20 "$DIR/gen.compile.log" >&2; die "step $i: compile failed"; }
+        # --verify-each: run in verify mode (compiled + per-op, prints the diff) instead of run.
+        # verify doesn't overwrite the logits, so llama samples the per-op token -- identical to the
+        # compiled token whenever the step MATCHes, so generation continues the same either way.
+        step_mode=run
+        [ "$VERIFY_EACH" = 1 ] && step_mode=verify
+        raw=$(TSI_WHOLEGRAPH="$step_mode" TSI_WG_DIR="$DIR" TSI_WG_SKIP="$TSI_WG_SKIP" \
+              TSI_WG_LIB="$DIR/out_fpga/host/host.so" \
+              "$LLAMA_CLI" -m "$MODEL" -p "$seq" -n 1 --no-warmup --no-display-prompt $LLAMA_FLAGS 2>"$DIR/gen.run.err" || true)
+        if [ "$VERIFY_EACH" = 1 ]; then
+            v=$(grep -a 'VERIFY compiled vs per-op' "$DIR/gen.run.err" | tail -1)
+            echo "  [step $i] ${v:-<no VERIFY line found>}" >&2
+        fi
+        # The tsavorite runtime prints a "TSI deploy ..." banner + profiler lines to STDOUT; strip
+        # them WITH their leading whitespace/newlines so only llama's generated token remains and its
+        # own single leading space (SentencePiece "_word") is preserved exactly (no stray double space).
+        tok=$(printf '%s' "$raw" | tr -d '\n' | sed -E \
+              -e 's/[[:space:]]*TSI deploy yaml=[^[:space:]]* txe_count=[0-9]+ multi_thread_enable=[0-9]+ advanced_matmul_shape_offload=[0-9]+//g' \
+              -e 's/[[:space:]]*OPU Profiling Results://g' -e 's/[[:space:]]*Profiler disabled//g')
+        case "$tok" in
+            *"TSI deploy"*|*hal_lib_init*|*"HAL "*)
+                die "step $i: runtime banner leaked into stdout, cannot isolate the generated token" ;;
+        esac
+        seq="$seq$tok"
+        printf '%s' "$tok"
+    done
+    printf '\n'
+    echo "=== done (gen) ==="
     exit 0
 fi
 
