@@ -1499,6 +1499,7 @@ typedef struct _txe_command_buffer_t *txe_command_buffer_s;
 typedef struct ggml_backend_tsavorite_buffer ggml_backend_tsavorite_buffer_s;
 
 const int Rank = MEM_REF_DESCRIPTOR_RANK;
+const int Rank_Triton = MEM_REF_DESCRIPTOR_RANK_TRITON;
 MemRefDescriptor<Rank>* glob_buf;
 
 template<int Rank>
@@ -3376,10 +3377,27 @@ static int32_t g_triton_cur_M_tile = TMU_M_TILE_MAX;
 static int32_t g_triton_cur_N_tile = TMU_N_BLOCK;
 
 
-extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
-    void *A, void *B, void *C,
-    void *M_scalar, void *N_scalar, void *K_scalar,
-    void *grid1_scalar, void *grid2_scalar, void *grid3_scalar);
+extern "C" void _mlir_ciface_add_kernel_device_wrapper(
+    void *A,
+    void *B,
+    void *C,
+    void *n_elements_scalar,
+    void *grid_x_scalar,
+    void *grid_y_scalar,
+    void *grid_z_scalar,
+    void *max_txes_scalar);
+
+extern "C" void _mlir_ciface_matmul_kernel_device_wrapper(
+    void *A,
+    void *B,
+    void *C,
+    void *M_scalar,
+    void *N_scalar,
+    void *K_scalar,
+    void *grid_x_scalar,
+    void *grid_y_scalar,
+    void *grid_z_scalar,
+    void *max_txes_scalar);
 
 // -----------------------------------------------------------------------------
 // Triton MAT_MUL manual memory wrapper
@@ -3390,25 +3408,28 @@ extern "C" void _mlir_ciface_matmul_kernel_memory_wrapper(
 // tsi_load_blob() expects prefix WITHOUT ".blob":
 //   .../txe_triton_mat_mul/blobs/txe_blob_0
 //
-// ABI assumption:
-//   9 args:
-//     A, B, C, M, N, K, grid1, grid2, grid3
+// Blob packed-args ABI:
+//   7 args:
+//     A, B, C, M, N, K, program_id
 //
-// Each arg packed as 16 bytes:
+// Each arg is packed as 16 bytes:
 //   p[idx++] = tsi_shmem_handle_from_ptr(desc->data);
 //   p[idx++] = desc->shape[0];
 //
 // Total:
-//   9 args * 2 int64 = 18 int64 = 144 bytes
+//   7 args * 2 int64 = 14 int64 = 112 bytes
 //
-// First step: fixed device 0.
+// Note:
+//   grid1/grid2/grid3/max_txes are wrapper-level arguments for the generated
+//   device wrapper path. They are not packed into the direct blob path.
+//   The direct blob path appends only program_id after the user kernel args.
 // -----------------------------------------------------------------------------
 
 
 static inline void tsi_pack_triton_matmul_arg(
     int64_t *p,
     int &idx,
-    MemRefDescriptor<Rank> *d,
+    MemRefDescriptor<Rank_Triton> *d,
     const char *name) {
     if (!d || !d->data) {
         fprintf(stderr,
@@ -3442,27 +3463,23 @@ static inline void tsi_pack_triton_matmul_arg(
 //   M_desc_v     : MemRefDescriptor<F32> scalar M
 //   N_desc_v     : MemRefDescriptor<F32> scalar N
 //   K_desc_v     : MemRefDescriptor<F32> scalar K
-//   grid1_desc_v : MemRefDescriptor<F32> scalar grid1
-//   grid2_desc_v : MemRefDescriptor<F32> scalar grid2
-//   grid3_desc_v : MemRefDescriptor<F32> scalar grid3
+//   program_id_desc_v : MemRefDescriptor<F32> dim-encoded program_id scratch
 //
 // Note:
 //   Current implementation supports F32 only. BF16/F16 and mixed-precision
 //   are not supported in ggml-tsavorite.cpp.
 
-static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
+static void *_mlir_ciface_matmul_kernel_device_wrapper_triton_manual_internal(
     void *A_desc_v,
     void *B_desc_v,
     void *C_desc_v,
     void *M_desc_v,
     void *N_desc_v,
     void *K_desc_v,
-    void *grid1_desc_v,
-    void *grid2_desc_v,
-    void *grid3_desc_v,
+    void *program_id_desc_v,
     TSI_DeviceIdType deviceId) {
 
-    constexpr int64_t kPackedArgsI64   = 18;
+    constexpr int64_t kPackedArgsI64   = 14;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * (int64_t)sizeof(int64_t);
 
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
@@ -3487,17 +3504,14 @@ static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
         abort();
     }
 
-    auto *grid1_desc = (MemRefDescriptor<Rank> *)grid1_desc_v;
-    auto *grid2_desc = (MemRefDescriptor<Rank> *)grid2_desc_v;
-    auto *grid3_desc = (MemRefDescriptor<Rank> *)grid3_desc_v;
+    auto *program_id_desc = (MemRefDescriptor<Rank_Triton> *)program_id_desc_v;
+    auto *A_desc = (MemRefDescriptor<Rank_Triton> *)A_desc_v;
+    auto *B_desc = (MemRefDescriptor<Rank_Triton> *)B_desc_v;
+    auto *C_desc = (MemRefDescriptor<Rank_Triton> *)C_desc_v;
 
-    auto *A_desc = (MemRefDescriptor<Rank> *)A_desc_v;
-    auto *B_desc = (MemRefDescriptor<Rank> *)B_desc_v;
-    auto *C_desc = (MemRefDescriptor<Rank> *)C_desc_v;
-
-    auto *M_desc = (MemRefDescriptor<Rank> *)M_desc_v;
-    auto *N_desc = (MemRefDescriptor<Rank> *)N_desc_v;
-    auto *K_desc = (MemRefDescriptor<Rank> *)K_desc_v;
+    auto *M_desc = (MemRefDescriptor<Rank_Triton> *)M_desc_v;
+    auto *N_desc = (MemRefDescriptor<Rank_Triton> *)N_desc_v;
+    auto *K_desc = (MemRefDescriptor<Rank_Triton> *)K_desc_v;
 
     int64_t *p = static_cast<int64_t *>(packed_args[deviceId]);
     memset(p, 0, (size_t)kPackedArgsBytes);
@@ -3508,22 +3522,19 @@ static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
     A_desc->offset = 0;
     B_desc->offset = 0;
     C_desc->offset = 0;
-    grid1_desc->offset = 0;
-    grid2_desc->offset = 0;
-    grid3_desc->offset = 0;
+    program_id_desc->offset = 0;
+    program_id_desc->shape[0] = 1;
 
     int idx = 0;
 
-    // M,N,K,A,B,C,grid1,grid2,grid3
+    // A,B,C,M,N,K,program_id
     tsi_pack_triton_matmul_arg(p, idx, A_desc,     "A");
     tsi_pack_triton_matmul_arg(p, idx, B_desc,     "B");
     tsi_pack_triton_matmul_arg(p, idx, C_desc,     "C");
     tsi_pack_triton_matmul_arg(p, idx, M_desc,     "M");
     tsi_pack_triton_matmul_arg(p, idx, N_desc,     "N");
     tsi_pack_triton_matmul_arg(p, idx, K_desc,     "K");
-    tsi_pack_triton_matmul_arg(p, idx, grid1_desc, "grid1");
-    tsi_pack_triton_matmul_arg(p, idx, grid2_desc, "grid2");
-    tsi_pack_triton_matmul_arg(p, idx, grid3_desc, "grid3");
+    tsi_pack_triton_matmul_arg(p, idx, program_id_desc, "program_id");
 
     if (idx != kPackedArgsI64) {
         fprintf(stderr,
@@ -3568,7 +3579,7 @@ static void *_mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
     return commandList;
 }
 
-static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
+static void _mlir_ciface_matmul_kernel_device_wrapper_triton_dispatch (
     void *A_desc_v,
     void *B_desc_v,
     void *C_desc_v,
@@ -3577,28 +3588,13 @@ static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
     void *K_desc_v,
     void *grid1_desc_v,
     void *grid2_desc_v,
-    void *grid3_desc_v) {
+    void *grid3_desc_v,
+    void *max_txes_desc_v) {
 
     tsi_init_per_txe_state_once();
 
     if (!multi_thread_enable) {
-        _mlir_ciface_matmul_kernel_memory_wrapper(
-            A_desc_v,
-            B_desc_v,
-            C_desc_v,
-            M_desc_v,
-            N_desc_v,
-            K_desc_v,
-            grid1_desc_v,
-            grid2_desc_v,
-            grid3_desc_v);
-        return;
-    }
-
-    int deviceId = acquire_device_blocking();
-
-    void *commandList =
-        _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
+        _mlir_ciface_matmul_kernel_device_wrapper(
             A_desc_v,
             B_desc_v,
             C_desc_v,
@@ -3608,6 +3604,23 @@ static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
             grid1_desc_v,
             grid2_desc_v,
             grid3_desc_v,
+            max_txes_desc_v);
+        return;
+    }
+
+    int deviceId = acquire_device_blocking();
+
+    void *program_id_desc_v = grid1_desc_v;
+
+    void *commandList =
+        _mlir_ciface_matmul_kernel_device_wrapper_triton_manual_internal(
+            A_desc_v,
+            B_desc_v,
+            C_desc_v,
+            M_desc_v,
+            N_desc_v,
+            K_desc_v,
+            program_id_desc_v,
             deviceId);
 
     if (!commandList) {
@@ -3634,7 +3647,7 @@ static void _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch (
 // Triton MAT_MUL ABI helpers
 // IMPORTANT:
 // - Triton matmul wrapper wants flattened rank-1 memrefs for A/B/C
-// - M/N/K and grid{1,2,3} are separate scalar memrefs
+// - M/N/K are scalar memrefs; direct blob launch appends program_id only
 // - Descriptor and scalar payload must both be device-visible and 128B aligned
 // -----------------------------------------------------------------------------
 
@@ -3664,7 +3677,7 @@ static inline void init_scalar_i32_memref_aligned(
     d->offset     = 0;
     //We bypass Triton generated host_wrapper and pack blob args manually.
     //d->shape[0]   = 1;
-    d->shape[0]   = v;
+    d->shape[0]   = v + 1;
     d->strides[0] = 1;
     *((int32_t *) payload_ptr) = v;
 }
@@ -3767,16 +3780,17 @@ static inline void call_triton_matmul_full_packed(
     int32_t N_pad,
     int32_t K) {
 
-    static MemRefDescriptor<Rank> *A_desc = nullptr;
-    static MemRefDescriptor<Rank> *B_desc = nullptr;
-    static MemRefDescriptor<Rank> *C_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *A_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *B_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *C_desc = nullptr;
 
-    static MemRefDescriptor<Rank> *M_desc     = nullptr;
-    static MemRefDescriptor<Rank> *N_desc     = nullptr;
-    static MemRefDescriptor<Rank> *K_desc     = nullptr;
-    static MemRefDescriptor<Rank> *grid1_desc = nullptr;
-    static MemRefDescriptor<Rank> *grid2_desc = nullptr;
-    static MemRefDescriptor<Rank> *grid3_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *M_desc     = nullptr;
+    static MemRefDescriptor<Rank_Triton> *N_desc     = nullptr;
+    static MemRefDescriptor<Rank_Triton> *K_desc     = nullptr;
+    static MemRefDescriptor<Rank_Triton> *grid1_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *grid2_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *grid3_desc = nullptr;
+    static MemRefDescriptor<Rank_Triton> *max_txes_desc = nullptr;
 
     static int32_t *M_payload     = nullptr;
     static int32_t *N_payload     = nullptr;
@@ -3784,20 +3798,22 @@ static inline void call_triton_matmul_full_packed(
     static int32_t *grid1_payload = nullptr;
     static int32_t *grid2_payload = nullptr;
     static int32_t *grid3_payload = nullptr;
+    static int32_t *max_txes_payload = nullptr;
 
     static bool inited = false;
 
     if (!inited) {
-        A_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        B_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        C_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
+        A_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        B_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        C_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
 
-        M_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        N_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        K_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        grid1_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        grid2_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        grid3_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
+        M_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        N_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        K_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        grid1_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        grid2_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        grid3_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        max_txes_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
 
         M_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         N_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
@@ -3805,12 +3821,13 @@ static inline void call_triton_matmul_full_packed(
         grid1_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         grid2_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         grid3_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        max_txes_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
 
         TSAVORITE_GGML_ASSERT(A_desc && B_desc && C_desc);
         TSAVORITE_GGML_ASSERT(M_desc && N_desc && K_desc);
-        TSAVORITE_GGML_ASSERT(grid1_desc && grid2_desc && grid3_desc);
+        TSAVORITE_GGML_ASSERT(grid1_desc && grid2_desc && grid3_desc && max_txes_desc);
         TSAVORITE_GGML_ASSERT(M_payload && N_payload && K_payload);
-        TSAVORITE_GGML_ASSERT(grid1_payload && grid2_payload && grid3_payload);
+        TSAVORITE_GGML_ASSERT(grid1_payload && grid2_payload && grid3_payload && max_txes_payload);
 
         inited = true;
     }
@@ -3840,12 +3857,14 @@ static inline void call_triton_matmul_full_packed(
     init_scalar_i32_memref_aligned(grid1_desc, grid1_payload, 1);
     init_scalar_i32_memref_aligned(grid2_desc, grid2_payload, 1);
     init_scalar_i32_memref_aligned(grid3_desc, grid3_payload, 1);
+    init_scalar_i32_memref_aligned(max_txes_desc, max_txes_payload, (int32_t)num_of_txes);
 
 
-    _mlir_ciface_matmul_kernel_memory_wrapper_triton_dispatch(
+    _mlir_ciface_matmul_kernel_device_wrapper_triton_dispatch(
         A_desc, B_desc, C_desc,
         M_desc, N_desc, K_desc,
-        grid1_desc, grid2_desc, grid3_desc);
+        grid1_desc, grid2_desc, grid3_desc,
+        max_txes_desc);
 }
 
 
@@ -3961,15 +3980,16 @@ static float * ensure_triton_B_packed_cache(size_t elems)
 
 
 struct triton_matmul_desc_set_t {
-    MemRefDescriptor<Rank> *A_desc = nullptr;
-    MemRefDescriptor<Rank> *B_desc = nullptr;
-    MemRefDescriptor<Rank> *C_desc = nullptr;
-    MemRefDescriptor<Rank> *M_desc = nullptr;
-    MemRefDescriptor<Rank> *N_desc = nullptr;
-    MemRefDescriptor<Rank> *K_desc = nullptr;
-    MemRefDescriptor<Rank> *grid1_desc = nullptr;
-    MemRefDescriptor<Rank> *grid2_desc = nullptr;
-    MemRefDescriptor<Rank> *grid3_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *A_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *B_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *C_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *M_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *N_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *K_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *grid1_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *grid2_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *grid3_desc = nullptr;
+    MemRefDescriptor<Rank_Triton> *max_txes_desc = nullptr;
 
     int32_t *M_payload = nullptr;
     int32_t *N_payload = nullptr;
@@ -3977,6 +3997,7 @@ struct triton_matmul_desc_set_t {
     int32_t *grid1_payload = nullptr;
     int32_t *grid2_payload = nullptr;
     int32_t *grid3_payload = nullptr;
+    int32_t *max_txes_payload = nullptr;
 };
 
 static std::vector<triton_matmul_desc_set_t> g_triton_desc_mt;
@@ -3995,16 +4016,17 @@ static inline triton_matmul_desc_set_t *ensure_triton_desc_for_device(int device
     triton_matmul_desc_set_t &s = g_triton_desc_mt[deviceId];
 
     if (!s.A_desc) {
-        s.A_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.B_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.C_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
+        s.A_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.B_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.C_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
 
-        s.M_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.N_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.K_desc     = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.grid1_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.grid2_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
-        s.grid3_desc = (MemRefDescriptor<Rank> *) tsi_alloc(sizeof(MemRefDescriptor<Rank>));
+        s.M_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.N_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.K_desc     = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.grid1_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.grid2_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.grid3_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+        s.max_txes_desc = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
 
         s.M_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         s.N_payload     = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
@@ -4012,12 +4034,13 @@ static inline triton_matmul_desc_set_t *ensure_triton_desc_for_device(int device
         s.grid1_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         s.grid2_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
         s.grid3_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        s.max_txes_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
 
         TSAVORITE_GGML_ASSERT(s.A_desc && s.B_desc && s.C_desc);
         TSAVORITE_GGML_ASSERT(s.M_desc && s.N_desc && s.K_desc);
-        TSAVORITE_GGML_ASSERT(s.grid1_desc && s.grid2_desc && s.grid3_desc);
+        TSAVORITE_GGML_ASSERT(s.grid1_desc && s.grid2_desc && s.grid3_desc && s.max_txes_desc);
         TSAVORITE_GGML_ASSERT(s.M_payload && s.N_payload && s.K_payload);
-        TSAVORITE_GGML_ASSERT(s.grid1_payload && s.grid2_payload && s.grid3_payload);
+        TSAVORITE_GGML_ASSERT(s.grid1_payload && s.grid2_payload && s.grid3_payload && s.max_txes_payload);
     }
 
     return &s;
@@ -4056,20 +4079,21 @@ static inline triton_matmul_dispatch_profile_t call_triton_matmul_full_packed_on
     init_scalar_i32_memref_aligned(s->grid1_desc, s->grid1_payload, 1);
     init_scalar_i32_memref_aligned(s->grid2_desc, s->grid2_payload, 1);
     init_scalar_i32_memref_aligned(s->grid3_desc, s->grid3_payload, 1);
+    init_scalar_i32_memref_aligned(s->max_txes_desc, s->max_txes_payload, (int32_t)num_of_txes);
 
     const int64_t launch_start_us = tsavorite_now_us();
 
+    auto *program_id_desc = s->grid1_desc;
+
     void *commandList =
-        _mlir_ciface_matmul_kernel_memory_wrapper_triton_manual_internal(
+        _mlir_ciface_matmul_kernel_device_wrapper_triton_manual_internal(
             s->A_desc,
             s->B_desc,
             s->C_desc,
             s->M_desc,
             s->N_desc,
             s->K_desc,
-            s->grid1_desc,
-            s->grid2_desc,
-            s->grid3_desc,
+            program_id_desc,
             (TSI_DeviceIdType)deviceId);
 
     prof.launch_us = tsavorite_elapsed_us(launch_start_us);
@@ -5490,8 +5514,20 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         *scalar_val = 1;
 
                         //ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, scalar_loop);
-                        _mlir_ciface_add_kernel_memory_wrapper(srcP0, srcP1, nodeP,
-                                        scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3);
+                        static MemRefDescriptor<Rank_Triton> *scalar_max_txes = nullptr;
+                        static int32_t *scalar_max_txes_payload = nullptr;
+
+                        if (!scalar_max_txes) {
+                            scalar_max_txes = (MemRefDescriptor<Rank_Triton> *) tsi_alloc(sizeof(MemRefDescriptor<Rank_Triton>));
+                            scalar_max_txes_payload = (int32_t *) tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+                            TSAVORITE_GGML_ASSERT(scalar_max_txes);
+                            TSAVORITE_GGML_ASSERT(scalar_max_txes_payload);
+                        }
+
+                        init_scalar_i32_memref_aligned(scalar_max_txes, scalar_max_txes_payload, (int32_t)num_of_txes);
+
+                        _mlir_ciface_add_kernel_device_wrapper(srcP0, srcP1, nodeP,
+                                        scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
                     } else {
 #endif /* TRITON_ADD */
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
