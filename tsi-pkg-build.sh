@@ -1028,6 +1028,34 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
 
 TAOS_CONFIG_PATH="/etc/taos/taos.json"
 
+extract_deployment_yaml_value() {
+  local deployment_yaml_path="$1"
+  local yaml_key="$2"
+
+  awk -F: -v key="${yaml_key}" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
+      v=$2
+
+      # Remove an inline YAML comment before quote normalization.
+      sub(/[[:space:]]+#.*/, "", v)
+
+      # Trim whitespace.
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+
+      # Normalize matching single or double quotes.
+      dq=sprintf("%c", 34)
+      sq=sprintf("%c", 39)
+      if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
+          (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
+        v = substr(v, 2, length(v) - 2)
+      }
+
+      print v
+      exit
+    }
+  ' "${deployment_yaml_path}"
+}
+
 update_one_tsavorite_deployment_yaml() {
   local deployment_yaml_path="$1"
   local txe_count="$2"
@@ -1038,40 +1066,14 @@ update_one_tsavorite_deployment_yaml() {
 
   if [ -f "${deployment_yaml_path}" ]; then
     local existing_advanced
-    existing_advanced="$(awk -F: '
-      /^[[:space:]]*advanced_matmul_shape_offload[[:space:]]*:/ {
-        v=$2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-        dq=sprintf("%c", 34)
-        sq=sprintf("%c", 39)
-        if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
-            (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
-          v = substr(v, 2, length(v) - 2)
-        }
-        print v
-        exit
-      }
-    ' "${deployment_yaml_path}")"
+    local existing_small_n_opt
+
+    existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
+    existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
     fi
-
-    local existing_small_n_opt
-    existing_small_n_opt="$(awk -F: '
-      /^[[:space:]]*triton_matmul_small_n_transpose_opt[[:space:]]*:/ {
-        v=$2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-        dq=sprintf("%c", 34)
-        sq=sprintf("%c", 39)
-        if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
-            (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
-          v = substr(v, 2, length(v) - 2)
-        }
-        print v
-        exit
-      }
-    ' "${deployment_yaml_path}")"
 
     if [ -n "${existing_small_n_opt}" ]; then
       triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
