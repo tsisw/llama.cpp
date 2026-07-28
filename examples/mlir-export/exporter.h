@@ -65,6 +65,17 @@ static std::string mlir_tensor_type(const ggml_tensor * t) {
     return "tensor<" + mlir_shape_dims(t) + mlir_element_type(t) + ">";
 }
 
+// MLIR type using an explicit rank R (>= ggml_n_dims): ggml's trailing size-1 dims become MLIR
+// leading size-1 dims. Used by CONCAT, where an operand can report a lower ggml_n_dims than the
+// node (e.g. the decode graph's new K/V [.,.,1] vs the cache [.,.,cur]).
+static std::string mlir_tensor_type_ranked(const ggml_tensor * t, int R) {
+    std::ostringstream oss;
+    oss << "tensor<";
+    for (int i = R - 1; i >= 0; i--) oss << t->ne[i] << "x";
+    oss << mlir_element_type(t) << ">";
+    return oss.str();
+}
+
 // tensor type for the explicit transpose of a 2D tensor (swaps ne[0] and ne[1])
 static std::string mlir_transposed_tensor_type(const ggml_tensor * t) {
     return "tensor<" + std::to_string(t->ne[0]) + "x" + std::to_string(t->ne[1]) + "x" + mlir_element_type(t) + ">";
@@ -220,6 +231,9 @@ struct linalg_exporter {
         if (a_dims == 2 && b_dims == 2) {
             return emit_mul_mat_2d(node, a, b);
         }
+        if (a_dims == 2 && b_dims == 1) {   // n_tokens=1 decode: b is ggml [k,1] collapsed to rank-1
+            return emit_mul_mat_2d_vec(node, a, b);
+        }
         if (a_dims == 3 && b_dims == 3) {
             if (a->ne[2] == b->ne[2]) {
                 return emit_mul_mat_batched_3d(node, a, b);
@@ -232,6 +246,39 @@ struct linalg_exporter {
                 "mlir-export: MUL_MAT only supports 2D, 3D with equal batch dims, or 3D GQA broadcast "
                 "(b's head count a multiple of a's)\n");
         throw mlir_export_error("unsupported graph construct (see message above)");
+    }
+
+    // ggml_mul_mat(a[k,n], b[k,1]) with a single column (n_tokens=1): b is rank-1 [k], result rank-1
+    // [n]. Expand b to [1,k], reuse the transpose+matmul path, then collapse [1,n] -> [n].
+    std::string emit_mul_mat_2d_vec(const ggml_tensor * node, const ggml_tensor * a, const ggml_tensor * b) {
+        ensure_cst();
+        const int64_t k = b->ne[0];
+        const int64_t n = a->ne[1];
+
+        std::string b2 = new_id();
+        body << "    " << b2 << " = tensor.expand_shape " << values.at(b) << " [[0, 1]] output_shape [1, " << k
+             << "] : tensor<" << k << "x" << mlir_element_type(b) << "> into tensor<1x" << k << "x" << mlir_element_type(b) << ">\n";
+
+        std::string at_ty = mlir_transposed_tensor_type(a);   // [k, n]
+        std::string at_init = new_id();
+        body << "    " << at_init << " = tensor.empty() : " << at_ty << "\n";
+        std::string at = new_id();
+        body << "    " << at << " = linalg.transpose ins(" << values.at(a) << " : " << mlir_tensor_type(a)
+             << ") outs(" << at_init << " : " << at_ty << ") permutation = [1, 0]\n";
+
+        std::string mm_ty = "tensor<1x" + std::to_string(n) + "x" + mlir_element_type(node) + ">";
+        std::string mm_init = new_id();
+        body << "    " << mm_init << " = tensor.empty() : " << mm_ty << "\n";
+        std::string filled = new_id();
+        body << "    " << filled << " = linalg.fill ins(%cst : f32) outs(" << mm_init << " : " << mm_ty << ") -> " << mm_ty << "\n";
+        std::string mm = new_id();
+        body << "    " << mm << " = linalg.matmul ins(" << b2 << ", " << at << " : tensor<1x" << k << "x" << mlir_element_type(b)
+             << ">, " << at_ty << ") outs(" << filled << " : " << mm_ty << ") -> " << mm_ty << "\n";
+
+        std::string result = new_id();
+        body << "    " << result << " = tensor.collapse_shape " << mm << " [[0, 1]] : " << mm_ty << " into "
+             << mlir_tensor_type(node) << "\n";
+        return result;
     }
 
     std::string emit_mul_mat_2d(const ggml_tensor * node, const ggml_tensor * a, const ggml_tensor * b) {
@@ -504,11 +551,7 @@ struct linalg_exporter {
     std::string emit_rms_norm(const ggml_tensor * node) {
         const ggml_tensor * x = node->src[0];
 
-        int n_dims = ggml_n_dims(x);
-        if (n_dims < 2) {
-            fprintf(stderr, "mlir-export: RMS_NORM requires at least 2 dims\n");
-            throw mlir_export_error("unsupported graph construct (see message above)");
-        }
+        int n_dims = ggml_n_dims(x);   // rank 1 (n_tokens=1 decode) reduces to a rank-0 scalar; valid.
 
         float eps;
         memcpy(&eps, node->op_params, sizeof(float));
@@ -607,11 +650,20 @@ struct linalg_exporter {
             fprintf(stderr, "mlir-export: SOFT_MAX requires at least 2 dims\n");
             throw mlir_export_error("unsupported graph construct (see message above)");
         }
-        if (mask != nullptr &&
-            (n_dims != 3 || ggml_n_dims(mask) != 2 || mask->ne[0] != x->ne[0] || mask->ne[1] != x->ne[1])) {
+        // mask [n_kv, n_q] broadcast across the head dim (d0). For n_q=1 (decode) it collapses to a
+        // rank-1 [n_kv] mask; accept that too, broadcasting across both the head and query dims.
+        bool mask_ok = false;
+        if (mask != nullptr && n_dims == 3 && mask->ne[0] == x->ne[0]) {
+            if (ggml_n_dims(mask) == 2 && mask->ne[1] == x->ne[1]) {
+                mask_ok = true;
+            } else if (ggml_n_dims(mask) == 1 && x->ne[1] == 1) {
+                mask_ok = true;
+            }
+        }
+        if (mask != nullptr && !mask_ok) {
             fprintf(stderr,
                     "mlir-export: SOFT_MAX with a mask only supports rank-3 x with a matching rank-2 mask "
-                    "broadcast across the head dim for now\n");
+                    "(or a rank-1 [n_kv] mask when n_q=1) broadcast across the head dim for now\n");
             throw mlir_export_error("unsupported graph construct (see message above)");
         }
 
@@ -640,7 +692,9 @@ struct linalg_exporter {
             if (mask != nullptr) {
                 const std::string & mask_val = values.at(mask);
                 std::string          mask_ty  = mlir_tensor_type(mask);
-                std::string          mask_map = affine_map_select(3, { 1, 2 }); // drop the head dim (d0)
+                // rank-2 mask [n_q,n_kv] -> x dims {1,2}; rank-1 mask [n_kv] (n_q=1) -> x dim {2}
+                std::string          mask_map = (ggml_n_dims(mask) == 1) ? affine_map_select(3, { 2 })
+                                                                         : affine_map_select(3, { 1, 2 });
                 body << "    " << combined_val << " = linalg.generic {indexing_maps = [" << full_map << ", "
                      << mask_map << ", " << full_map << "], iterator_types = " << full_it << "} ins(" << x_val
                      << ", " << mask_val << " : " << x_ty << ", " << mask_ty << ") outs(" << comb_init << " : "
@@ -1069,9 +1123,87 @@ struct linalg_exporter {
     // see the top-of-file convention comment): for effective rank R, ggml dim g sits at MLIR
     // position R-1-g. If ggml moves dim g to position axis[g], the corresponding MLIR
     // transpose must place old MLIR position (R-1-g) at new MLIR position (R-1-axis[g]).
+    // MLIR (reversed-ne) dims of a tensor over its effective rank.
+    static std::vector<int64_t> mlir_dims(const ggml_tensor * t) {
+        std::vector<int64_t> v;
+        for (int i = ggml_n_dims(t) - 1; i >= 0; i--) {
+            v.push_back(t->ne[i]);
+        }
+        return v;
+    }
+
+    // Reshape src (MLIR shape src_dims) to dst_dims when they differ only in where size-1 dims sit
+    // (same non-1 dims, same order) - the n_tokens=1 case where a permute of the size-1 token dim
+    // moves no data. Collapse to the dense (no size-1) shape, then expand to the target.
+    std::string emit_size1_reshape(const std::string & src_val, const std::vector<int64_t> & src_dims,
+                                   const std::vector<int64_t> & dst_dims, const std::string & elem) {
+        auto ty = [&](const std::vector<int64_t> & s) {
+            std::ostringstream o;
+            o << "tensor<";
+            for (int64_t d : s) o << d << "x";
+            o << elem << ">";
+            return o.str();
+        };
+        // Group dims so each group holds exactly one non-1 dim (size-1 dims attach to the preceding
+        // non-1's group, leading 1s to the first) - the reassociation for collapse/expand vs dense.
+        auto reassoc = [&](const std::vector<int64_t> & s) {
+            std::vector<std::vector<int>> groups;
+            bool has_nonone = false;
+            for (int i = 0; i < (int) s.size(); i++) {
+                if (s[i] != 1 && has_nonone) { groups.push_back({}); has_nonone = false; }
+                if (groups.empty()) groups.push_back({});
+                groups.back().push_back(i);
+                if (s[i] != 1) has_nonone = true;
+            }
+            std::ostringstream o;
+            o << "[";
+            for (int g = 0; g < (int) groups.size(); g++) {
+                if (g) o << ", ";
+                o << "[";
+                for (int j = 0; j < (int) groups[g].size(); j++) { if (j) o << ", "; o << groups[g][j]; }
+                o << "]";
+            }
+            o << "]";
+            return o.str();
+        };
+        std::vector<int64_t> dense;
+        for (int64_t d : src_dims) if (d != 1) dense.push_back(d);
+
+        std::string cur = src_val;
+        if (src_dims.size() != dense.size()) {   // collapse src -> dense
+            std::string c = new_id();
+            body << "    " << c << " = tensor.collapse_shape " << cur << " " << reassoc(src_dims) << " : "
+                 << ty(src_dims) << " into " << ty(dense) << "\n";
+            cur = c;
+        }
+        if (dst_dims.size() != dense.size()) {   // expand dense -> dst
+            std::string e = new_id();
+            body << "    " << e << " = tensor.expand_shape " << cur << " " << reassoc(dst_dims) << " output_shape [";
+            for (int i = 0; i < (int) dst_dims.size(); i++) { if (i) body << ", "; body << dst_dims[i]; }
+            body << "] : " << ty(dense) << " into " << ty(dst_dims) << "\n";
+            cur = e;
+        }
+        return cur;
+    }
+
     std::string emit_permute(const ggml_tensor * node) {
         const ggml_tensor * x = node->src[0];
         int                 R = ggml_n_dims(x);
+
+        // n_tokens=1: if the permute only reshuffles size-1 dims (relative order of the non-1 dims is
+        // preserved), it moves no data - emit it as a reshape rather than a rank-preserving transpose.
+        {
+            const int32_t * axis4 = (const int32_t *) node->op_params;
+            bool size1_only = true;
+            for (int i = 0; i < 4 && size1_only; i++) {
+                for (int j = i + 1; j < 4; j++) {
+                    if (x->ne[i] > 1 && x->ne[j] > 1 && axis4[i] > axis4[j]) { size1_only = false; break; }
+                }
+            }
+            if (size1_only) {
+                return emit_size1_reshape(values.at(x), mlir_dims(x), mlir_dims(node), mlir_element_type(x));
+            }
+        }
 
         if (R < 2 || R > 3) {
             fprintf(stderr, "mlir-export: PERMUTE only supports rank 2 or 3 for now\n");
@@ -1162,11 +1294,90 @@ struct linalg_exporter {
                  << " into " << out_ty << "\n";
             return result;
         }
+        // n_tokens=1: 1D hidden -> 2D heads (q/k/v proj -> heads), e.g. [hidden,1] -> [head_dim,n_head,1]
+        if (x_dims == 1 && out_dims == 2 && node->ne[0] * node->ne[1] == x->ne[0]) {
+            std::string result = new_id();
+            body << "    " << result << " = tensor.expand_shape " << x_val << " [[0, 1]] output_shape ["
+                 << node->ne[1] << ", " << node->ne[0] << "] : " << x_ty << " into " << out_ty << "\n";
+            return result;
+        }
+        // n_tokens=1: 2D heads -> 1D hidden (head merge), e.g. [head_dim,n_head,1] -> [hidden,1]
+        if (x_dims == 2 && out_dims == 1 && x->ne[0] * x->ne[1] == node->ne[0]) {
+            std::string result = new_id();
+            body << "    " << result << " = tensor.collapse_shape " << x_val << " [[0, 1]] : " << x_ty
+                 << " into " << out_ty << "\n";
+            return result;
+        }
 
         fprintf(stderr,
                 "mlir-export: RESHAPE/CONT only supports a same-shape passthrough, a 2D->3D head split, or a "
                 "3D->2D head merge for now\n");
         throw mlir_export_error("unsupported graph construct (see message above)");
+    }
+
+    // ggml_concat(a, b, dim): joins a and b along ggml dim `dim` (op_params[0]). Used by the KV-cache
+    // decode graph to append the new token's K/V to the cache. ggml dim d maps to MLIR dim R-1-d
+    // (reversed ne), and ggml's [a; b] order is the MLIR concat operand order. An operand can report
+    // fewer ggml dims than the node (e.g. new K/V [.,.,1] vs cache [.,.,cur]); expand it to rank R.
+    std::string emit_concat(const ggml_tensor * node) {
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        const int R = ggml_n_dims(node);
+        const int32_t dim = ((const int32_t *) node->op_params)[0];
+        if (dim < 0 || dim >= R) {
+            fprintf(stderr, "mlir-export: CONCAT dim %d out of range for rank %d\n", (int) dim, R);
+            throw mlir_export_error("unsupported graph construct (see message above)");
+        }
+
+        // bring an operand up to rank R via tensor.expand_shape (ggml trailing-1 -> MLIR leading-1)
+        auto to_rankR = [&](const ggml_tensor * op) -> std::string {
+            const int r = ggml_n_dims(op);
+            if (r == R) return values.at(op);
+            std::string dst = new_id();
+            std::ostringstream re;                       // reassociation [[0..R-r], [R-r+1], ..., [R-1]]
+            re << "[[";
+            for (int i = 0; i <= R - r; i++) { if (i) re << ", "; re << i; }
+            re << "]";
+            for (int i = R - r + 1; i < R; i++) re << ", [" << i << "]";
+            re << "]";
+            std::ostringstream osh;                      // output_shape = MLIR dims (reversed ne over R)
+            osh << "[";
+            for (int i = R - 1; i >= 0; i--) { if (i != R - 1) osh << ", "; osh << op->ne[i]; }
+            osh << "]";
+            body << "    " << dst << " = tensor.expand_shape " << values.at(op) << " " << re.str()
+                 << " output_shape " << osh.str()
+                 << " : " << mlir_tensor_type(op) << " into " << mlir_tensor_type_ranked(op, R) << "\n";
+            return dst;
+        };
+        std::string av = to_rankR(a), bv = to_rankR(b);
+
+        // Build the concat from tensor.empty + insert_slice (tensor.concat isn't bufferized by the
+        // TSI pipeline). `a` fills [0 : a.dim) along the concat dim; `b` fills [a.dim : a.dim+b.dim).
+        const int        mlir_dim = R - 1 - dim;
+        const std::string out_ty  = mlir_tensor_type(node);
+        auto dims = [&](const ggml_tensor * t) {           // MLIR sizes "[d0, d1, ...]" at rank R
+            std::ostringstream o; o << "[";
+            for (int j = 0; j < R; j++) { if (j) o << ", "; o << t->ne[R - 1 - j]; }
+            o << "]"; return o.str();
+        };
+        std::ostringstream zeros, ones, boff;
+        zeros << "["; ones << "["; boff << "[";
+        for (int j = 0; j < R; j++) {
+            if (j) { zeros << ", "; ones << ", "; boff << ", "; }
+            zeros << "0"; ones << "1";
+            boff << (j == mlir_dim ? (long long) a->ne[dim] : 0);   // b starts after a on the concat dim
+        }
+        zeros << "]"; ones << "]"; boff << "]";
+
+        std::string init = new_id();
+        body << "    " << init << " = tensor.empty() : " << out_ty << "\n";
+        std::string r0 = new_id();
+        body << "    " << r0 << " = tensor.insert_slice " << av << " into " << init << zeros.str() << " "
+             << dims(a) << " " << ones.str() << " : " << mlir_tensor_type_ranked(a, R) << " into " << out_ty << "\n";
+        std::string r1 = new_id();
+        body << "    " << r1 << " = tensor.insert_slice " << bv << " into " << r0 << boff.str() << " "
+             << dims(b) << " " << ones.str() << " : " << mlir_tensor_type_ranked(b, R) << " into " << out_ty << "\n";
+        return r1;
     }
 
     // ggml_get_rows(a, b): gathers rows of embedding table `a` (ggml ne=(n_embd, n_vocab))
@@ -1200,6 +1411,21 @@ struct linalg_exporter {
         std::string          b_ty   = mlir_tensor_type(b);
         std::string          row_ty = "tensor<1x" + std::to_string(n_embd) + "x" + mlir_element_type(a) + ">";
         std::string          out_ty = mlir_tensor_type(node);
+
+        // n_tokens=1 (decode): output collapses to rank-1 [n_embd]; extract the single row directly
+        // with a rank-reducing slice (the [1, n_embd] slice into a rank-1 result drops the unit dim).
+        if (n_tokens == 1 && ggml_n_dims(node) == 1) {
+            std::string c_t = new_id();
+            body << "    " << c_t << " = arith.constant 0 : index\n";
+            std::string tok_i32 = new_id();
+            body << "    " << tok_i32 << " = tensor.extract " << b_val << "[" << c_t << "] : " << b_ty << "\n";
+            std::string tok_idx = new_id();
+            body << "    " << tok_idx << " = arith.index_cast " << tok_i32 << " : i32 to index\n";
+            std::string row = new_id();
+            body << "    " << row << " = tensor.extract_slice " << a_val << "[" << tok_idx << ", 0] [1, " << n_embd
+                 << "] [1, 1] : " << a_ty << " to " << out_ty << "\n";
+            return row;
+        }
 
         std::string out_init = new_id();
         body << "    " << out_init << " = tensor.empty() : " << out_ty << "\n";
@@ -1291,6 +1517,9 @@ static void dispatch_graph_nodes(struct ggml_cgraph * gf, linalg_exporter & ex, 
                 break;
             case GGML_OP_GET_ROWS:
                 val = ex.emit_get_rows(node);
+                break;
+            case GGML_OP_CONCAT:
+                val = ex.emit_concat(node);
                 break;
             case GGML_OP_UNARY:
                 if (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU) {
@@ -1410,6 +1639,48 @@ static std::string build_func_text_baked(struct ggml_cgraph * gf, const char * f
     f << "    return " << ex.values.at(out) << " : " << mlir_tensor_type(out) << "\n";
     f << "  }\n";
 
+    return f.str();
+}
+
+// Multi-output variant: returns the given `outputs` in order (e.g. logits + per-layer k_new/v_new for
+// the KV-cache decode graph). MLIR's emit-c-interface appends the result out-params after the inputs,
+// so the ciface arg order is [runtime_args..., outputs...] (verified against the single-output case).
+static std::string build_func_text_baked_multi(struct ggml_cgraph * gf, const char * func_name,
+                                               const std::vector<const ggml_tensor *> & runtime_args,
+                                               const std::vector<const ggml_tensor *> & const_leafs,
+                                               const std::vector<const ggml_tensor *> & outputs) {
+    if (ggml_graph_n_nodes(gf) == 0) { fprintf(stderr, "mlir-export: graph has no nodes\n"); throw mlir_export_error("unsupported graph construct (see message above)"); }
+    if (runtime_args.empty())        { fprintf(stderr, "mlir-export: graph has no runtime input tensors\n"); throw mlir_export_error("unsupported graph construct (see message above)"); }
+    if (outputs.empty())             { fprintf(stderr, "mlir-export: no outputs given\n"); throw mlir_export_error("unsupported graph construct (see message above)"); }
+
+    linalg_exporter ex;
+    std::vector<std::string> arg_decls;
+    for (size_t i = 0; i < runtime_args.size(); i++) {
+        std::string arg = "%arg" + std::to_string(i);
+        ex.values[runtime_args[i]] = arg;
+        std::ostringstream decl; decl << arg << ": " << mlir_tensor_type(runtime_args[i]) << " {txe.name = \"input_" << i << "\"}";
+        arg_decls.push_back(decl.str());
+    }
+    for (const ggml_tensor * leaf : const_leafs) {
+        std::string id = ex.new_id();
+        ex.body << "    " << id << " = arith.constant " << mlir_dense_literal(leaf) << " : " << mlir_tensor_type(leaf) << "\n";
+        ex.values[leaf] = id;
+    }
+    struct ggml_tensor * ignored = nullptr;
+    dispatch_graph_nodes(gf, ex, ignored);
+
+    std::ostringstream f;
+    f << "  func.func @" << func_name << "(";
+    for (size_t i = 0; i < arg_decls.size(); i++) { if (i) f << ", "; f << arg_decls[i]; }
+    f << ") -> (";
+    for (size_t i = 0; i < outputs.size(); i++) { if (i) f << ", "; f << mlir_tensor_type(outputs[i]) << " {txe.name = \"res_" << i << "\"}"; }
+    f << ") attributes {llvm.emit_c_interface} {\n";
+    f << ex.body.str();
+    f << "    return ";
+    for (size_t i = 0; i < outputs.size(); i++) { if (i) f << ", "; f << ex.values.at(outputs[i]); }
+    f << " : ";
+    for (size_t i = 0; i < outputs.size(); i++) { if (i) f << ", "; f << mlir_tensor_type(outputs[i]); }
+    f << "\n  }\n";
     return f.str();
 }
 

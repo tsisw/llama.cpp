@@ -46,3 +46,15 @@ set_target_properties(ggml-tsavorite PROPERTIES
 )
 endif()
 
+# Standalone runner for the compiled KV-cache decode graph. Needs the TSI runtime (tsi_alloc, via
+# TLIBS) and, at run time, the compiled decode host.so. EXCLUDE_FROM_ALL so it never blocks the
+# package build - build on demand: cmake --build <dir> --target decode_run
+add_executable(decode_run EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/mlir-export/decode_run.cpp)
+target_include_directories(decode_run PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/mlir-export
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu)
+target_link_libraries(decode_run PRIVATE llama ggml-tsavorite ggml ggml-base ggml-cpu ${TLIBS} dl rt)
+target_compile_features(decode_run PRIVATE cxx_std_20)
+
