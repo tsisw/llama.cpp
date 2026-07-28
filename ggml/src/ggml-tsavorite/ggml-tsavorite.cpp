@@ -3401,13 +3401,11 @@ void _mlir_ciface_txe_mul_mat_tile_f32_k2048_host  (void *A_tile, void *B_tile, 
 #define TRITON_MATMUL_1X8_N_DIM     64
 
 struct triton_matmul_txe_shape_t {
-    const char *name;
     int64_t m_dim;
     int64_t n_dim;
 };
 
 static constexpr triton_matmul_txe_shape_t TRITON_MATMUL_SHAPE_1X8 = {
-    "1x8",
     TRITON_MATMUL_1X8_M_DIM,
     TRITON_MATMUL_1X8_N_DIM,
 };
@@ -3737,7 +3735,12 @@ static inline bool triton_matmul_should_use_small_n_transpose(
     int64_t M,
     int64_t N,
     int64_t K) {
-    if (!triton_matmul_small_n_transpose_opt) {
+    // Current PR scope: small-N transpose is implemented for the single-TXE
+    // path only. Keep the flag explicit for multi-TXE deployments so enabling
+    // triton_matmul_small_n_transpose_opt does not silently imply multi-TXE
+    // transpose support.
+    if (!triton_matmul_small_n_transpose_opt ||
+        (multi_thread_enable && num_of_txes > 1)) {
         return false;
     }
 
@@ -3761,8 +3764,8 @@ static inline bool triton_matmul_should_use_small_n_transpose(
     const int64_t swap_M_pad = tsi_round_up_i64(N, shape.m_dim);
     const int64_t swap_N_pad = tsi_round_up_i64(M, shape.n_dim);
 
-    const int64_t orig_elems = orig_M_pad * K + K * orig_N_pad + orig_M_pad * orig_N_pad;
-    const int64_t swap_elems = swap_M_pad * K + K * swap_N_pad + swap_M_pad * swap_N_pad;
+    const int64_t orig_elems = orig_M_pad * orig_N_pad * K;
+    const int64_t swap_elems = swap_M_pad * swap_N_pad * K;
 
     if (swap_elems >= orig_elems) {
         return false;
