@@ -3727,7 +3727,19 @@ static inline void init_scalar_i32_memref_aligned(
 }
 
 static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
-    return ((v + a - 1) / a) * a;
+    if (v <= 0 || a <= 0) {
+        return 0;
+    }
+
+    const unsigned __int128 uv = (unsigned __int128)(uint64_t)v;
+    const unsigned __int128 ua = (unsigned __int128)(uint64_t)a;
+    const unsigned __int128 rounded = ((uv + ua - 1) / ua) * ua;
+
+    if (rounded > (unsigned __int128)INT64_MAX) {
+        return INT64_MAX;
+    }
+
+    return (int64_t)rounded;
 }
 
 static inline bool triton_matmul_should_use_small_n_transpose(
@@ -3764,16 +3776,33 @@ static inline bool triton_matmul_should_use_small_n_transpose(
     const int64_t swap_M_pad = tsi_round_up_i64(N, shape.m_dim);
     const int64_t swap_N_pad = tsi_round_up_i64(M, shape.n_dim);
 
-    const int64_t orig_elems = orig_M_pad * orig_N_pad * K;
-    const int64_t swap_elems = swap_M_pad * swap_N_pad * K;
+    if (orig_M_pad == INT64_MAX || orig_N_pad == INT64_MAX ||
+        swap_M_pad == INT64_MAX || swap_N_pad == INT64_MAX) {
+        return false;
+    }
 
-    if (swap_elems >= orig_elems) {
+    const unsigned __int128 orig_work =
+        (unsigned __int128)(uint64_t)orig_M_pad *
+        (unsigned __int128)(uint64_t)orig_N_pad *
+        (unsigned __int128)(uint64_t)K;
+
+    const unsigned __int128 swap_work =
+        (unsigned __int128)(uint64_t)swap_M_pad *
+        (unsigned __int128)(uint64_t)swap_N_pad *
+        (unsigned __int128)(uint64_t)K;
+
+    if (orig_work > (unsigned __int128)INT64_MAX ||
+        swap_work > (unsigned __int128)INT64_MAX) {
+        return false;
+    }
+
+    if (swap_work >= orig_work) {
         return false;
     }
 
     // Use the transpose path only for clear small-N cases. This avoids changing
     // behavior for square matrices or cases where N is already large enough.
-    return (M >= 4 * N) || (N <= 8);
+    return (M / 4 >= N) || (N <= 8);
 }
 
 static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
