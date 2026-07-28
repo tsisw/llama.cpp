@@ -83,3 +83,35 @@ Expected tail:
 - Host-only CPU checks (no FPGA): build `ref_check` + `recon_cpu_check` and compare argmax
   (`ref_check <gguf> "<prompt>"` prints the ids + reference token; `recon_cpu_check <gguf> <ids…>`
   prints the reconstruction's argmax).
+
+---
+
+## KV-cache decode (fast multi-token)
+
+`wholegraph.sh --mode gen` recompiles per token (O(n²)). `decode.sh` is the fast path: it compiles
+**one** fixed-length decode graph and reuses it for every token, with the KV cache held on the host
+(each step's `k_new`/`v_new` are read back and appended). Design details are in the
+`WHOLEGRAPH-TSI-FLOW.md` doc (§13).
+
+`decode_run` + `decode.sh` are built and bundled into the `.tz` by the same package build, so on
+tsisim there's no extra build step — same deploy as above (untar, repoint symlink, `./ggml.sh`),
+then:
+
+```
+./decode.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" --gen 16 --verify
+```
+
+| flag | meaning |
+|---|---|
+| `-m` | model gguf path |
+| `-p` | prompt (tokenized by llama); or `--ids "id0 id1 …"` for raw token ids |
+| `--gen` | number of tokens to generate |
+| `--L` | cache cap (default `n_prompt + gen + 2`); must be ≥ prompt + gen |
+| `--verify` | also run a CPU prefill each step and diff the argmax |
+
+It prints the generated ids and the detokenized text; `--verify` adds a per-step `MATCH` line and a
+`compiled-decode vs prefill: k/k MATCH` tail. Use the 1.1B gguf for coherent text — `tinyllama-v0` is
+a toy model (the decode is numerically exact regardless).
+
+Host-only check (no FPGA): `decode_cpu_check <gguf> <ids…> --L <n>` runs the same fixed-L decode
+against a CPU prefill and prints the per-step MATCH.
