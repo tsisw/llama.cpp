@@ -1061,12 +1061,14 @@ update_one_tsavorite_deployment_yaml() {
   local txe_count="$2"
   local advanced_matmul_shape_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
+local user_dram_size_gb="1"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
   if [ -f "${deployment_yaml_path}" ]; then
     local existing_advanced
     local existing_small_n_opt
+local existing_user_dram_size_gb
 
     existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
     existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
@@ -1080,10 +1082,32 @@ update_one_tsavorite_deployment_yaml() {
     fi
   fi
 
-  cat > "${deployment_yaml_path}" <<EOF
+  
+existing_user_dram_size_gb="$(
+    awk -F: '
+    /^[[:space:]]*user_dram_size_gb[[:space:]]*:/ {
+        v=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+    }' "$deployment_yaml_path"
+)"
+
+if [ -n "$existing_user_dram_size_gb" ]; then
+    user_dram_size_gb="$existing_user_dram_size_gb"
+fi
+
+cat > "${deployment_yaml_path}" <<EOF
 # Tsavorite deployment config
 txe_count: ${txe_count}
 multi_thread_enable: true
+
+## Runtime user DRAM size in GiB.
+## Example: 1 = 1GB, 2 = 2GB.
+## If this key is missing, runtime DeviceConfig default is used.
+
+user_dram_size_gb: $user_dram_size_gb
+
 
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
 # false = old behavior
@@ -1207,6 +1231,13 @@ EOL
 # Tsavorite deployment config
 txe_count: 1
 multi_thread_enable: true
+
+## Runtime user DRAM size in GiB.
+## Example: 1 = 1GB, 2 = 2GB.
+## If this key is missing, runtime DeviceConfig default is used.
+
+user_dram_size_gb: 1
+
 
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
 # false = old behavior
