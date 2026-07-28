@@ -1032,6 +1032,7 @@ update_one_tsavorite_deployment_yaml() {
   local deployment_yaml_path="$1"
   local txe_count="$2"
   local advanced_matmul_shape_offload="false"
+  local triton_matmul_small_n_transpose_opt="false"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1049,6 +1050,20 @@ update_one_tsavorite_deployment_yaml() {
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
     fi
+
+    local existing_small_n_opt
+    existing_small_n_opt="$(awk -F: '
+      /^[[:space:]]*triton_matmul_small_n_transpose_opt[[:space:]]*:/ {
+        v=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    ' "${deployment_yaml_path}")"
+
+    if [ -n "${existing_small_n_opt}" ]; then
+      triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
+    fi
   fi
 
   cat > "${deployment_yaml_path}" <<EOF
@@ -1060,9 +1075,14 @@ multi_thread_enable: true
 # false = old behavior
 # true  = new offload shapes
 advanced_matmul_shape_offload: ${advanced_matmul_shape_offload}
+
+# Enable Triton MAT_MUL small-N transpose optimization.
+# false = old behavior
+# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
+triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
   return 0
 }
 
@@ -1178,9 +1198,14 @@ multi_thread_enable: true
 # false = old behavior
 # true  = new offload shapes
 advanced_matmul_shape_offload: false
+
+# Enable Triton MAT_MUL small-N transpose optimization.
+# false = old behavior
+# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
+triton_matmul_small_n_transpose_opt: false
 EOF
 
-  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false; ggml.sh updates txe_count and preserves advanced_matmul_shape_offload."
+  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false, triton_matmul_small_n_transpose_opt:false; ggml.sh updates txe_count and preserves both MAT_MUL flags."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 
