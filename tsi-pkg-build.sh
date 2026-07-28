@@ -1042,6 +1042,12 @@ update_one_tsavorite_deployment_yaml() {
       /^[[:space:]]*advanced_matmul_shape_offload[[:space:]]*:/ {
         v=$2
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        dq=sprintf("%c", 34)
+        sq=sprintf("%c", 39)
+        if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
+            (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
+          v = substr(v, 2, length(v) - 2)
+        }
         print v
         exit
       }
@@ -1056,6 +1062,12 @@ update_one_tsavorite_deployment_yaml() {
       /^[[:space:]]*triton_matmul_small_n_transpose_opt[[:space:]]*:/ {
         v=$2
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        dq=sprintf("%c", 34)
+        sq=sprintf("%c", 39)
+        if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
+            (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
+          v = substr(v, 2, length(v) - 2)
+        }
         print v
         exit
       }
