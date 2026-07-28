@@ -1028,26 +1028,55 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:$(pwd)
 
 TAOS_CONFIG_PATH="/etc/taos/taos.json"
 
+extract_deployment_yaml_value() {
+  local deployment_yaml_path="$1"
+  local yaml_key="$2"
+
+  awk -F: -v key="${yaml_key}" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
+      v=$2
+
+      # Remove an inline YAML comment before quote normalization.
+      sub(/[[:space:]]+#.*/, "", v)
+
+      # Trim whitespace.
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+
+      # Normalize matching single or double quotes.
+      dq=sprintf("%c", 34)
+      sq=sprintf("%c", 39)
+      if ((substr(v, 1, 1) == dq && substr(v, length(v), 1) == dq) ||
+          (substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)) {
+        v = substr(v, 2, length(v) - 2)
+      }
+
+      print v
+      exit
+    }
+  ' "${deployment_yaml_path}"
+}
+
 update_one_tsavorite_deployment_yaml() {
   local deployment_yaml_path="$1"
   local txe_count="$2"
   local advanced_matmul_shape_offload="false"
+  local triton_matmul_small_n_transpose_opt="false"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
   if [ -f "${deployment_yaml_path}" ]; then
     local existing_advanced
-    existing_advanced="$(awk -F: '
-      /^[[:space:]]*advanced_matmul_shape_offload[[:space:]]*:/ {
-        v=$2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-        print v
-        exit
-      }
-    ' "${deployment_yaml_path}")"
+    local existing_small_n_opt
+
+    existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
+    existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
+    fi
+
+    if [ -n "${existing_small_n_opt}" ]; then
+      triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
     fi
   fi
 
@@ -1060,9 +1089,14 @@ multi_thread_enable: true
 # false = old behavior
 # true  = new offload shapes
 advanced_matmul_shape_offload: ${advanced_matmul_shape_offload}
+
+# Enable Triton MAT_MUL small-N transpose optimization.
+# false = old behavior
+# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
+triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
   return 0
 }
 
@@ -1178,9 +1212,14 @@ multi_thread_enable: true
 # false = old behavior
 # true  = new offload shapes
 advanced_matmul_shape_offload: false
+
+# Enable Triton MAT_MUL small-N transpose optimization.
+# false = old behavior
+# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
+triton_matmul_small_n_transpose_opt: false
 EOF
 
-  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false; ggml.sh updates txe_count and preserves advanced_matmul_shape_offload."
+  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false, triton_matmul_small_n_transpose_opt:false; ggml.sh updates txe_count and preserves both MAT_MUL flags."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 

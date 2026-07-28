@@ -110,6 +110,7 @@ struct TsavoriteRuntimeState {
 #if TRITON_MAT_MUL
     void **loadResult_matmul = nullptr;
     bool advanced_matmul_shape_offload = false;
+    bool triton_matmul_small_n_transpose_opt = false;
 #endif
 
     // blob lifetime state machine
@@ -160,6 +161,7 @@ auto &loadResult_rms_norm     = g_rt.loadResult_rms_norm;
 #if TRITON_MAT_MUL
 auto &loadResult_matmul       = g_rt.loadResult_matmul;
 auto &advanced_matmul_shape_offload = g_rt.advanced_matmul_shape_offload;
+auto &triton_matmul_small_n_transpose_opt = g_rt.triton_matmul_small_n_transpose_opt;
 #endif
 } // anonymous namespace
 
@@ -254,6 +256,8 @@ struct tsi_deploy_cfg_t {
 #if TRITON_MAT_MUL
     bool advanced_matmul_shape_offload = false;
     bool has_advanced_matmul_shape_offload = false;
+    bool triton_matmul_small_n_transpose_opt = false;
+    bool has_triton_matmul_small_n_transpose_opt = false;
 #endif
 };
 
@@ -313,6 +317,14 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
             if (tsi_parse_bool_after_colon(t, &b)) {
                 cfg.advanced_matmul_shape_offload = b;
                 cfg.has_advanced_matmul_shape_offload = true;
+            }
+        }
+        if (t.find("triton_matmul_small_n_transpose_opt") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            bool b = false;
+            if (tsi_parse_bool_after_colon(t, &b)) {
+                cfg.triton_matmul_small_n_transpose_opt = b;
+                cfg.has_triton_matmul_small_n_transpose_opt = true;
             }
         }
 #endif
@@ -1452,6 +1464,10 @@ static void ensure_tsi_runtime_initialized() {
         cfg.has_advanced_matmul_shape_offload ?
         cfg.advanced_matmul_shape_offload :
         false;
+    triton_matmul_small_n_transpose_opt =
+        cfg.has_triton_matmul_small_n_transpose_opt ?
+        cfg.triton_matmul_small_n_transpose_opt :
+        false;
 #endif
 
     printf("\n TSI deploy yaml=%s txe_count=%u multi_thread_enable=%d",
@@ -1462,6 +1478,8 @@ static void ensure_tsi_runtime_initialized() {
 #if TRITON_MAT_MUL
     printf(" advanced_matmul_shape_offload=%d",
            (int)advanced_matmul_shape_offload);
+    printf(" triton_matmul_small_n_transpose_opt=%d",
+           (int)triton_matmul_small_n_transpose_opt);
 #endif
 
     printf("\n");
@@ -3362,9 +3380,35 @@ void _mlir_ciface_txe_mul_mat_tile_f32_k2048_host  (void *A_tile, void *B_tile, 
 
 #if TRITON_MAT_MUL
 
-// TXE Shape specific
+// TXE shape descriptor for Triton MAT_MUL.
+//
+// Current PR scope:
+//   - Uses only the 1x8 TXE shape.
+//   - 1x8 requires M to be aligned to 8 rows and N to be aligned to 64 columns.
+//   - When triton_matmul_small_n_transpose_opt is enabled, we may compute the
+//     mathematically equivalent transposed problem for M >> N:
+//       original: C[M,N] = A[K,M] x B[K,N]
+//       swapped : T[N,M] = B[K,N] x A[K,M], then copy back C[m,n] = T[n,m]
+//
+// Future extension:
+//   - Add another descriptor such as TRITON_MATMUL_SHAPE_2X4 when the 2x4 blob
+//     is introduced.
+//   - Reuse the same padding-cost heuristic and transpose decision logic by
+//     passing that shape descriptor instead of hard-coding dimensions.
+//   - The packing/copyback logic can stay common as long as the selected blob
+//     uses the same flattened A[M,K], B[K,N], C[M,N] contract.
 #define TRITON_MATMUL_1X8_M_DIM      8
 #define TRITON_MATMUL_1X8_N_DIM     64
+
+struct triton_matmul_txe_shape_t {
+    int64_t m_dim;
+    int64_t n_dim;
+};
+
+static constexpr triton_matmul_txe_shape_t TRITON_MATMUL_SHAPE_1X8 = {
+    TRITON_MATMUL_1X8_M_DIM,
+    TRITON_MATMUL_1X8_N_DIM,
+};
 
 
 // Data type specific
@@ -3683,7 +3727,82 @@ static inline void init_scalar_i32_memref_aligned(
 }
 
 static inline int64_t tsi_round_up_i64(int64_t v, int64_t a) {
-    return ((v + a - 1) / a) * a;
+    if (v <= 0 || a <= 0) {
+        return 0;
+    }
+
+    const unsigned __int128 uv = (unsigned __int128)(uint64_t)v;
+    const unsigned __int128 ua = (unsigned __int128)(uint64_t)a;
+    const unsigned __int128 rounded = ((uv + ua - 1) / ua) * ua;
+
+    if (rounded > (unsigned __int128)INT64_MAX) {
+        return INT64_MAX;
+    }
+
+    return (int64_t)rounded;
+}
+
+static inline bool triton_matmul_should_use_small_n_transpose(
+    const triton_matmul_txe_shape_t &shape,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+    // Current PR scope: small-N transpose is implemented for the single-TXE
+    // path only. Keep the flag explicit for multi-TXE deployments so enabling
+    // triton_matmul_small_n_transpose_opt does not silently imply multi-TXE
+    // transpose support.
+    if (!triton_matmul_small_n_transpose_opt ||
+        (multi_thread_enable && num_of_txes > 1)) {
+        return false;
+    }
+
+    if (M <= 0 || N <= 0 || K <= 0) {
+        return false;
+    }
+
+    if (shape.m_dim <= 0 || shape.n_dim <= 0) {
+        return false;
+    }
+
+    if (N >= M) {
+        return false;
+    }
+
+    // Estimate total physical work for the selected TXE shape.
+    // This is intentionally shape-driven so the same decision path can be reused
+    // when a 2x4 shape is added in a later PR.
+    const int64_t orig_M_pad = tsi_round_up_i64(M, shape.m_dim);
+    const int64_t orig_N_pad = tsi_round_up_i64(N, shape.n_dim);
+    const int64_t swap_M_pad = tsi_round_up_i64(N, shape.m_dim);
+    const int64_t swap_N_pad = tsi_round_up_i64(M, shape.n_dim);
+
+    if (orig_M_pad == INT64_MAX || orig_N_pad == INT64_MAX ||
+        swap_M_pad == INT64_MAX || swap_N_pad == INT64_MAX) {
+        return false;
+    }
+
+    const unsigned __int128 orig_work =
+        (unsigned __int128)(uint64_t)orig_M_pad *
+        (unsigned __int128)(uint64_t)orig_N_pad *
+        (unsigned __int128)(uint64_t)K;
+
+    const unsigned __int128 swap_work =
+        (unsigned __int128)(uint64_t)swap_M_pad *
+        (unsigned __int128)(uint64_t)swap_N_pad *
+        (unsigned __int128)(uint64_t)K;
+
+    if (orig_work > (unsigned __int128)INT64_MAX ||
+        swap_work > (unsigned __int128)INT64_MAX) {
+        return false;
+    }
+
+    if (swap_work >= orig_work) {
+        return false;
+    }
+
+    // Use the transpose path only for clear small-N cases. This avoids changing
+    // behavior for square matrices or cases where N is already large enough.
+    return (M / 4 >= N) || (N <= 8);
 }
 
 static float *g_triton_A_full = nullptr; // [M_cap x K_cap]
@@ -4242,15 +4361,33 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     // ============================================================
     // Single-TXE / generated-host-wrapper path.
     //
-    // Note:
-    //   This path calls the generated wrapper. It does not expose tsi_wait()
-    //   directly, so the wrapper elapsed time is recorded as Launch_ms.
-    //   Multi-TXE manual path below gives true tsi_wait() timing.
+    // Current shape bucket:
+    //   TRITON_MATMUL_SHAPE_1X8
+    //
+    // Optional small-N transpose optimization:
+    //   Original: C[M,N] = A[K,M] x B[K,N]
+    //   Swapped : T[N,M] = B[K,N] x A[K,M], then copy back C[m,n] = T[n,m]
+    //
+    // Why this helps for 1x8:
+    //   The 1x8 blob pads N to 64 columns. For decode-style N=1 or small N,
+    //   running the original orientation can waste many padded columns. The
+    //   swapped orientation can reduce padded work when M is much larger than N.
+    //
+    // Future 2x4 extension:
+    //   Keep this shape-bucket pattern. Select TRITON_MATMUL_SHAPE_2X4 in the
+    //   future 2x4 path, then call the same transpose heuristic with that shape.
     // ============================================================
     if (!multi_thread_enable || num_of_txes <= 1) {
-        const int64_t M_pad = ((M + 7) / 8) * 8;
+        const triton_matmul_txe_shape_t &txe_shape = TRITON_MATMUL_SHAPE_1X8;
+        const bool use_small_n_transpose =
+            triton_matmul_should_use_small_n_transpose(txe_shape, M, N, K);
 
-        ensure_triton_full_buffers(M_pad, N_pad, K);
+        const int64_t M_work = use_small_n_transpose ? N : M;
+        const int64_t N_work = use_small_n_transpose ? M : N;
+        const int64_t M_pad = tsi_round_up_i64(M_work, txe_shape.m_dim);
+        const int64_t N_work_pad = tsi_round_up_i64(N_work, txe_shape.n_dim);
+
+        ensure_triton_full_buffers(M_pad, N_work_pad, K);
 
         for (int64_t d3 = 0; d3 < D3; ++d3) {
             for (int64_t d2 = 0; d2 < D2; ++d2) {
@@ -4268,36 +4405,59 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 profile.padding_memset_us += tsavorite_elapsed_us(t0);
 
                 t0 = tsavorite_now_us();
-                for (int64_t r = 0; r < M; ++r) {
-                    const char *row = A_ptr + r * a_nb1;
-                    float *dst = g_triton_A_full + r * K;
+                if (use_small_n_transpose) {
+                    for (int64_t r = 0; r < N; ++r) {
+                        const char *row = B_ptr + r * b_nb1;
+                        float *dst = g_triton_A_full + r * K;
 
-                    if (a_nb0 == sizeof(float)) {
-                        memcpy(dst, row, (size_t)K * sizeof(float));
-                    } else {
                         for (int64_t k = 0; k < K; ++k) {
-                            dst[k] = *(float *)(row + k * a_nb0);
+                            dst[k] = *(const float *)(row + k * b_nb0);
+                        }
+                    }
+                } else {
+                    for (int64_t r = 0; r < M; ++r) {
+                        const char *row = A_ptr + r * a_nb1;
+                        float *dst = g_triton_A_full + r * K;
+
+                        if (a_nb0 == sizeof(float)) {
+                            memcpy(dst, row, (size_t)K * sizeof(float));
+                        } else {
+                            for (int64_t k = 0; k < K; ++k) {
+                                dst[k] = *(const float *)(row + k * a_nb0);
+                            }
                         }
                     }
                 }
                 profile.pack_a_us += tsavorite_elapsed_us(t0);
 
                 t0 = tsavorite_now_us();
-                memset(g_triton_B_full, 0, (size_t)K * (size_t)N_pad * sizeof(float));
+                memset(g_triton_B_full, 0, (size_t)K * (size_t)N_work_pad * sizeof(float));
                 profile.padding_memset_us += tsavorite_elapsed_us(t0);
 
                 t0 = tsavorite_now_us();
-                for (int64_t c = 0; c < N; ++c) {
-                    const char *col = B_ptr + c * b_nb1;
-                    for (int64_t k = 0; k < K; ++k) {
-                        g_triton_B_full[k * N_pad + c] =
-                            *(float *)(col + k * b_nb0);
+                if (use_small_n_transpose) {
+                    for (int64_t c = 0; c < M; ++c) {
+                        const char *col = A_ptr + c * a_nb1;
+
+                        for (int64_t k = 0; k < K; ++k) {
+                            g_triton_B_full[k * N_work_pad + c] =
+                                *(const float *)(col + k * a_nb0);
+                        }
+                    }
+                } else {
+                    for (int64_t c = 0; c < N; ++c) {
+                        const char *col = B_ptr + c * b_nb1;
+
+                        for (int64_t k = 0; k < K; ++k) {
+                            g_triton_B_full[k * N_work_pad + c] =
+                                *(const float *)(col + k * b_nb0);
+                        }
                     }
                 }
                 profile.pack_b_us += tsavorite_elapsed_us(t0);
 
                 t0 = tsavorite_now_us();
-                memset(g_triton_C_full, 0, (size_t)M_pad * (size_t)N_pad * sizeof(float));
+                memset(g_triton_C_full, 0, (size_t)M_pad * (size_t)N_work_pad * sizeof(float));
                 profile.padding_memset_us += tsavorite_elapsed_us(t0);
 
                 t0 = tsavorite_now_us();
@@ -4306,7 +4466,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     g_triton_B_full,
                     g_triton_C_full,
                     (int32_t)M_pad,
-                    (int32_t)N_pad,
+                    (int32_t)N_work_pad,
                     (int32_t)K);
                 profile.launch_us += tsavorite_elapsed_us(t0);
 
@@ -4315,10 +4475,19 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 }
 
                 t0 = tsavorite_now_us();
-                for (int64_t r = 0; r < M; ++r) {
-                    for (int64_t c = 0; c < N; ++c) {
-                        *(float *)(C_ptr + r * c_nb0 + c * c_nb1) =
-                            g_triton_C_full[r * N_pad + c];
+                if (use_small_n_transpose) {
+                    for (int64_t r = 0; r < M; ++r) {
+                        for (int64_t c = 0; c < N; ++c) {
+                            *(float *)(C_ptr + r * c_nb0 + c * c_nb1) =
+                                g_triton_C_full[c * N_work_pad + r];
+                        }
+                    }
+                } else {
+                    for (int64_t r = 0; r < M; ++r) {
+                        for (int64_t c = 0; c < N; ++c) {
+                            *(float *)(C_ptr + r * c_nb0 + c * c_nb1) =
+                                g_triton_C_full[r * N_work_pad + c];
+                        }
                     }
                 }
                 profile.copyback_us += tsavorite_elapsed_us(t0);

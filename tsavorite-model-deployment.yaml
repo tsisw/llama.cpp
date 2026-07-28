@@ -6,3 +6,8 @@ multi_thread_enable: false
 # false = old behavior
 # true  = new offload shapes
 advanced_matmul_shape_offload: false
+
+# Enable Triton MAT_MUL small-N transpose optimization.
+# false = old behavior
+# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
+triton_matmul_small_n_transpose_opt: false
