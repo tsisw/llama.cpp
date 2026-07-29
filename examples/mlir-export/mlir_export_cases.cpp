@@ -89,12 +89,56 @@ static ggml_tensor * build_add(ggml_context * ctx, std::vector<const ggml_tensor
     return ggml_add(ctx, a, b);
 }
 
+static ggml_tensor * build_mul(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_set_name(a, "a");
+    ggml_set_name(b, "b");
+    args.push_back(a);
+    args.push_back(b);
+    return ggml_mul(ctx, a, b);
+}
+
+static ggml_tensor * build_scale(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_set_name(a, "a");
+    args.push_back(a);
+    return ggml_scale(ctx, a, 0.5f);   // scalar is baked into the graph, not a func arg
+}
+
+static ggml_tensor * build_silu(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    ggml_set_name(a, "a");
+    args.push_back(a);
+    return ggml_silu(ctx, a);          // GGML_OP_UNARY / GGML_UNARY_OP_SILU
+}
+
+// RMS_NORM normalizes over ne[0], so use 2-D input to exercise a real reduction per row.
+static ggml_tensor * build_rms_norm(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+    ggml_set_name(a, "a");
+    args.push_back(a);
+    return ggml_rms_norm(ctx, a, 1e-5f);
+}
+
+static ggml_tensor * build_soft_max(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8);
+    ggml_set_name(a, "a");
+    args.push_back(a);
+    return ggml_soft_max(ctx, a);
+}
+
 static const case_spec CASES[] = {
     { "add",          build_add, 0.0f, 0.0f, "pass",     false },
     // Proves the comparison in test_mlir_export.py actually compares. If a harness bug made the
     // check vacuous, every other case would still pass and this one would too - so this must fail
     // to match, by construction.
     { "add_negative", build_add, 0.0f, 0.0f, "mismatch", true  },
+    { "mul",          build_mul,      0.0f,  0.0f,  "pass", false },
+    { "scale",        build_scale,    0.0f,  0.0f,  "pass", false },
+    { "silu",         build_silu,     1e-5f, 1e-6f, "pass", false },
+    { "rms_norm",     build_rms_norm, 1e-5f, 1e-6f, "pass", false },
+    { "soft_max",     build_soft_max, 1e-5f, 1e-6f, "pass", false },
 };
 
 static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);
