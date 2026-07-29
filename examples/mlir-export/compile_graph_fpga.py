@@ -19,10 +19,11 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 try:
-    from tsi_mlir.ir import Module
     from tsavorite.compiler_config import TXECompilerConfig
-    from tsavorite.txe_backend.txe_backend import TXEBackend
+    from tsi_raw_backend import RawGraphBackend
 except ImportError as e:
     print(
         f"error: {e}\nRun with a venv that has the mlir_external_packages wheel "
@@ -30,13 +31,6 @@ except ImportError as e:
         file=sys.stderr,
     )
     sys.exit(1)
-
-
-class RawGraphBackend(TXEBackend):
-    """The model is already whole-graph linalg MLIR text; parse it into the txe context."""
-
-    def convert_to_linalg(self, model, input_types, *, func_name=None, log_dir=None, verbose=False, **kwargs):
-        return Module.parse(model)
 
 
 def _default_fpga_config():
