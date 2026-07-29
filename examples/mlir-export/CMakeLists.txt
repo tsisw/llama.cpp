@@ -19,6 +19,63 @@
 
 set(TSI_MLIR_EXPORT_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
+set(MLIR_COMPILER_DIR "$ENV{HOME}/repo/mlir-compiler" CACHE PATH
+    "TSI mlir-compiler checkout; supplies both the MLIR C++ libraries and the venv used by the tests")
+
+# ---------------------------------------------------------------------------------------------
+# MLIR C++ libraries, from mlir-compiler's own LLVM (22.0.0git) - never a system or Homebrew LLVM,
+# which would be a different version and would not match the compiler consuming our output.
+#
+# Two constraints, both verified rather than assumed:
+#   * The enclosing project MUST enable C. find_package(MLIR) -> LLVMConfig -> FindLibEdit runs a C
+#     check_include_file, which errors out in a CXX-only project. llama.cpp's top-level
+#     project("llama.cpp" C CXX) satisfies this.
+#   * Do NOT include(HandleLLVMOptions). It would add -fno-exceptions (their LLVM is built with
+#     LLVM_ENABLE_EH=OFF) and break `throw mlir_export_error`. Include dirs plus link libs is all
+#     that is needed; exceptions then work fine against those static libs.
+# ---------------------------------------------------------------------------------------------
+if (NOT MLIR_DIR)
+    # A build tree, not an install tree. Also accept an install prefix layout.
+    foreach (candidate "${MLIR_COMPILER_DIR}/build/_deps/llvm-build/lib/cmake/mlir"
+                       "${MLIR_COMPILER_DIR}/install/lib/cmake/mlir")
+        if (EXISTS "${candidate}/MLIRConfig.cmake")
+            set(MLIR_DIR "${candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+find_package(MLIR CONFIG)
+
+if (MLIR_FOUND)
+    message(STATUS "mlir-export: MLIR ${LLVM_PACKAGE_VERSION} from ${MLIR_DIR}")
+
+    # Only the dialects the exporter builds, not all 412 static libs.
+    add_library(tsi-mlir-export STATIC
+        src/export/Builder.cpp
+        src/export/Exporter.cpp
+        src/export/GraphWalk.cpp
+        src/export/OpsElementwise.cpp
+        src/export/OpsNorm.cpp
+        src/export/OpsMatmul.cpp
+        src/export/OpsShape.cpp
+        src/export/OpsRope.cpp
+    )
+    target_include_directories(tsi-mlir-export
+        PUBLIC  "${TSI_MLIR_EXPORT_INCLUDE}"
+        PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    target_link_libraries(tsi-mlir-export PRIVATE
+        ggml MLIRIR MLIRParser MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
+        MLIRArithDialect MLIRMathDialect MLIRSupport)
+    # C++17 to match the standard their LLVM was built with. Consumers stay at C++20; they only see
+    # the MLIR-free public header.
+    target_compile_features(tsi-mlir-export PRIVATE cxx_std_17)
+else()
+    message(STATUS "mlir-export: MLIR not found (looked under ${MLIR_COMPILER_DIR}); "
+                   "the exporter library will not be built. Configure with -DMLIR_DIR=<path to "
+                   "lib/cmake/mlir> or -DMLIR_COMPILER_DIR=<mlir-compiler checkout> to enable.")
+endif()
+
 add_executable(recon_cpu_check tools/recon-cpu-check/recon_cpu_check.cpp)
 target_include_directories(recon_cpu_check PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
 target_link_libraries(recon_cpu_check PRIVATE ggml)
@@ -39,6 +96,13 @@ add_executable(mlir-export-cases tools/mlir-export-cases/mlir_export_cases.cpp)
 target_include_directories(mlir-export-cases PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
 target_link_libraries(mlir-export-cases PRIVATE ggml)
 target_compile_features(mlir-export-cases PRIVATE cxx_std_20)
+
+# TRANSITIONAL: while both emitters exist, the generator can produce IR from either, so each ported
+# family is diffable against the golden IR before the default flips.
+if (MLIR_FOUND)
+    target_link_libraries(mlir-export-cases PRIVATE tsi-mlir-export)
+    target_compile_definitions(mlir-export-cases PRIVATE TSI_HAVE_MLIR_EXPORT=1)
+endif()
 
 # ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at
 # line 303 only when LLAMA_BUILD_TESTS=ON - without this guard, configuring with

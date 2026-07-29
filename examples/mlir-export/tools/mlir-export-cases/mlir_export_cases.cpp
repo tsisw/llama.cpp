@@ -11,6 +11,10 @@
 //   mlir-export-cases --emit-all <dir>
 #include "tsi/export/TextEmitter.h"
 
+#if TSI_HAVE_MLIR_EXPORT
+#    include "tsi/export/Exporter.h"
+#endif
+
 #include "ggml.h"
 #include "ggml-cpu.h"
 
@@ -388,6 +392,37 @@ static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);
 // emit
 // ---------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------
+// emitter selection (TRANSITIONAL)
+// ---------------------------------------------------------------------------------------
+// The string emitter (TextEmitter.h) is being replaced by the MLIR C++ API one (Exporter.h).
+// While the port is in progress both are reachable, so each ported family can be diffed against
+// the committed golden IR without leaving the default emitter broken. Once every emitter is
+// ported this flag, the text emitter, and this shim all go away.
+enum class emitter_kind { text, mlir };
+
+static emitter_kind g_emitter = emitter_kind::text;
+
+static std::string emit_forward_mlir(ggml_cgraph * gf, const std::vector<const ggml_tensor *> & args) {
+    if (g_emitter == emitter_kind::text) {
+        return "module {\n" + build_func_text_baked(gf, "forward", args, {}) + "}\n";
+    }
+#if TSI_HAVE_MLIR_EXPORT
+    tsi::mlir_export::ExportOptions opts;
+    opts.runtime_args = args;
+    try {
+        return tsi::mlir_export::exportGraph(gf, opts);
+    } catch (const tsi::mlir_export::mlir_export_error & e) {
+        // Re-thrown as the text emitter's type so emit_case has one exception type to handle for
+        // as long as both emitters coexist.
+        throw mlir_export_error(e.what());
+    }
+#else
+    fprintf(stderr, "--emitter mlir needs the tsi-mlir-export library; configure with MLIR available\n");
+    exit(2);
+#endif
+}
+
 static bool emit_case(const case_spec & spec, const fs::path & dir) {
     fs::create_directories(dir);
 
@@ -425,7 +460,7 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
     std::string expect = spec.expect;
     std::string mlir;
     try {
-        mlir = "module {\n" + build_func_text_baked(gf, "forward", args, {}) + "}\n";
+        mlir = emit_forward_mlir(gf, args);
     } catch (const mlir_export_error & e) {
         // Exporter gap: record it so the runner xfails with a reason instead of the build breaking.
         fprintf(stderr, "%s: exporter rejected the graph: %s\n", spec.name, e.what());
@@ -478,6 +513,18 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
 }
 
 int main(int argc, char ** argv) {
+    // Optional leading "--emitter text|mlir", stripped before the normal argument handling below.
+    if (argc >= 3 && strcmp(argv[1], "--emitter") == 0) {
+        if (strcmp(argv[2], "mlir") == 0) {
+            g_emitter = emitter_kind::mlir;
+        } else if (strcmp(argv[2], "text") != 0) {
+            fprintf(stderr, "unknown --emitter '%s' (expected text or mlir)\n", argv[2]);
+            return 2;
+        }
+        argv += 2;
+        argc -= 2;
+    }
+
     if (argc >= 2 && strcmp(argv[1], "--list") == 0) {
         for (size_t i = 0; i < N_CASES; i++) printf("%s\n", CASES[i].name);
         return 0;
