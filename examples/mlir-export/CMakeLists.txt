@@ -50,23 +50,49 @@ find_package(MLIR CONFIG)
 if (MLIR_FOUND)
     message(STATUS "mlir-export: MLIR ${LLVM_PACKAGE_VERSION} from ${MLIR_DIR}")
 
+    list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}" "${LLVM_CMAKE_DIR}")
+    include(TableGen)
+    include(AddLLVM)
+    include(AddMLIR)
+
+    # tablegen() derives its -I flags from DIRECTORY-scope include_directories, not from target
+    # properties. Setting these only per-target makes .td files fail with
+    # "could not find include file 'mlir/IR/OpBase.td'".
+    include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+
+    # --- the ggml dialect ---------------------------------------------------------------------
+    set(LLVM_TARGET_DEFINITIONS src/dialect/GgmlOps.td)
+    mlir_tablegen(GgmlOps.h.inc -gen-op-decls)
+    mlir_tablegen(GgmlOps.cpp.inc -gen-op-defs)
+    mlir_tablegen(GgmlOpsDialect.h.inc -gen-dialect-decls -dialect=ggml)
+    mlir_tablegen(GgmlOpsDialect.cpp.inc -gen-dialect-defs -dialect=ggml)
+    add_public_tablegen_target(TsiGgmlOpsIncGen)
+
     # Only the dialects the exporter builds, not all 412 static libs.
     add_library(tsi-mlir-export STATIC
+        src/dialect/GgmlDialect.cpp
+        src/import/Importer.cpp
+        src/convert/GgmlToLinalg.cpp
+        src/convert/PatternSupport.cpp
+        src/convert/PatternsElementwise.cpp
+        src/convert/PatternsTodo.cpp
         src/export/Builder.cpp
         src/export/Exporter.cpp
         src/export/GraphWalk.cpp
-        src/export/OpsElementwise.cpp
-        src/export/OpsNorm.cpp
-        src/export/OpsMatmul.cpp
-        src/export/OpsShape.cpp
-        src/export/OpsRope.cpp
     )
+    add_dependencies(tsi-mlir-export TsiGgmlOpsIncGen)
     target_include_directories(tsi-mlir-export
         PUBLIC  "${TSI_MLIR_EXPORT_INCLUDE}"
-        PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/dialect"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/export"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/import"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/convert"
+                "${CMAKE_CURRENT_BINARY_DIR}"          # generated .inc files land here
+                ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
     target_link_libraries(tsi-mlir-export PRIVATE
         ggml MLIRIR MLIRParser MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
-        MLIRArithDialect MLIRMathDialect MLIRSupport)
+        MLIRArithDialect MLIRMathDialect MLIRSupport
+        MLIRPass MLIRTransforms MLIRTransformUtils)
     # C++17 to match the standard their LLVM was built with. Consumers stay at C++20; they only see
     # the MLIR-free public header.
     target_compile_features(tsi-mlir-export PRIVATE cxx_std_17)

@@ -52,6 +52,71 @@ Every row was measured on this machine, not assumed.
 | fpga build fails loudly with an explanatory CMake warning | User accepted broken paths. Silently dropping documented on-board capture is worse than a clear error |
 | Golden IR diff before deleting the text emitter | 8 of 22 emitters have coverage. Without goldens, "tests pass" would not justify deletion |
 
+## Amendment: a `ggml` MLIR dialect
+
+Direction changed after the elementwise family landed. Instead of building linalg directly from the
+ggml graph, the exporter now runs in two stages:
+
+```
+ggml_cgraph -> [import] -> `ggml` dialect module -> [convert-ggml-to-linalg] -> linalg -> print
+```
+
+I argued against this on the grounds that ggml graphs arrive fully specialized (static shapes, no
+control flow, one block, already sorted) so there is little for a source-level dialect to enable,
+and that TableGen is a real cost. That was overruled; this records what the dialect buys and what it
+costs, and the design proceeds with it.
+
+What it genuinely improves:
+
+| Gain | Detail |
+|---|---|
+| Per-op lowering tests | `tsi-ggml-opt --convert-ggml-to-linalg %s \| FileCheck %s`, the native idiom, instead of end-to-end pytest goldens |
+| Better home for constraints | ggml's own invariants (mul_mat operand compatibility, concat dim range) become ODS verifiers. Our *lowering's* limits (rank <= 3, `mode == NORMAL`, `freq_scale == 1`) become pattern match failures. Today both are the same scattered `if (...) unsupported(...)` |
+| Separable failure modes | The intermediate is dumpable, so "did we read the graph right" and "did we lower it right" stop being one question |
+| Shape normalization as passes | GQA head repeat, size-1 permute collapse and rank dispatch can become canonicalizations rather than branches inside emitters |
+
+Costs accepted: `mlir-tblgen` becomes a build-time dependency of llama.cpp, and the shape math
+(ne reversal, GQA grouping, rope pair interleaving, reassociation indices) is relocated rather than
+reduced.
+
+### Additional established facts
+
+| Fact | Value | How established |
+|---|---|---|
+| `mlir-tblgen`, `FileCheck`, `llvm-lit`, `mlir-opt`, `count`, `not` | all present in mlir-compiler's LLVM build | direct check |
+| `MLIROptLib`, `MLIRPass`, `MLIRTransforms`, `MLIRTransformUtils` | present | direct check |
+| TableGen from a downstream CMake project | works | probe generated all four `.inc` files and linked |
+| `include(TableGen)`/`include(AddLLVM)`/`include(AddMLIR)` | do NOT break exceptions | probe throws and catches after including all three |
+| `mlir_tablegen` include paths | needs **directory-scope** `include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})`; target-scope is not enough | probe failed with "could not find include file 'mlir/IR/OpBase.td'" until moved |
+| Dialect header needs | `Bytecode/BytecodeOpInterface.h`, `IR/BuiltinAttributes.h`, `IR/BuiltinTypes.h`, `IR/Dialect.h`, `IR/OpDefinition.h`, `IR/OpImplementation.h`, `Interfaces/SideEffectInterfaces.h` | probe, one error at a time |
+| Dialect implementation needs | `IR/Builders.h` | probe |
+
+### Dialect scope
+
+Thirteen ops mirroring the op switch: `add`, `mul`, `scale`, `silu`, `rms_norm`, `soft_max`,
+`mul_mat`, `rope`, `permute`, `reshape`, `cont`, `get_rows`, `concat`. `reshape` and `cont` stay
+distinct so the import is faithful to ggml even though both lower through one pattern.
+
+**Shape convention.** Dialect ops carry MLIR-ordered tensor types (ggml `ne` reversed), reversed once
+at import, so a single convention holds across the whole pipeline and the existing goldens stay
+valid. Attributes that *name* dimensions (`permute` axes, `concat` dim) stay in ggml dim space,
+verbatim from `op_params`; translating them to MLIR dims is part of the lowering, which is where
+that logic belongs anyway.
+
+The dialect lives entirely under `src/dialect/`, not `include/`, so the public header stays
+MLIR-free.
+
+### Revised file layout
+
+| Path | Contents |
+|---|---|
+| `src/dialect/` | `GgmlOps.td`, `GgmlDialect.h`, `GgmlDialect.cpp` |
+| `src/import/` | `Importer.cpp`: ggml_cgraph -> ggml dialect |
+| `src/convert/` | `GgmlToLinalg.cpp` (the pass) plus `Patterns*.cpp`, one per op family |
+| `src/Exporter.cpp` | orchestrates import, convert, verify, print |
+| `tools/tsi-ggml-opt/` | `mlir-opt`-style driver registering the dialect and pass, for lit tests |
+| `tests/lit/` | per-op FileCheck tests |
+
 ## Architecture
 
 ### Public API

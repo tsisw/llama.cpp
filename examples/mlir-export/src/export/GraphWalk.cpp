@@ -1,4 +1,4 @@
-// Leaf discovery and the ggml-op -> emitter dispatch.
+// Leaf discovery. The ggml-op dispatch now lives in the importer (src/import/Importer.cpp).
 #include "Builder.h"
 
 #include <map>
@@ -28,41 +28,6 @@ std::vector<const ggml_tensor *> discoverLeafs(ggml_cgraph * gf) {
         }
     }
     return leafs;
-}
-
-Value GraphBuilder::emitNode(const ggml_tensor * node) {
-    switch (node->op) {
-        case GGML_OP_MUL_MAT:
-            return emitMulMat(node);
-        case GGML_OP_ADD:
-            return emitAdd(node);
-        case GGML_OP_MUL:
-            return emitMul(node);
-        case GGML_OP_SCALE:
-            return emitScale(node);
-        case GGML_OP_RMS_NORM:
-            return emitRmsNorm(node);
-        case GGML_OP_SOFT_MAX:
-            return emitSoftMax(node);
-        case GGML_OP_ROPE:
-            return emitRope(node);
-        case GGML_OP_PERMUTE:
-            return emitPermute(node);
-        case GGML_OP_RESHAPE:
-        case GGML_OP_CONT:
-            return emitReshapeLike(node, node->src[0]);
-        case GGML_OP_GET_ROWS:
-            return emitGetRows(node);
-        case GGML_OP_CONCAT:
-            return emitConcat(node);
-        case GGML_OP_UNARY:
-            if (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU) {
-                return emitSilu(node);
-            }
-            unsupported("unsupported unary op: %s", ggml_unary_op_name(ggml_get_unary_op(node)));
-        default:
-            unsupported("unsupported op: %s", ggml_op_name(node->op));
-    }
 }
 
 }  // namespace tsi::mlir_export
