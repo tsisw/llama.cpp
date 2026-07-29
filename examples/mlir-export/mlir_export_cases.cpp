@@ -128,6 +128,34 @@ static ggml_tensor * build_soft_max(ggml_context * ctx, std::vector<const ggml_t
     return ggml_soft_max(ctx, a);
 }
 
+// ggml_mul_mat(a,b) requires a->ne[0] == b->ne[0] (= K) and yields ne = (a->ne[1], b->ne[1]).
+// In MLIR shape order that is a -> [M,K], b -> [N,K], out -> [N,M], computed as B @ A^T (see
+// emit_mul_mat_2d in exporter.h). K is a multiple of 32 for TMU K-alignment (TMU_K_MULTIPLE).
+static ggml_tensor * build_matmul(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    const int K = 32, M = 32, N = 32;
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);   // MLIR [M,K]
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);   // MLIR [N,K]
+    ggml_set_name(a, "a");
+    ggml_set_name(b, "b");
+    args.push_back(a);
+    args.push_back(b);
+    return ggml_mul_mat(ctx, a, b);                                  // ne (M,N) -> MLIR [N,M]
+}
+
+static ggml_tensor * build_matmul_add(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    const int K = 32, M = 32, N = 32;
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);   // matches mul_mat's ne
+    ggml_set_name(a, "a");
+    ggml_set_name(b, "b");
+    ggml_set_name(c, "c");
+    args.push_back(a);
+    args.push_back(b);
+    args.push_back(c);
+    return ggml_add(ctx, ggml_mul_mat(ctx, a, b), c);
+}
+
 static const case_spec CASES[] = {
     { "add",          build_add, 0.0f, 0.0f, "pass",     false },
     // Proves the comparison in test_mlir_export.py actually compares. If a harness bug made the
@@ -139,6 +167,10 @@ static const case_spec CASES[] = {
     { "silu",         build_silu,     1e-5f, 1e-6f, "pass", false },
     { "rms_norm",     build_rms_norm, 1e-5f, 1e-6f, "pass", false },
     { "soft_max",     build_soft_max, 1e-5f, 1e-6f, "pass", false },
+    // atol 1e-5, not 1e-6: a 32x32x32 f32 matmul measures max abs err ~5.7e-06 from reduction
+    // reassociation in the lowered code. Measured, not guessed.
+    { "matmul",       build_matmul,     1e-5f, 1e-5f, "pass", false },
+    { "matmul_add",   build_matmul_add, 1e-5f, 1e-5f, "pass", false },
 };
 
 static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);
