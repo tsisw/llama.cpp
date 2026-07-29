@@ -11,8 +11,11 @@
 #include <cstring>
 #include <limits>
 
-#ifdef GGML_USE_TSAVORITE
-// Whole-graph interception, defined in the ggml-tsavorite backend (tsi_wholegraph.cpp / .h).
+#if defined(LLAMA_TSI_MLIR_EXPORT) || defined(GGML_USE_TSAVORITE)
+// Whole-graph interception. Defined in examples/mlir-export/src/llama/WholeGraphHook.cpp, which is
+// host-buildable: it needs the MLIR exporter and the TSI runtime shim, not the tsavorite backend.
+// That is what lets `llama-cli` alone capture/compile/run the whole forward, with no wrapper script.
+#  define LLAMA_HAS_TSI_WHOLEGRAPH 1
 void tsi_wholegraph_maybe_capture(struct ggml_cgraph * cgraph);
 bool tsi_wholegraph_maybe_run(struct ggml_cgraph * cgraph);
 extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
@@ -1473,13 +1476,14 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
-#ifdef GGML_USE_TSAVORITE
+#ifdef LLAMA_HAS_TSI_WHOLEGRAPH
     // gf is the full forward graph before the scheduler splits it across backends, the only place
     // the whole forward is visible. Capture/dump here, and install the weight-capture callback that
     // the reconstruction depends on.
     tsi_wholegraph_maybe_capture(gf);
-    if (getenv("TSI_WHOLEGRAPH"))
+    if (getenv("TSI_WHOLEGRAPH")) {
         ggml_backend_sched_set_eval_callback(sched.get(), tsi_wholegraph_eval_cb, nullptr);
+    }
 #endif
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
@@ -1502,7 +1506,7 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-#ifdef GGML_USE_TSAVORITE
+#ifdef LLAMA_HAS_TSI_WHOLEGRAPH
     // after the per-op pass: run/verify the compiled whole-graph forward against gf's output
     tsi_wholegraph_maybe_run(gf);
 #endif

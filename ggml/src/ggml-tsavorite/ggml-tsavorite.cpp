@@ -22,7 +22,7 @@
 #include <signal.h>
 
 #include "ggml-tsavorite.h"
-#include "tsi_wholegraph.h"
+#include "tsi/llama/WholeGraphHook.h"
 #include <unistd.h>
 #include <inttypes.h>
 #include <math.h>

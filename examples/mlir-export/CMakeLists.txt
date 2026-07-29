@@ -107,6 +107,49 @@ if (MLIR_FOUND)
     # the MLIR-free public header.
     target_compile_features(tsi-mlir-export PRIVATE cxx_std_17)
 
+    # ---------------------------------------------------------------------------------------------
+    # Whole-graph interception hooked straight into llama_context, so `llama-cli` alone does
+    # capture/compile/run with no wrapper scripts.
+    #
+    # This needs the TSI runtime shim, because the compiled host.o is an ORCHESTRATION program: it
+    # calls tsi_initialize/tsi_alloc/tsi_copy/tsi_load_blob/tsi_launch_blob/tsi_wait rather than
+    # computing anything itself. That is true for the FFM target too - FFM only changes where the
+    # kernels live (host txe_blob_*.o instead of TXE .blob), not the host API.
+    #
+    # The shim is built by mlir-compiler's setup_runtime() into _deps/runtime-build, NOT build/lib.
+    # ---------------------------------------------------------------------------------------------
+    set(TSI_RT_INCLUDE_DIR "${MLIR_COMPILER_DIR}/third-party/runtime/include/tsi-rt/shim")
+    set(TSI_RT_LIB_DIR     "${MLIR_COMPILER_DIR}/build/_deps/runtime-build/lib")
+    find_library(TSI_RT_SHIM_LIB NAMES TsavRTShimCAPI PATHS "${TSI_RT_LIB_DIR}" NO_DEFAULT_PATH)
+
+    if (TSI_RT_SHIM_LIB AND EXISTS "${TSI_RT_INCLUDE_DIR}/HostShimCAPI.h" AND TARGET llama)
+        message(STATUS "mlir-export: TSI runtime shim ${TSI_RT_SHIM_LIB}")
+        add_library(tsi-llama-hook STATIC src/llama/WholeGraphHook.cpp)
+        add_dependencies(tsi-llama-hook TsiGgmlOpsIncGen)
+        target_include_directories(tsi-llama-hook PRIVATE
+            "${TSI_MLIR_EXPORT_INCLUDE}"
+            "${TSI_RT_INCLUDE_DIR}"                                  # bare "HostShimCAPI.h"
+            "${MLIR_COMPILER_DIR}/third-party/runtime/include"       # its own "tsi-rt/..." includes
+            "${MLIR_COMPILER_DIR}/build/_deps/runtime-build/include" # generated runtime headers
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-tsavorite/include"   # TestModel.h
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src"
+            ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+        target_link_libraries(tsi-llama-hook PUBLIC tsi-mlir-export ggml "${TSI_RT_SHIM_LIB}")
+        target_link_directories(tsi-llama-hook PUBLIC "${TSI_RT_LIB_DIR}")
+        target_compile_features(tsi-llama-hook PRIVATE cxx_std_20)
+        set_target_properties(tsi-llama-hook PROPERTIES BUILD_RPATH "${TSI_RT_LIB_DIR}")
+
+        # Turn the hooks on inside libllama and link them in. Set from here rather than src/ because
+        # the exporter targets only exist once this directory has been processed; CMake evaluates
+        # target properties at generate time, so ordering is fine.
+        target_compile_definitions(llama PRIVATE LLAMA_TSI_MLIR_EXPORT=1)
+        target_link_libraries(llama PRIVATE tsi-llama-hook)
+        set_property(TARGET llama APPEND PROPERTY BUILD_RPATH "${TSI_RT_LIB_DIR}")
+    else()
+        message(STATUS "mlir-export: TSI runtime shim not found under ${TSI_RT_LIB_DIR}; "
+                       "llama-cli whole-graph interception disabled (export library still built)")
+    endif()
+
     # --- tsi-ggml-opt: mlir-opt-style driver, for per-op FileCheck tests -----------------------
     add_executable(tsi-ggml-opt tools/tsi-ggml-opt/tsi-ggml-opt.cpp)
     add_dependencies(tsi-ggml-opt TsiGgmlOpsIncGen)

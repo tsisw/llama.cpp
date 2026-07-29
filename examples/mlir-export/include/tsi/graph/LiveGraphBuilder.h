@@ -171,7 +171,28 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
             REAL_ROPE.ext_factor, REAL_ROPE.attn_factor, REAL_ROPE.beta_fast, REAL_ROPE.beta_slow,
             REAL_ROPE.n_ctx_orig, REAL_KQ_SCALE);
 
-    size_t ctx_size = (size_t) 256 << 20;   // activations + ids/pos/mask + weight copies
+    // The reconstruction copies EVERY weight into a fresh contiguous tensor, so the context has to
+    // hold the whole model plus activations. A fixed 256 MB was enough for the toy tinyllama-v0 but
+    // aborts on a real 1.1B f32 model (4.4 GB of weights) with
+    // "ggml.c: GGML_ASSERT(obj_new) failed" - so size it from the live graph instead of guessing.
+    size_t weight_bytes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
+        ggml_tensor * nd = ggml_graph_node(live, i);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            ggml_tensor * sc = nd->src[s];
+            if (sc && sc->op == GGML_OP_NONE && sc->data) {
+                weight_bytes += ggml_nbytes(sc);
+            }
+        }
+    }
+    // x2 for activations and the per-tensor object/padding overhead, floor at 256 MB for tiny models.
+    size_t ctx_size = std::max((size_t) 256 << 20, weight_bytes * 2 + ((size_t) 64 << 20));
+    if (const char * env = getenv("TSI_WG_CTX_MB")) {
+        ctx_size = (size_t) atoll(env) << 20;
+    }
+    fprintf(stderr, "[tsi-wholegraph] reconstruction ctx: %.2f GiB (weights seen %.2f GiB)\n",
+            (double) ctx_size / (1024.0 * 1024.0 * 1024.0),
+            (double) weight_bytes / (1024.0 * 1024.0 * 1024.0));
     struct ggml_init_params params { /*.mem_size =*/ ctx_size, /*.mem_buffer =*/ NULL, /*.no_alloc =*/ false };
 
     case_result r;

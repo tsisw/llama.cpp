@@ -1,4 +1,5 @@
-// Whole-graph interception for the ggml-tsavorite backend.
+// Whole-graph interception, hooked directly into llama_context::graph_compute().
+// Host-buildable: needs the MLIR exporter and the TSI runtime shim, NOT the tsavorite backend.
 //
 // Hooks the forward cgraph llama.cpp builds and, depending on $TSI_WHOLEGRAPH:
 //   capture  export the whole forward as one MLIR `func @forward` to $TSI_WG_DIR/forward.mlir

@@ -1,9 +1,9 @@
-// Whole-graph interception for the ggml-tsavorite backend. See tsi_wholegraph.h.
-#include "tsi_wholegraph.h"
+// Whole-graph interception hooked into llama_context. See WholeGraphHook.h.
+#include "tsi/llama/WholeGraphHook.h"
 
 #include "tsi/export/Exporter.h"                 // exportGraph, discoverLeafs, mlir_export_error
 #include "tsi/graph/LiveGraphBuilder.h"       // build_cachefree_from_live (Approach B2)
-#include "include/TestModel.h"        // MemRefDescriptor<N>, tsi_alloc (via HostShimCAPI.h)
+#include "TestModel.h"                // MemRefDescriptor<N>, tsi_alloc (via HostShimCAPI.h)
 #include "ggml-cpu.h"                 // ggml_graph_compute_with_ctx (reconstruction CPU reference)
 
 #include <dlfcn.h>
@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
