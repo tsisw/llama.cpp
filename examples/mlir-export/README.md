@@ -170,7 +170,9 @@ succeeds. Two non-obvious build rules, both learned the hard way:
 - Never `include(HandleLLVMOptions)`. It adds `-fno-exceptions`, and the exporter throws.
 
 `mlir_tablegen` also takes its `-I` flags from *directory-scope* `include_directories`, not target
-properties.
+properties. And `find_package(MLIR ...)` is called with `NO_DEFAULT_PATH`: without it, an
+unresolvable `MLIR_DIR` is ignored and CMake falls back to its default search paths, which on a
+machine with Homebrew LLVM silently builds against MLIR 17.
 
 The fpga/aarch64 target **cannot** link this, since MLIR is host-only here. That is accepted; the
 tsavorite CMakeLists emits a warning naming the reason rather than leaving a bare linker error.
@@ -186,10 +188,13 @@ model file and no hardware.
 ctest --test-dir build -L mlir-export --output-on-failure
 ```
 
-Two tests. `mlir-export-suite` compiles and runs every case and compares numerics.
-`mlir-export-golden` compares the emitted linalg against committed golden IR, compiles nothing, and
-runs in under a second. Keeping them separate means a numeric regression and an IR change are
-distinguishable.
+Three tests, deliberately separate so a failure names its own cause:
+
+| Test | What it proves | Needs | Time |
+|---|---|---|---|
+| `mlir-export-suite` | the compiled graph matches ggml numerically | TSI compiler venv | ~17 s |
+| `mlir-export-golden` | the emitted linalg is structurally unchanged | venv (parse only) | ~0.4 s |
+| `mlir-export-lit` | each ggml op lowers to the expected linalg | `llvm-lit`, `FileCheck` | ~0.2 s |
 
 `MLIR_COMPILER_DIR` defaults to `~/repo/mlir-compiler`; point it elsewhere with
 `cmake -B build -DMLIR_COMPILER_DIR=<path>`. If its `venv/bin/python` is missing the suite reports
@@ -221,6 +226,27 @@ for d in /tmp/c/*/; do cp "$d/forward.mlir" tests/golden/"$(basename $d)".mlir; 
 ```
 
 Only do that when you intend the IR to change, and review the diff.
+
+### Per-op lowering tests (lit + FileCheck)
+
+`tests/lit/` checks what a single ggml op lowers to, which the end-to-end suite cannot say without
+running a whole graph through the TSI compiler. No Python, no compiler, milliseconds.
+
+```
+./build/bin/tsi-ggml-opt --convert-ggml-to-linalg tests/lit/matmul.mlir
+```
+
+Run the suite by hand:
+
+```
+TSI_LIT_TOOLS_DIR=$PWD/build/bin \
+TSI_LIT_LLVM_TOOLS_DIR=~/repo/mlir-compiler/build/_deps/llvm-build/bin \
+  ~/repo/mlir-compiler/build/_deps/llvm-build/bin/llvm-lit -sv examples/mlir-export/tests/lit
+```
+
+`errors.mlir` is the interesting one. It pins down *which layer* rejects what: a violated ggml
+invariant must fail in the dialect verifier, and a limit of our lowering must fail as `failed to
+legalize operation 'ggml.<op>'`. If those ever swap places, the separation between the two has broken.
 
 ### Two stages, each runnable alone
 

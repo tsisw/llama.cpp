@@ -46,7 +46,13 @@ if (NOT MLIR_DIR)
     endforeach()
 endif()
 
-find_package(MLIR CONFIG)
+# NO_DEFAULT_PATH is load-bearing, not defensive tidiness. A plain find_package(MLIR CONFIG) ignores
+# an MLIR_DIR that does not resolve and falls back to CMake's default search paths, which on a machine
+# with Homebrew LLVM installed silently finds MLIR 17 and builds the exporter against a different
+# MLIR version than the compiler that consumes its output. Only ever look where we were pointed.
+if (MLIR_DIR AND EXISTS "${MLIR_DIR}/MLIRConfig.cmake")
+    find_package(MLIR REQUIRED CONFIG NO_DEFAULT_PATH PATHS "${MLIR_DIR}")
+endif()
 
 if (MLIR_FOUND)
     message(STATUS "mlir-export: MLIR ${LLVM_PACKAGE_VERSION} from ${MLIR_DIR}")
@@ -100,6 +106,21 @@ if (MLIR_FOUND)
     # C++17 to match the standard their LLVM was built with. Consumers stay at C++20; they only see
     # the MLIR-free public header.
     target_compile_features(tsi-mlir-export PRIVATE cxx_std_17)
+
+    # --- tsi-ggml-opt: mlir-opt-style driver, for per-op FileCheck tests -----------------------
+    add_executable(tsi-ggml-opt tools/tsi-ggml-opt/tsi-ggml-opt.cpp)
+    add_dependencies(tsi-ggml-opt TsiGgmlOpsIncGen)
+    target_include_directories(tsi-ggml-opt PRIVATE
+        "${TSI_MLIR_EXPORT_INCLUDE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/dialect"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/convert"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    # ggml only for its headers: Exporter.h declares ggml types in its signatures.
+    target_link_libraries(tsi-ggml-opt PRIVATE tsi-mlir-export ggml MLIROptLib MLIRIR MLIRParser MLIRPass
+        MLIRTransforms MLIRSupport MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
+        MLIRArithDialect MLIRMathDialect)
+    target_compile_features(tsi-ggml-opt PRIVATE cxx_std_17)
 else()
     message(STATUS "mlir-export: MLIR not found (looked under ${MLIR_COMPILER_DIR}); "
                    "the exporter library will not be built. Configure with -DMLIR_DIR=<path to "
@@ -178,4 +199,24 @@ if (BUILD_TESTING)
         set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export"
                              SKIP_REGULAR_EXPRESSION "SKIPPED")
     endif()
+
+    # Per-op lowering tests: tsi-ggml-opt --convert-ggml-to-linalg | FileCheck. No Python and no TSI
+    # compiler involved, so this is independent of the venv and registered separately from the two
+    # tests above. llvm-lit and FileCheck come from the same LLVM build as MLIR.
+    if (TARGET tsi-ggml-opt AND EXISTS "${LLVM_TOOLS_BINARY_DIR}/llvm-lit"
+                            AND EXISTS "${LLVM_TOOLS_BINARY_DIR}/FileCheck")
+        add_test(NAME mlir-export-lit
+                 COMMAND "${LLVM_TOOLS_BINARY_DIR}/llvm-lit" -sv "${CMAKE_CURRENT_SOURCE_DIR}/tests/lit")
+        set_tests_properties(mlir-export-lit PROPERTIES
+            LABELS "mlir-export" TIMEOUT 300
+            ENVIRONMENT "TSI_LIT_TOOLS_DIR=${CMAKE_BINARY_DIR}/bin;TSI_LIT_LLVM_TOOLS_DIR=${LLVM_TOOLS_BINARY_DIR};TSI_LIT_EXEC_ROOT=${CMAKE_CURRENT_BINARY_DIR}/lit-output")
+    else()
+        message(STATUS "mlir-export: tsi-ggml-opt, llvm-lit or FileCheck unavailable; "
+                       "mlir-export-lit will skip")
+        add_test(NAME mlir-export-lit COMMAND ${CMAKE_COMMAND} -E echo
+                 "SKIPPED: tsi-ggml-opt, llvm-lit or FileCheck not available")
+        set_tests_properties(mlir-export-lit PROPERTIES LABELS "mlir-export"
+                             SKIP_REGULAR_EXPRESSION "SKIPPED")
+    endif()
+
 endif()
