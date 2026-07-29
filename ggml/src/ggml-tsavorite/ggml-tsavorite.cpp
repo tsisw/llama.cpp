@@ -48,6 +48,13 @@
 #include "tsi-rt/queues/Command.h"
 #include "HostShimCAPI.h"
 #include "tsi-rt/utils/Profiler.h"
+#ifdef GGML_TARGET_POSIX
+#include "device/posix/PosixSimDeviceConfig.h"
+using TsavoriteDeviceConfig = tsi::runtime::PosixDeviceConfig;
+#else
+#include "device/fpga/FPGADeviceConfig.h"
+using TsavoriteDeviceConfig = tsi::runtime::FPGADeviceConfig;
+#endif
 
 #include <thread>
 #include <vector>
@@ -253,6 +260,9 @@ struct tsi_deploy_cfg_t {
     bool mt_enable = false;
     bool has_mt    = false;
 
+    int  user_dram_size_gb = -1;
+    bool has_user_dram_size_gb = false;
+
 #if TRITON_MAT_MUL
     bool advanced_matmul_shape_offload = false;
     bool has_advanced_matmul_shape_offload = false;
@@ -310,6 +320,20 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
             if (tsi_parse_bool_after_colon(t, &b)) { cfg.mt_enable = b; cfg.has_mt = true; }
         }
 
+        const size_t user_dram_colon = t.find(':');
+
+        if (user_dram_colon != std::string::npos &&
+            tsi_trim_copy(t.substr(0, user_dram_colon)) == "user_dram_size_gb") {
+
+            const int v = tsi_parse_int_after_colon(t);
+
+            if (v > 0) {
+                cfg.user_dram_size_gb = v;
+                cfg.has_user_dram_size_gb = true;
+            }
+        }
+
+
 #if TRITON_MAT_MUL
         if (t.find("advanced_matmul_shape_offload") != std::string::npos &&
             t.find(':') != std::string::npos) {
@@ -355,6 +379,27 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
 
     if (txes_count > 0 && cfg.txe_count <= 0) cfg.txe_count = txes_count;
     return cfg;
+}
+
+static inline size_t tsi_user_dram_size_bytes_from_cfg(const tsi_deploy_cfg_t &cfg) {
+    if (!cfg.has_user_dram_size_gb || cfg.user_dram_size_gb <= 0) {
+        fprintf(stderr,
+               "WARNING: user_dram_size_gb=%d is invalid. Using runtime default DRAM size.\n",
+                                                                              cfg.user_dram_size_gb);
+        return 0;
+    }
+
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t gb = static_cast<uint64_t>(cfg.user_dram_size_gb);
+
+    if (gb > static_cast<uint64_t>(SIZE_MAX) / gib) {
+        fprintf(stderr,
+                "ERROR: user_dram_size_gb=%d is too large for size_t\n",
+                cfg.user_dram_size_gb);
+        abort();
+    }
+
+    return static_cast<size_t>(gb * gib);
 }
 
 // ============================================================================
@@ -1359,7 +1404,7 @@ static inline void tsi_init_per_txe_state_once() {
         scalar_grid3_args.assign(num_of_txes, nullptr);
         for (uint32_t i = 0; i < num_of_txes; ++i) {
             if (!packed_args[i]) {
-                packed_args[i] = tsi_alloc(kPackedArgsBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                packed_args[i] = tsi_alloc(kPackedArgsBytesMax);
                 if (!packed_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for packed_args[%u]\n", i);
                     abort();
@@ -1367,14 +1412,14 @@ static inline void tsi_init_per_txe_state_once() {
             }
 
             if (!scalar_loop_args[i]) {
-                scalar_loop_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_loop_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_loop_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_loop_args[%u]\n", i);
                     abort();
                 }
             }
             if (!scalar_m_args[i]) {
-                scalar_m_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_m_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_m_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_m_args[%u]\n", i);
                     abort();
@@ -1382,7 +1427,7 @@ static inline void tsi_init_per_txe_state_once() {
             }
 
             if (!scalar_n_args[i]) {
-                scalar_n_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_n_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_n_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_n_args[%u]\n", i);
                     abort();
@@ -1390,7 +1435,7 @@ static inline void tsi_init_per_txe_state_once() {
             }
 
             if (!scalar_k_args[i]) {
-                scalar_k_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_k_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_k_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_k_args[%u]\n", i);
                     abort();
@@ -1399,21 +1444,21 @@ static inline void tsi_init_per_txe_state_once() {
 
 
             if (!scalar_grid1_args[i]) {
-                scalar_grid1_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_grid1_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_grid1_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_grid1_args[%u]\n", i);
                     abort();
                 }
             }
             if (!scalar_grid2_args[i]) {
-                scalar_grid2_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_grid2_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_grid2_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_grid2_args[%u]\n", i);
                     abort();
                 }
             }
             if (!scalar_grid3_args[i]) {
-                scalar_grid3_args[i] = tsi_alloc(scalarLoopBytesMax, tsi::MemorySpace::SHARED_DRAM_TS);
+                scalar_grid3_args[i] = tsi_alloc(scalarLoopBytesMax);
                 if (!scalar_grid3_args[i]) {
                     fprintf(stderr, "tsi_alloc failed for scalar_grid3_args[%u]\n", i);
                     abort();
@@ -1425,12 +1470,12 @@ static inline void tsi_init_per_txe_state_once() {
 
 // Centralized TSI runtime initialization - called once globally
 //
-
 static void ensure_tsi_runtime_initialized() {
     if (runtime_initialized) {
         GGML_TSAVORITE_LOG_INFO("\n tsavorite backend already initialized \n");
         return;
     }
+
     tsi_blob_free_tables();
 
     std::string mainProfilerName = "OPU ";
@@ -1470,10 +1515,28 @@ static void ensure_tsi_runtime_initialized() {
         false;
 #endif
 
+    static TsavoriteDeviceConfig deviceConfig{};
+    const size_t requested_user_dram_size =
+        tsi_user_dram_size_bytes_from_cfg(cfg);
+
+    TsavoriteDeviceConfig *deviceConfigPtr = NULL;
+    if (requested_user_dram_size > 0) {
+        deviceConfig.setUserDRAMSize(requested_user_dram_size);
+        deviceConfigPtr = &deviceConfig;
+    }
+
     printf("\n TSI deploy yaml=%s txe_count=%u multi_thread_enable=%d",
            yaml_path.c_str(),
            (unsigned)num_of_txes,
            (int)multi_thread_enable);
+
+    if (requested_user_dram_size > 0) {
+        printf(" user_dram_size_gb=%d user_dram_size_bytes=%zu",
+               cfg.user_dram_size_gb,
+               requested_user_dram_size);
+    } else {
+        printf(" user_dram_size_gb=default");
+    }
 
 #if TRITON_MAT_MUL
     printf(" advanced_matmul_shape_offload=%d",
@@ -1484,7 +1547,7 @@ static void ensure_tsi_runtime_initialized() {
 
     printf("\n");
 
-    tsi_initialize(num_of_txes, NULL);
+    tsi_initialize(num_of_txes, deviceConfigPtr);
     tsavorite_install_signal_handlers();
 
     if (multi_thread_enable) {
@@ -1503,6 +1566,7 @@ static void ensure_tsi_runtime_initialized() {
         tsi_finalize();
         abort();
     }
+
     workers.reserve(num_of_txes);
     runtime_initialized = true;
 

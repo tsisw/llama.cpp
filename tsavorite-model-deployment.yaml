@@ -2,6 +2,22 @@
 txe_count: 1
 multi_thread_enable: false
 
+## Runtime user DRAM size in GiB.
+##
+## Typical requirements:
+##   - Small models may work with lower memory allocations.
+##   - Llama 3.2 1B was observed to require ~1.8 GB with 20 TXEs.
+##   - For general use, 4 GB is a reasonable starting point.
+##   - Larger models may require significantly more memory (for example, 12 GB to 24 GB).
+##
+## If this key is omitted, the runtime DeviceConfig default memory size is used.
+##
+## Examples:
+##   user_dram_size_gb: 4
+##   user_dram_size_gb: 12
+##   user_dram_size_gb: 24
+user_dram_size_gb: 4
+
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
 # false = old behavior
 # true  = new offload shapes
