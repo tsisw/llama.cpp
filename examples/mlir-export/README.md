@@ -241,7 +241,7 @@ Compilation runs with `log_mlir=True`, so every lowering stage (`linalg.mlir`, `
 
 ### Adding a case
 
-One `build_fn` plus one `CASES` entry in `mlir_export_cases.cpp`. No Python change — the case
+One `build_fn` plus one `CASES` entry in `tests/test-mlir-export-cases.cpp`. No Python change — the case
 directory is the interface. Inputs are filled from a fixed `mt19937` seed and the reference is
 computed with `ggml_graph_compute_with_ctx(ctx, gf, 1)`, so cases are bit-for-bit reproducible.
 

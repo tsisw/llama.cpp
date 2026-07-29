@@ -129,7 +129,9 @@ endif()
 # the rest of the suite rather than under tools/, since it is test scaffolding and not a usable tool.
 # Links ggml ONLY (not llama), same reason as the checks above: in a TSI build linking llama/ggml
 # pulls in libggml-tsavorite and the link fails.
-add_executable(test-mlir-export-cases tests/mlir_export_cases.cpp)
+# Filename stem matches the target, the same way upstream tests/ derives targets with
+# get_filename_component(... NAME_WE).
+add_executable(test-mlir-export-cases tests/test-mlir-export-cases.cpp)
 target_include_directories(test-mlir-export-cases PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
 target_link_libraries(test-mlir-export-cases PRIVATE ggml)
 target_compile_features(test-mlir-export-cases PRIVATE cxx_std_20)
