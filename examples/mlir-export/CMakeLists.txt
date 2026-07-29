@@ -44,6 +44,15 @@ if (BUILD_TESTING)
                          --cases-bin "$<TARGET_FILE:mlir-export-cases>"
                          --target ffm)
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export" TIMEOUT 1800)
+
+        # Structural check against committed golden IR. Compiles nothing, so it is seconds rather
+        # than minutes, and it is what protects the emitters whose numerics are insensitive to a
+        # structural change. Separate test so a numeric failure and an IR change are distinguishable.
+        add_test(NAME mlir-export-golden
+                 COMMAND "${TSI_VENV_PYTHON}" -m pytest -v
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ir_golden.py"
+                         --cases-bin "$<TARGET_FILE:mlir-export-cases>")
+        set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export" TIMEOUT 600)
     else()
         # Never a hard error: a plain host build must not start requiring the compiler repo.
         message(STATUS "mlir-export: ${TSI_VENV_PYTHON} not found; mlir-export-suite will skip "
@@ -51,6 +60,10 @@ if (BUILD_TESTING)
         add_test(NAME mlir-export-suite COMMAND ${CMAKE_COMMAND} -E echo
                  "SKIPPED: mlir-compiler venv not found at ${TSI_VENV_PYTHON}")
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export"
+                             SKIP_REGULAR_EXPRESSION "SKIPPED")
+        add_test(NAME mlir-export-golden COMMAND ${CMAKE_COMMAND} -E echo
+                 "SKIPPED: mlir-compiler venv not found at ${TSI_VENV_PYTHON}")
+        set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export"
                              SKIP_REGULAR_EXPRESSION "SKIPPED")
     endif()
 endif()
