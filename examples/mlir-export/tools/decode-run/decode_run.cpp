@@ -6,7 +6,7 @@
 //
 // Usage: decode_run <model.gguf> {--lib host.so | --emit forward.mlir} {--prompt "text" | id0 [ids...]} [--L N] [--gen N] [--verify]
 #include "tsi/graph/DecodeModel.h"          // load_decode_model, build_decode, DecodeModel
-#include "tsi/export/TextEmitter.h"              // discover_leafs
+#include "tsi/export/Exporter.h"              // exportGraph, discoverLeafs
 #include "include/TestModel.h"     // MemRefDescriptor<N>, tsi_alloc, tsi_dealloc
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -124,7 +124,7 @@ int main(int argc, char ** argv) {
     // outputs in the order the emitter uses: [logits, k_new0, v_new0, k_new1, v_new1, ...]
     std::vector<ggml_tensor *> outs; outs.push_back(logits);
     for (int il = 0; il < M.n_layers; il++) { outs.push_back(knew[il]); outs.push_back(vnew[il]); }
-    auto leafs = discover_leafs(gf);
+    auto leafs = tsi::mlir_export::discoverLeafs(gf);
     fprintf(stderr, "graph: leafs=%zu outputs=%zu\n", leafs.size(), outs.size());
 
     // handle only for a clean finalize: the runtime is already up (llama_backend_init), and
@@ -134,8 +134,11 @@ int main(int argc, char ** argv) {
     // --emit: write this graph as the multi-output MLIR func (same leaf order as the run below)
     if (emit) {
         std::vector<const ggml_tensor *> co(outs.begin(), outs.end());
-        std::string txt = build_func_text_baked_multi(gf, "forward", leafs, {}, co);
-        std::ofstream f(emit); f << "module {\n" << txt << "}\n";
+        tsi::mlir_export::ExportOptions opts;
+        opts.runtime_args = leafs;
+        opts.outputs      = co;
+        // exportGraph returns a complete module, so no wrapping here any more.
+        std::ofstream f(emit); f << tsi::mlir_export::exportGraph(gf, opts);
         fprintf(stderr, "emitted decode graph: L=%d leafs=%zu outputs=%zu -> %s\n", L, leafs.size(), outs.size(), emit);
         if (!lib) { ggml_free(dc); ggml_free(M.wc); llama_model_free(lmodel); ggml_backend_free(tsi_be); return 0; }
     }

@@ -78,7 +78,7 @@ if (MLIR_FOUND)
         src/convert/PatternsNorm.cpp
         src/convert/PatternsMatmul.cpp
         src/convert/PatternsShape.cpp
-        src/convert/PatternsTodo.cpp
+        src/convert/PatternsRope.cpp
         src/export/Builder.cpp
         src/export/Exporter.cpp
         src/export/GraphWalk.cpp
@@ -118,6 +118,10 @@ add_executable(decode_cpu_check tools/decode-cpu-check/decode_cpu_check.cpp)
 target_include_directories(decode_cpu_check PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
 target_link_libraries(decode_cpu_check PRIVATE ggml)
 target_compile_features(decode_cpu_check PRIVATE cxx_std_20)
+# --emit writes a forward.mlir, so this needs the exporter.
+if (MLIR_FOUND)
+    target_link_libraries(decode_cpu_check PRIVATE tsi-mlir-export)
+endif()
 
 # Case generator for the export test suite. Links ggml ONLY (not llama), same reason as the
 # checks above: in a TSI build linking llama/ggml pulls in libggml-tsavorite and the link fails.
@@ -126,11 +130,9 @@ target_include_directories(mlir-export-cases PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}
 target_link_libraries(mlir-export-cases PRIVATE ggml)
 target_compile_features(mlir-export-cases PRIVATE cxx_std_20)
 
-# TRANSITIONAL: while both emitters exist, the generator can produce IR from either, so each ported
-# family is diffable against the golden IR before the default flips.
+# The generator needs the exporter library; without MLIR there is no exporter, so it is skipped.
 if (MLIR_FOUND)
     target_link_libraries(mlir-export-cases PRIVATE tsi-mlir-export)
-    target_compile_definitions(mlir-export-cases PRIVATE TSI_HAVE_MLIR_EXPORT=1)
 endif()
 
 # ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at

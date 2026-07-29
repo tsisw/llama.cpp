@@ -9,7 +9,7 @@
 // Weights come from g_wcap (captured while llama computed, see tsi_wholegraph.cpp); the prompt
 // tokens, positions and rope/softmax params come from the live graph, so the reconstruction can be
 // diffed against llama's own per-op logits.
-#include "tsi/export/TextEmitter.h"      // case_result, discover_leafs, build_func_text_baked, mlir_export_error
+#include "tsi/export/Exporter.h"      // exportGraph, discoverLeafs, mlir_export_error
 #include "tsi/graph/ModelLayer.h"   // build_layer, LayerW, REAL_RMS_EPS
 
 #include <cstring>
@@ -55,6 +55,17 @@ static std::map<std::string, ggml_tensor *> wg_index_live(struct ggml_cgraph * l
     return m;
 }
 
+// Result of reconstructing a graph: the owning context, the graph, its leafs, the subset that
+// become function arguments, and the exported MLIR module text. Previously declared alongside the
+// string emitter; it is a reconstruction concept, so it belongs here with its only user.
+struct case_result {
+    struct ggml_context             * ctx;
+    struct ggml_cgraph              * gf;
+    std::vector<const ggml_tensor *>  leafs;          // every leaf tensor in the graph
+    std::vector<const ggml_tensor *>  runtime_args;   // subset of `leafs` that become %argN params
+    std::string                       func_text;      // the complete MLIR module
+};
+
 // Reconstruct the cache-free prefill graph. Throws mlir_export_error if the live graph isn't the
 // expected llama shape, so capture can skip non-target graphs gracefully.
 static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
@@ -81,7 +92,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
         }
         if (any) return any;
         if (it != idx.end() && it->second) return it->second;
-        throw mlir_export_error("live graph missing tensor '" + core + "'");
+        throw tsi::mlir_export::mlir_export_error("live graph missing tensor '" + core + "'");
     };
 
     ggml_tensor * embd_t    = need("token_embd.weight");
@@ -93,7 +104,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
 
     int N_LAYERS = 0;
     while (idx.count("blk." + std::to_string(N_LAYERS) + ".attn_q.weight")) N_LAYERS++;
-    if (N_LAYERS == 0) throw mlir_export_error("live graph has no blk.*.attn_q.weight layers");
+    if (N_LAYERS == 0) throw tsi::mlir_export::mlir_export_error("live graph has no blk.*.attn_q.weight layers");
 
     // token ids: the embedding GET_ROWS has src1 = i32 ids[n_tokens]
     ggml_tensor * ids_live = nullptr;
@@ -105,7 +116,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
             ids_live = nd->src[1];
         }
     }
-    if (!ids_live) throw mlir_export_error("live graph: could not find token-id input");
+    if (!ids_live) throw tsi::mlir_export::mlir_export_error("live graph: could not find token-id input");
     { auto it = idx.find(wg_core_name(ids_live->name)); if (it != idx.end()) ids_live = it->second; }
     const int N_TOKENS = (int) ids_live->ne[0];
 
@@ -129,7 +140,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
             memcpy(&REAL_ROPE.beta_slow,   (const float *) nd->op_params + 10, sizeof(float));
         }
     }
-    if (!pos_live || HEAD_DIM == 0) throw mlir_export_error("live graph: could not find ROPE/positions");
+    if (!pos_live || HEAD_DIM == 0) throw tsi::mlir_export::mlir_export_error("live graph: could not find ROPE/positions");
 
     // attention scale from the first SOFT_MAX (op_params[0])
     for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
@@ -226,8 +237,10 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     r.gf = ggml_new_graph(r.ctx);
     ggml_build_forward_expand(r.gf, logits);
 
-    r.leafs = discover_leafs(r.gf);
+    r.leafs = tsi::mlir_export::discoverLeafs(r.gf);
     r.runtime_args = r.leafs;   // every leaf is a runtime arg; nothing baked
-    r.func_text = build_func_text_baked(r.gf, "forward", r.runtime_args, {});
+        tsi::mlir_export::ExportOptions opts;
+    opts.runtime_args = r.runtime_args;
+    r.func_text       = tsi::mlir_export::exportGraph(r.gf, opts);
     return r;
 }

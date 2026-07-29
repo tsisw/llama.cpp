@@ -1,7 +1,7 @@
 // Whole-graph interception for the ggml-tsavorite backend. See tsi_wholegraph.h.
 #include "tsi_wholegraph.h"
 
-#include "tsi/export/TextEmitter.h"                 // discover_leafs, build_func_text_baked, ggml_* accessors
+#include "tsi/export/Exporter.h"                 // exportGraph, discoverLeafs, mlir_export_error
 #include "tsi/graph/LiveGraphBuilder.h"       // build_cachefree_from_live (Approach B2)
 #include "include/TestModel.h"        // MemRefDescriptor<N>, tsi_alloc (via HostShimCAPI.h)
 #include "ggml-cpu.h"                 // ggml_graph_compute_with_ctx (reconstruction CPU reference)
@@ -158,7 +158,7 @@ void tsi_wholegraph_maybe_capture(struct ggml_cgraph * cgraph) {
                 "Continuing per-op.\n", e.what());
         return;
     }
-    std::string module = "module {\n" + r.func_text + "}\n";
+    std::string module = r.func_text;   // exportGraph already returns a complete module
 
     { std::ofstream f(dir + "/forward.mlir"); f << module; }
     {

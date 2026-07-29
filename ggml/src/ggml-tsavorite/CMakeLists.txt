@@ -15,6 +15,19 @@ if(DEFINED MLIR_COMPILER_DIR)
     target_link_directories(ggml-tsavorite PRIVATE "${MLIR_COMPILER_DIR}/lib")
 endif()
 
+# The whole-graph exporter is now an MLIR C++ library, so tsi_wholegraph.cpp needs it at link time.
+# There is no aarch64 build of MLIR, so the fpga target CANNOT link this - that is expected and
+# accepted. Warn with the reason rather than leaving a bare undefined-symbol error to interpret.
+if (TARGET tsi-mlir-export)
+    target_link_libraries(ggml-tsavorite PRIVATE tsi-mlir-export)
+    target_link_libraries(decode_run PRIVATE tsi-mlir-export)
+else()
+    message(WARNING
+        "ggml-tsavorite: tsi-mlir-export target not present, so TSI_WHOLEGRAPH capture will not "
+        "link. The exporter is an MLIR C++ library now and MLIR is host-only here; the fpga/aarch64 "
+        "target cannot build it. Use a posix build for whole-graph export.")
+endif()
+
 
 if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
 target_link_libraries(ggml-tsavorite PRIVATE ${TLIBS} dl rt)

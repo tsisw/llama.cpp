@@ -5,7 +5,7 @@
 //
 // Usage: decode_cpu_check <model.gguf> <id0> [id1 ...] [--L N] [--emit forward.mlir]
 #include "tsi/graph/DecodeModel.h"   // load_decode_model, build_decode (pulls decode_layer.h -> model_layer.h)
-#include "tsi/export/TextEmitter.h"       // discover_leafs, build_func_text_baked_multi
+#include "tsi/export/Exporter.h"       // exportGraph, discoverLeafs
 #include "ggml-cpu.h"
 
 #include <fstream>
@@ -51,9 +51,12 @@ int main(int argc, char ** argv) {
         for (int il = 0; il < M.n_layers; il++) { ggml_build_forward_expand(gf, knew[il]); ggml_build_forward_expand(gf, vnew[il]); }
         std::vector<const ggml_tensor *> outs; outs.push_back(logits);
         for (int il = 0; il < M.n_layers; il++) { outs.push_back(knew[il]); outs.push_back(vnew[il]); }
-        auto leafs = discover_leafs(gf);
-        std::string txt = build_func_text_baked_multi(gf, "forward", leafs, {}, outs);
-        std::ofstream f(emit); f << "module {\n" << txt << "}\n";
+        auto leafs = tsi::mlir_export::discoverLeafs(gf);
+        tsi::mlir_export::ExportOptions opts;
+        opts.runtime_args = leafs;
+        opts.outputs      = outs;
+        // exportGraph returns a complete module, so no wrapping here any more.
+        std::ofstream f(emit); f << tsi::mlir_export::exportGraph(gf, opts);
         fprintf(stderr, "emitted decode graph: L=%d leafs=%zu outputs=%zu -> %s\n", L, leafs.size(), outs.size(), emit);
         ggml_free(ec);
     }
