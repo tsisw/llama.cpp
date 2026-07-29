@@ -15,14 +15,18 @@
 # Input is a prompt string (-p, tokenized by llama) or raw token ids (--ids). The generated tokens
 # are printed as ids and as detokenized text.
 #
+# --txes N tiles the compile across N TXEs (1..20) and brings the runtime up with the same count
+# (both must match; the flag sets both). Changing N forces a recompile.
+#
 # Usage:
-#   ./decode.sh -m MODEL {-p "prompt" | --ids "id0 id1 ..."} [--L N] [--gen N] [--verify]
+#   ./decode.sh -m MODEL {-p "prompt" | --ids "id0 id1 ..."} [--L N] [--gen N] [--verify] [--txes N]
 #               [-d DIR] [--build-dir BD] [--lib host.so] [-c CONFIG]
 #               [--host tsisim|x86] [--sdk SDK_ROOT] [--venv VENV]
 #
 # Examples:
 #   ./decode.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" --gen 16            # generate + print text
 #   ./decode.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" --gen 16 --verify   # + check each vs prefill
+#   ./decode.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" --gen 16 --txes 8   # tile across 8 TXEs
 #   ./decode.sh -m /root/tinyllama-v0-f32.gguf --ids "1 2 3 4" --L 8 --verify       # validate on raw ids
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -49,6 +53,7 @@ HOST="tsisim"
 SDK=""
 VENV=""
 FORCE=0
+TXES=""              # multi-TXE: compile num_txes + runtime txe_count (1..20); empty = leave as configured
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -68,6 +73,7 @@ while [ $# -gt 0 ]; do
         --host)        HOST="$2"; shift 2 ;;
         --sdk)         SDK="$2"; shift 2 ;;
         --venv)        VENV="$2"; shift 2 ;;
+        --txes)        TXES="$2"; shift 2 ;;
         --force)       FORCE=1; shift ;;
         -h|--help)     grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1  (use -h)" ;;
@@ -108,9 +114,37 @@ fi
 export TXE_FPGA_CONFIG="$CONFIG"
 mkdir -p "$DIR"
 
+# multi-TXE: tile the compile across N TXEs and bring the runtime up with the same count. The two
+# MUST match, so we set both from one flag. A deployment yaml in $DIR (pointed at via the env the
+# runtime checks first) overrides the bundled one. Changing N invalidates the cached host.so.
+if [ -n "$TXES" ]; then
+    case "$TXES" in ''|*[!0-9]*) die "--txes must be an integer 1..20 (got '$TXES')" ;; esac
+    { [ "$TXES" -ge 1 ] && [ "$TXES" -le 20 ]; } || die "--txes out of range 1..20 (got '$TXES')"
+    export TSI_NUM_TXES="$TXES"                                  # compile: tile across N TXEs
+    if [ "$TXES" -gt 1 ]; then
+        export TSI_ENABLE_MULTI_TXE="${TSI_ENABLE_MULTI_TXE:-1}"     # compiler gates num_txes>1
+        # host.so needs LLVM libomp (__kmpc_*). Honor a preset TSI_OMP_LIB_DIR, else find libomp.
+        if [ -z "${TSI_OMP_LIB_DIR:-}" ]; then
+            for __d in /usr/lib/llvm-*/lib /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64; do
+                if ls "$__d"/libomp.so* >/dev/null 2>&1; then TSI_OMP_LIB_DIR="$__d"; break; fi
+            done
+        fi
+        if [ -n "${TSI_OMP_LIB_DIR:-}" ]; then export TSI_OMP_LIB_DIR; else
+            echo "  warning: libomp not found; set TSI_OMP_LIB_DIR (LLVM lib dir with libomp.so) for --txes>1" >&2
+        fi
+    fi
+    cat > "$DIR/tsavorite-model-deployment.yaml" <<EOF
+txe_count: $TXES
+multi_thread_enable: true
+advanced_matmul_shape_offload: false
+EOF
+    export TSAVORITE_MODEL_DEPLOYMENT_YAML="$DIR/tsavorite-model-deployment.yaml"   # runtime: N TXEs
+    FORCE=1                                                      # recompile (num_txes changes the blobs)
+fi
+
 echo "=== KV-cache decode ==="
 printf '  %-14s %s\n' host "$HOST" model "$MODEL" input "${PROMPT:-$IDS}" L "${L:-auto}" gen "$GEN" \
-       verify "$VERIFY" dir "$DIR" config "$CONFIG"
+       verify "$VERIFY" txes "${TXES:-default}" dir "$DIR" config "$CONFIG"
 
 # ---------------------------------------------------------------- 1) build decode_run
 if [ -z "$DECODE_RUN" ]; then

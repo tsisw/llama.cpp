@@ -14,6 +14,7 @@
 #include "llama.h"                 // tokenize a --prompt, detokenize the output
 
 #include <dlfcn.h>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -166,6 +167,8 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> seq = ids;   // full sequence (prompt ++ produced), for input + verify prefill
     std::vector<float> lbuf(VOC);
     int mism = 0, verified = 0;
+    double prefill_ms = 0, decode_ms = 0, first_decode_ms = -1;   // per-token wall clock (fwd path)
+    int decode_cnt = 0;
     const int steps = N + gen;
     printf("[decode] prompt ids:"); for (int t : ids) printf(" %d", t); printf("\n");
 
@@ -173,6 +176,7 @@ int main(int argc, char ** argv) {
         const int32_t tok = seq[step];      // token fed this step (prompt, then produced)
         const int cur = step;               // its position == current cache length
 
+        auto t0 = std::chrono::steady_clock::now();
         ((int32_t *) id->data)[0]  = tok;
         ((int32_t *) pos->data)[0] = cur;
         float * mm = (float *) mask->data;
@@ -190,6 +194,9 @@ int main(int argc, char ** argv) {
             memcpy((char *) cK[il]->data + (size_t) cur * KV * sizeof(float), dev_out[1 + 2 * il], KV * sizeof(float));
             memcpy((char *) cV[il]->data + (size_t) cur * KV * sizeof(float), dev_out[2 + 2 * il], KV * sizeof(float));
         }
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (step < N) prefill_ms += ms;   // prompt tokens (time to first token)
+        else { if (first_decode_ms < 0) first_decode_ms = ms; decode_ms += ms; decode_cnt++; }
 
         const char * kind = (step < N) ? "prompt" : "gen";
         if (verify) {   // CPU prefill of seq[0..step] last position -> reference argmax
@@ -210,11 +217,11 @@ int main(int argc, char ** argv) {
             int refm = argmax(pl, VOC);
             double num = 0, den = 0; for (int v = 0; v < VOC; v++) { double d = (double) lbuf[v] - pl[v]; num += d * d; den += (double) pl[v] * pl[v]; }
             bool ok = (pred == refm); if (!ok) mism++; verified++;
-            fprintf(stderr, "step %2d %-6s tok=%-5d cur=%2d: compiled=%d prefill=%d rel_sq_err=%.3g -> %s\n",
-                    step, kind, tok, cur, pred, refm, den > 0 ? num / den : num, ok ? "MATCH" : "DIFFER");
+            fprintf(stderr, "step %2d %-6s tok=%-5d cur=%2d: compiled=%d prefill=%d rel_sq_err=%.3g -> %s (%.1f ms)\n",
+                    step, kind, tok, cur, pred, refm, den > 0 ? num / den : num, ok ? "MATCH" : "DIFFER", ms);
             ggml_free(pc);
         } else {
-            fprintf(stderr, "step %2d %-6s tok=%-5d cur=%2d -> pred=%d\n", step, kind, tok, cur, pred);
+            fprintf(stderr, "step %2d %-6s tok=%-5d cur=%2d -> pred=%d (%.1f ms)\n", step, kind, tok, cur, pred, ms);
         }
 
         if (step + 1 < (int) seq.size()) continue;   // still consuming the prompt: next input is known
@@ -231,6 +238,13 @@ int main(int argc, char ** argv) {
         if (l > 0) text.append(buf, l);
     }
     printf("[decode] generated text:%s\n", text.c_str());
+
+    // timing (with KV cache): prefill = the N prompt tokens (time to first token); decode = each
+    // subsequent token, one fwd over the fixed-L graph (no recompile).
+    fprintf(stderr, "[timing] first token (prefill %d tok): %.1f ms (%.1f ms/tok)\n", N, prefill_ms, prefill_ms / N);
+    if (decode_cnt)
+        fprintf(stderr, "[timing] subsequent tokens: first %.1f ms, avg %.1f ms/tok over %d tokens\n",
+                first_decode_ms, decode_ms / decode_cnt, decode_cnt);
     if (verify) fprintf(stderr, "=== compiled-decode vs prefill: %d/%d MATCH ===\n", verified - mism, verified);
 
     for (void * d : dev_leaf) tsi_dealloc(d);

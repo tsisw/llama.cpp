@@ -97,6 +97,17 @@ def main():
 
     config = _fpga_config(args.config) if args.target == "fpga" else TXECompilerConfig(log_mlir=True)
 
+    # $TSI_NUM_TXES tiles the graph across N TXEs (TVU vectorize pass). Must match the runtime
+    # txe_count in tsavorite-model-deployment.yaml. Default: leave the config value (1).
+    env_txes = os.environ.get("TSI_NUM_TXES")
+    if env_txes:
+        n = int(env_txes)
+        config = config._replace(num_txes=n)
+        if n > 1:
+            # the compiler gates num_txes>1 behind this toggle (experimental multi-TXE feature)
+            os.environ.setdefault("TSI_ENABLE_MULTI_TXE", "1")
+        print(f"=== num_txes = {n} (multi_txe={os.environ.get('TSI_ENABLE_MULTI_TXE', '0')}) ===", file=sys.stderr)
+
     print(f"=== compiling whole graph: target={args.target}  in={args.mlir}  out={out} ===")
     RawGraphBackend(config).compile(
         model=mlir_text, input_types=[], compilation_type="aot",
@@ -151,6 +162,11 @@ def main():
     rt_dir = os.environ.get("TSI_RT_LIB_DIR")
     if rt_dir:
         link_cmd += [f"-L{rt_dir}", "-lTsavRTShimCAPI", f"-Wl,-rpath,{rt_dir}"]
+    # multi-TXE host code calls the LLVM OpenMP runtime (__kmpc_*); link libomp so host.so is
+    # self-contained (rpath so any loader finds it). $TSI_OMP_LIB_DIR points at the LLVM lib dir.
+    omp_dir = os.environ.get("TSI_OMP_LIB_DIR")
+    if omp_dir:
+        link_cmd += [f"-L{omp_dir}", "-lomp", f"-Wl,-rpath,{omp_dir}"]
     rc = subprocess.call(link_cmd)
     print(f"host.so: {'OK ' + str(host_so) if (rc == 0 and host_so.exists()) else 'FAILED (link manually: ' + ' '.join(link_cmd) + ')'}")
 

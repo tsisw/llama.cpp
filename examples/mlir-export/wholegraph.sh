@@ -161,7 +161,9 @@ if [ "$MODE" = gen ]; then
     echo "--- gen: $N tokens, prefill-only (recompile per step) ---"
     seq="$PROMPT"
     printf '%s' "$PROMPT"
+    __first_ms=0; __rest_ms=0; __rest_cnt=0
     for ((i = 1; i <= N; i++)); do
+        __t0=$(date +%s%N)
         echo "  [step $i/$N] capture+compile+run over $(printf %s "$seq" | wc -c | tr -d ' ') prompt chars" >&2
         TSI_WHOLEGRAPH=capture TSI_WG_DIR="$DIR" TSI_WG_SKIP="$TSI_WG_SKIP" \
             "$LLAMA_CLI" -m "$MODEL" -p "$seq" -n 1 --no-warmup $LLAMA_FLAGS >"$DIR/gen.capture.log" 2>&1 \
@@ -191,10 +193,15 @@ if [ "$MODE" = gen ]; then
             *"TSI deploy"*|*hal_lib_init*|*"HAL "*)
                 die "step $i: runtime banner leaked into stdout, cannot isolate the generated token" ;;
         esac
+        __dt=$(( ($(date +%s%N) - __t0) / 1000000 ))
+        if [ "$i" -eq 1 ]; then __first_ms=$__dt; else __rest_ms=$((__rest_ms + __dt)); __rest_cnt=$((__rest_cnt + 1)); fi
+        echo "  [step $i] ${__dt} ms (capture+compile+run)" >&2
         seq="$seq$tok"
         printf '%s' "$tok"
     done
     printf '\n'
+    echo "[timing] first token: ${__first_ms} ms (capture+compile+run over the prompt)" >&2
+    [ "$__rest_cnt" -gt 0 ] && echo "[timing] subsequent tokens: $((__rest_ms / __rest_cnt)) ms/token avg over $__rest_cnt (each = recapture+recompile+run)" >&2
     echo "=== done (gen) ==="
     exit 0
 fi
