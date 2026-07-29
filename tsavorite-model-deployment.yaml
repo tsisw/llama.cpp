@@ -1,6 +1,6 @@
 # Tsavorite deployment config
 txe_count: 1
-multi_thread_enable: false
+multi_thread_enable: true
 
 ## Runtime user DRAM size in GiB.
 ##

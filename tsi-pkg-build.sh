@@ -77,20 +77,21 @@
 # - If present, the Tsavorite backend loads this file at runtime to determine
 #   TXE configuration and multi-threading behavior.
 #
-# ------------------------------------------------------------------------------
-# FPGA Packaging – Source Selection Order
-# ------------------------------------------------------------------------------
-#
-# When creating an FPGA bundle, the deployment file is picked up using the
-# following priority order:
-#
-# 1) TSAVORITE_DEPLOYMENT_YAML_SRC=/path/to/tsavorite-model-deployment.yaml
-# 2) ./tsavorite-model-deployment.yaml
-# 3) <script-dir>/tsavorite-model-deployment.yaml
-#
-# The resolved file is then copied into the FPGA bundle alongside the
-# Tsavorite shared libraries.
-# ------------------------------------------------------------------------------
+## ------------------------------------------------------------------------------
+## FPGA Packaging – Deployment File
+## ------------------------------------------------------------------------------
+##
+## FPGA packaging requires ./tsavorite-model-deployment.yaml to exist in the
+## current working directory.
+##
+## tsi-pkg-build.sh does not generate deployment configuration files.
+## The deployment configuration is maintained only in
+## tsavorite-model-deployment.yaml.
+##
+## During packaging, the file is copied directly into the FPGA bundle
+## alongside the Tsavorite shared libraries.
+##
+## ------------------------------------------------------------------------------
 #
 #
 # Build modes (optional):
@@ -237,10 +238,11 @@
 # 13) Package only (existing FPGA build dir already built):
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh package
 #
-# 14) Override tsavorite-model-deployment.yaml source for packaging:
-#     TSAVORITE_DEPLOYMENT_YAML_SRC=/abs/path/tsavorite-model-deployment.yaml \
-#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
+# 14) FPGA packaging:
+#     Ensure ./tsavorite-model-deployment.yaml exists in the current
+#     working directory before running package.
 #
+#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
 # ==============================================================================
 
 log_error(){ echo "ERROR: $*" >&2; }
