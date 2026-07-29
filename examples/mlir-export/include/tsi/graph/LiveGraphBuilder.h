@@ -9,8 +9,8 @@
 // Weights come from g_wcap (captured while llama computed, see tsi_wholegraph.cpp); the prompt
 // tokens, positions and rope/softmax params come from the live graph, so the reconstruction can be
 // diffed against llama's own per-op logits.
-#include "exporter.h"      // case_result, discover_leafs, build_func_text_baked, mlir_export_error
-#include "model_layer.h"   // build_layer, LayerW, REAL_RMS_EPS
+#include "tsi/export/TextEmitter.h"      // case_result, discover_leafs, build_func_text_baked, mlir_export_error
+#include "tsi/graph/ModelLayer.h"   // build_layer, LayerW, REAL_RMS_EPS
 
 #include <cstring>
 #include <map>

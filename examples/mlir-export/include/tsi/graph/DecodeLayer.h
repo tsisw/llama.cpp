@@ -3,7 +3,7 @@
 // graph emitter so both drive the same graph. Processes one new token; cache_K/cache_V are
 // [head_dim, n_head_kv, L] (L = cache_K->ne[2]); a runtime mask over the L+1 keys (cache ++ new)
 // blocks the not-yet-filled cache slots.
-#include "model_layer.h"   // REAL_RMS_EPS, REAL_ROPE, REAL_KQ_SCALE, wg_rope, LayerW
+#include "tsi/graph/ModelLayer.h"   // REAL_RMS_EPS, REAL_ROPE, REAL_KQ_SCALE, wg_rope, LayerW
 #include "ggml.h"
 
 #include <cmath>

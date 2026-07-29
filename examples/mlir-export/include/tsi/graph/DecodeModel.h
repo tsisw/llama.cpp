@@ -1,7 +1,7 @@
 #pragma once
 // Shared model load + decode-graph builder for the KV-cache decode path, used by decode_cpu_check
 // (CPU validator) and decode_run (compiled stateful runner) so both drive the identical graph.
-#include "decode_layer.h"   // build_decode_layer, and via it model_layer.h (build_layer, wg_rope, REAL_*)
+#include "tsi/graph/DecodeLayer.h"   // build_decode_layer, and via it model_layer.h (build_layer, wg_rope, REAL_*)
 #include "ggml.h"
 #include "gguf.h"
 

@@ -5,8 +5,8 @@
 // diffs each token's argmax against a CPU prefill of the prefix. Box-only (needs the TSI runtime).
 //
 // Usage: decode_run <model.gguf> {--lib host.so | --emit forward.mlir} {--prompt "text" | id0 [ids...]} [--L N] [--gen N] [--verify]
-#include "decode_model.h"          // load_decode_model, build_decode, DecodeModel
-#include "exporter.h"              // discover_leafs
+#include "tsi/graph/DecodeModel.h"          // load_decode_model, build_decode, DecodeModel
+#include "tsi/export/TextEmitter.h"              // discover_leafs
 #include "include/TestModel.h"     // MemRefDescriptor<N>, tsi_alloc, tsi_dealloc
 #include "ggml.h"
 #include "ggml-cpu.h"

@@ -1185,7 +1185,7 @@ EOL
   # llama-cli so the box can capture->compile->run (prefill) and emit->compile->run (decode) locally.
   # Warn-only: a missing file must never break a normal package build.
   __wg_src="${__TSI_SCRIPT_DIR}/examples/mlir-export"
-  for __wg in wholegraph.sh decode.sh compile_graph_fpga.py; do
+  for __wg in wholegraph.sh decode.sh compile_graph_fpga.py tsi_raw_backend.py; do
     if [ -f "${__wg_src}/${__wg}" ]; then
       cp "${__wg_src}/${__wg}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" && \
         log_info "bundled whole-graph tool: ${__wg}"

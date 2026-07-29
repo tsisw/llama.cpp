@@ -3,7 +3,7 @@
 // prints the next-token argmax per column and each layer's output. Compare the argmax to ref_check.
 //
 // Usage: recon_cpu_check <model.gguf> <id0> [id1 ...]   (ids from ref_check)
-#include "model_layer.h"      // build_layer, LayerW, REAL_RMS_EPS, REAL_ROPE, REAL_KQ_SCALE
+#include "tsi/graph/ModelLayer.h"      // build_layer, LayerW, REAL_RMS_EPS, REAL_ROPE, REAL_KQ_SCALE
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "gguf.h"

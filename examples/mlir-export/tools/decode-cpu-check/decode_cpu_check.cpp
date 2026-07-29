@@ -4,8 +4,8 @@
 // --emit writes the decode graph as one multi-output MLIR func (logits + per-layer k_new/v_new).
 //
 // Usage: decode_cpu_check <model.gguf> <id0> [id1 ...] [--L N] [--emit forward.mlir]
-#include "decode_model.h"   // load_decode_model, build_decode (pulls decode_layer.h -> model_layer.h)
-#include "exporter.h"       // discover_leafs, build_func_text_baked_multi
+#include "tsi/graph/DecodeModel.h"   // load_decode_model, build_decode (pulls decode_layer.h -> model_layer.h)
+#include "tsi/export/TextEmitter.h"       // discover_leafs, build_func_text_baked_multi
 #include "ggml-cpu.h"
 
 #include <fstream>

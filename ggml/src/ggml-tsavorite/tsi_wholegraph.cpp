@@ -1,8 +1,8 @@
 // Whole-graph interception for the ggml-tsavorite backend. See tsi_wholegraph.h.
 #include "tsi_wholegraph.h"
 
-#include "exporter.h"                 // discover_leafs, build_func_text_baked, ggml_* accessors
-#include "live_graph_builder.h"       // build_cachefree_from_live (Approach B2)
+#include "tsi/export/TextEmitter.h"                 // discover_leafs, build_func_text_baked, ggml_* accessors
+#include "tsi/graph/LiveGraphBuilder.h"       // build_cachefree_from_live (Approach B2)
 #include "include/TestModel.h"        // MemRefDescriptor<N>, tsi_alloc (via HostShimCAPI.h)
 #include "ggml-cpu.h"                 // ggml_graph_compute_with_ctx (reconstruction CPU reference)
 

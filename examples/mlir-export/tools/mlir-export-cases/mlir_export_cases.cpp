@@ -9,7 +9,7 @@
 //   mlir-export-cases --list
 //   mlir-export-cases --emit <name> <dir>
 //   mlir-export-cases --emit-all <dir>
-#include "exporter.h"
+#include "tsi/export/TextEmitter.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
