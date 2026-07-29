@@ -22,3 +22,9 @@ target_compile_features(ref_check PRIVATE cxx_std_20)
 add_executable(decode_cpu_check decode_cpu_check.cpp)
 target_link_libraries(decode_cpu_check PRIVATE ggml)
 target_compile_features(decode_cpu_check PRIVATE cxx_std_20)
+
+# Case generator for the export test suite. Links ggml ONLY (not llama), same reason as the
+# checks above: in a TSI build linking llama/ggml pulls in libggml-tsavorite and the link fails.
+add_executable(mlir-export-cases mlir_export_cases.cpp)
+target_link_libraries(mlir-export-cases PRIVATE ggml)
+target_compile_features(mlir-export-cases PRIVATE cxx_std_20)
