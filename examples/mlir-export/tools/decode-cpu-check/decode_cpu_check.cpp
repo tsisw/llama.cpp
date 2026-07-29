@@ -18,10 +18,11 @@ int main(int argc, char ** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s model.gguf id0 [id1 ...] [--L N] [--emit file]\n", argv[0]); return 1; }
     const char * path = argv[1];
     std::vector<int32_t> ids;
-    int L_arg = -1; const char * emit = nullptr;
+    int L_arg = -1; const char * emit = nullptr; const char * dump_io = nullptr;
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--L") && i + 1 < argc)         L_arg = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--emit") && i + 1 < argc) emit = argv[++i];
+        if (!strcmp(argv[i], "--L") && i + 1 < argc)            L_arg = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--emit") && i + 1 < argc)    emit = argv[++i];
+        else if (!strcmp(argv[i], "--dump-io") && i + 1 < argc) dump_io = argv[++i];
         else ids.push_back(atoi(argv[i]));
     }
     const int N = (int) ids.size();
@@ -33,16 +34,26 @@ int main(int argc, char ** argv) {
             M.n_layers, M.hidden, M.n_head, M.n_head_kv, M.head_dim, VOC, L, N);
 
     // emit the fixed-L decode graph as one multi-output MLIR func
-    if (emit) {
+    if (emit || dump_io) {
         ggml_init_params ep { (size_t) 128 << 20, nullptr, false };
         ggml_context * ec = ggml_init(ep);
         ggml_tensor * id   = ggml_new_tensor_1d(ec, GGML_TYPE_I32, 1);
         ggml_tensor * pos  = ggml_new_tensor_1d(ec, GGML_TYPE_I32, 1);
         ggml_tensor * mask = ggml_new_tensor_2d(ec, GGML_TYPE_F32, L + 1, 1);
+        // --dump-io needs real values, so set up decode step 0: the first token, position 0, an
+        // empty cache with every padded slot masked off. Fresh ggml tensors are NOT zeroed, so the
+        // cache must be memset explicitly or the reference would be computed on garbage.
+        ((int32_t *) id->data)[0]  = ids[0];
+        ((int32_t *) pos->data)[0] = 0;
+        { float * mm = (float *) mask->data;
+          for (int j = 0; j < L; j++) mm[j] = -INFINITY;   // nothing valid in the cache yet
+          mm[L] = 0.0f; }                                  // the new token attends to itself
         std::vector<ggml_tensor *> cK(M.n_layers), cV(M.n_layers);
         for (int il = 0; il < M.n_layers; il++) {
             cK[il] = ggml_new_tensor_3d(ec, GGML_TYPE_F32, M.head_dim, M.n_head_kv, L);
             cV[il] = ggml_new_tensor_3d(ec, GGML_TYPE_F32, M.head_dim, M.n_head_kv, L);
+            memset(cK[il]->data, 0, ggml_nbytes(cK[il]));
+            memset(cV[il]->data, 0, ggml_nbytes(cV[il]));
         }
         std::vector<ggml_tensor *> knew, vnew;
         ggml_tensor * logits = build_decode(ec, M, id, pos, mask, cK, cV, knew, vnew);
@@ -56,8 +67,53 @@ int main(int argc, char ** argv) {
         opts.runtime_args = leafs;
         opts.outputs      = outs;
         // exportGraph returns a complete module, so no wrapping here any more.
-        std::ofstream f(emit); f << tsi::mlir_export::exportGraph(gf, opts);
-        fprintf(stderr, "emitted decode graph: L=%d leafs=%zu outputs=%zu -> %s\n", L, leafs.size(), outs.size(), emit);
+        std::string module_text = tsi::mlir_export::exportGraph(gf, opts);
+        if (emit) {
+            std::ofstream f(emit); f << module_text;
+            fprintf(stderr, "emitted decode graph: L=%d leafs=%zu outputs=%zu -> %s\n",
+                    L, leafs.size(), outs.size(), emit);
+        }
+
+        // Everything the compiled graph needs to be run and checked independently: every function
+        // argument, the CPU reference for every result, and a manifest of shapes/dtypes in MLIR dim
+        // order. Lets a compiled real-model graph be diffed against ggml without the TSI runtime.
+        if (dump_io) {
+            ggml_graph_compute_with_ctx(ec, gf, 4);
+
+            auto dump = [&](const std::string & file, const ggml_tensor * t) {
+                std::ofstream o(std::string(dump_io) + "/" + file, std::ios::binary);
+                o.write((const char *) t->data, (std::streamsize) ggml_nbytes(t));
+            };
+            auto shape_json = [&](const ggml_tensor * t) {   // MLIR order = ne reversed over n_dims
+                std::string s = "[";
+                for (int i = ggml_n_dims(t) - 1; i >= 0; i--) {
+                    if (i != ggml_n_dims(t) - 1) s += ", ";
+                    s += std::to_string(t->ne[i]);
+                }
+                return s + "]";
+            };
+            auto dt = [](const ggml_tensor * t) { return t->type == GGML_TYPE_I32 ? "i32" : "f32"; };
+
+            std::ofstream mf(std::string(dump_io) + "/manifest.json");
+            mf << "{\n  \"step\": 0,\n  \"token_id\": " << ids[0] << ",\n  \"L\": " << L
+               << ",\n  \"inputs\": [\n";
+            for (size_t i = 0; i < leafs.size(); i++) {
+                std::string fn = "input_" + std::to_string(i) + ".bin";
+                dump(fn, leafs[i]);
+                mf << "    {\"file\": \"" << fn << "\", \"shape\": " << shape_json(leafs[i])
+                   << ", \"dtype\": \"" << dt(leafs[i]) << "\"}" << (i + 1 < leafs.size() ? "," : "") << "\n";
+            }
+            mf << "  ],\n  \"outputs\": [\n";
+            for (size_t i = 0; i < outs.size(); i++) {
+                std::string fn = "res_" + std::to_string(i) + ".bin";
+                dump(fn, outs[i]);
+                mf << "    {\"file\": \"" << fn << "\", \"shape\": " << shape_json(outs[i])
+                   << ", \"dtype\": \"" << dt(outs[i]) << "\"}" << (i + 1 < outs.size() ? "," : "") << "\n";
+            }
+            mf << "  ]\n}\n";
+            fprintf(stderr, "dumped step-0 io: %zu inputs + %zu outputs -> %s (cpu argmax=%d)\n",
+                    leafs.size(), outs.size(), dump_io, argmax((const float *) logits->data, VOC));
+        }
         ggml_free(ec);
     }
 
