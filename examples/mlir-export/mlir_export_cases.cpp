@@ -76,6 +76,7 @@ struct case_spec {
     float        rtol;
     float        atol;
     const char * expect;   // "pass" | "mismatch"
+    bool         corrupt;  // deliberately poison expected_0.bin (harness self-check)
 };
 
 static ggml_tensor * build_add(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
@@ -89,7 +90,11 @@ static ggml_tensor * build_add(ggml_context * ctx, std::vector<const ggml_tensor
 }
 
 static const case_spec CASES[] = {
-    { "add", build_add, 0.0f, 0.0f, "pass" },
+    { "add",          build_add, 0.0f, 0.0f, "pass",     false },
+    // Proves the comparison in test_mlir_export.py actually compares. If a harness bug made the
+    // check vacuous, every other case would still pass and this one would too - so this must fail
+    // to match, by construction.
+    { "add_negative", build_add, 0.0f, 0.0f, "mismatch", true  },
 };
 
 static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);
@@ -148,7 +153,16 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
         args_json += "{\"file\": \"" + fn + "\", \"shape\": " + shape_json(mlir_shape_of(args[i])) + "}";
     }
 
-    write_f32(dir / "expected_0.bin", out);
+    if (spec.corrupt) {
+        // Offset element 0 by a large, unmistakable amount, then write.
+        std::vector<float> ref(ggml_nelements(out));
+        memcpy(ref.data(), out->data, ref.size() * sizeof(float));
+        ref[0] += 1000.0f;
+        std::ofstream f(dir / "expected_0.bin", std::ios::binary);
+        f.write((const char *) ref.data(), (std::streamsize) (ref.size() * sizeof(float)));
+    } else {
+        write_f32(dir / "expected_0.bin", out);
+    }
 
     char buf[256];
     snprintf(buf, sizeof(buf), "%.8g", spec.rtol);
