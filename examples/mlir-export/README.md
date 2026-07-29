@@ -118,6 +118,63 @@ against a CPU prefill and prints the per-step MATCH.
 
 ---
 
+## How the exporter works: ggml dialect then linalg
+
+The exporter is a two-stage MLIR pipeline built with the MLIR C++ API. There is no IR text
+generation anywhere; MLIR builds and verifies the module, and only the final print produces text.
+
+```
+ggml_cgraph ──[import]──► `ggml` dialect ──[convert-ggml-to-linalg]──► linalg ──► forward.mlir
+```
+
+| Stage | Path | Role |
+|---|---|---|
+| dialect | `src/dialect/GgmlOps.td` | 13 ops mirroring ggml, plus ODS verifiers |
+| import | `src/import/Importer.cpp` | 1:1, one dialect op per graph node, `op_params` as attributes |
+| convert | `src/convert/Patterns*.cpp` | one file per op family, lowering to linalg |
+| entry | `src/export/Exporter.cpp` | import, verify, lower, verify, print |
+
+Dump the intermediate to see what was read from the graph, separately from how it was lowered:
+
+```
+TSI_DUMP_GGML_IR=1 ./build/bin/mlir-export-cases --emit silu /tmp/x
+```
+```mlir
+%0 = ggml.silu %arg0 : tensor<128xf32> -> tensor<128xf32>
+```
+
+**Where constraints live.** ggml's *own* invariants are dialect verifiers: `mul_mat` reduction-dim
+agreement and GQA divisibility, rope position count, reshape element-count preservation, concat dim
+bounds, `get_rows` row count. Our *lowering's* limits are `notifyMatchFailure` in the pattern that
+cannot proceed: ALiBi softmax, permute outside rank 2-3, an unhandled reshape pair, NEOX rope,
+partial rotation, YaRN scaling. So the dialect accepts anything ggml can express, and only the
+lowering admits what it cannot handle. Adding an op means one `.td` entry plus one pattern.
+
+**Shape convention.** Dialect ops carry MLIR-ordered tensor types (ggml `ne` reversed), reversed
+once in the importer. Attributes that *name* dims (`permute` axes, `concat` dim) stay in ggml dim
+space, verbatim from `op_params`, because translating them is part of lowering.
+
+**One entry point.** `exportGraph(gf, ExportOptions)` handles single and multiple outputs; an empty
+`outputs` means the graph's last node. It returns a **complete module**, so callers must not wrap it
+in `module { ... }`.
+
+### Building it
+
+Needs MLIR from the mlir-compiler checkout, never a system or Homebrew LLVM (it would be a different
+version than the compiler consuming the output). `MLIR_DIR` is derived from `MLIR_COMPILER_DIR`
+automatically; if MLIR is absent the library is skipped with a message and a plain host build still
+succeeds. Two non-obvious build rules, both learned the hard way:
+
+- The enclosing CMake project must enable **C**. `find_package(MLIR)` reaches `FindLibEdit`, which
+  runs a C `check_include_file` and errors out in a CXX-only project.
+- Never `include(HandleLLVMOptions)`. It adds `-fno-exceptions`, and the exporter throws.
+
+`mlir_tablegen` also takes its `-I` flags from *directory-scope* `include_directories`, not target
+properties.
+
+The fpga/aarch64 target **cannot** link this, since MLIR is host-only here. That is accepted; the
+tsavorite CMakeLists emits a warning naming the reason rather than leaving a bare linker error.
+
 ## Export unit test suite (no FPGA, no model)
 
 Verifies the exporter itself end to end on small graphs: ggml graph → linalg MLIR → TSI compiler →
@@ -126,15 +183,44 @@ under 10 s; needs only a built [mlir-compiler](https://github.com/tsisw/mlir-com
 model file and no hardware.
 
 ```
-ctest --test-dir build -R mlir-export-suite --output-on-failure
+ctest --test-dir build -L mlir-export --output-on-failure
 ```
+
+Two tests. `mlir-export-suite` compiles and runs every case and compares numerics.
+`mlir-export-golden` compares the emitted linalg against committed golden IR, compiles nothing, and
+runs in under a second. Keeping them separate means a numeric regression and an IR change are
+distinguishable.
 
 `MLIR_COMPILER_DIR` defaults to `~/repo/mlir-compiler`; point it elsewhere with
 `cmake -B build -DMLIR_COMPILER_DIR=<path>`. If its `venv/bin/python` is missing the suite reports
 **skipped** and configure still succeeds — a host build never starts requiring the compiler repo.
 
-Cases: `add`, `mul`, `scale`, `silu`, `rms_norm`, `soft_max`, `matmul`, `matmul_add`, plus
-`add_negative`.
+21 cases, covering every one of the exporter's op lowerings: `add`, `mul`, `scale`, `silu`,
+`rms_norm`, `soft_max`, `matmul`, `matmul_add`, `matmul_vec`, `matmul_3d`, `matmul_gqa`, `permute`,
+`permute_size1`, `reshape_split`, `reshape_merge`, `concat`, `get_rows`, `get_rows_1tok`, `rope_2d`,
+`rope_3d`, plus `add_negative`.
+
+The seven pure data-movement cases are held to **bit-exact** equality (`rtol=atol=0`); they measure
+0.0 error, so that is a real constraint rather than an accident. rope measures 1.5e-07/1.8e-07 max
+abs and the matmul variants 2.4e-07 to 9.5e-07. Tolerances are measured, never guessed.
+
+### Golden IR
+
+`tests/golden/<case>.mlir` holds the linalg each case is expected to produce. Both sides are parsed
+and re-printed with MLIR before comparison, so differences that are legitimate between one emitter
+and another cancel out (inline `affine_map` vs hoisted `#map` aliases, SSA numbering, auto names like
+`%transposed`, whitespace, attribute order) while real structure survives: op sequence, types,
+shapes, permutations, reassociation indices, iterator types, constant values.
+
+These goldens were captured from the original string emitter, so they are what proves the MLIR C++
+rewrite preserved behavior. Regenerating them is deliberate:
+
+```
+./build/bin/mlir-export-cases --emit-all /tmp/c
+for d in /tmp/c/*/; do cp "$d/forward.mlir" tests/golden/"$(basename $d)".mlir; done
+```
+
+Only do that when you intend the IR to change, and review the diff.
 
 ### Two stages, each runnable alone
 
