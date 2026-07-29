@@ -1227,30 +1227,12 @@ EOL
   cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
-  cat > "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" <<'EOF'
-# Tsavorite deployment config
-txe_count: 1
-multi_thread_enable: true
+if [ ! -f "./tsavorite-model-deployment.yaml" ]; then
+    die "required ./tsavorite-model-deployment.yaml not found for FPGA package"
+fi
+cp "./tsavorite-model-deployment.yaml" "$TSI_GGML_BUNDLE_INSTALL_DIR/tsavorite-model-deployment.yaml" || return 1
+log_info "included ./tsavorite-model-deployment.yaml in FPGA package"
 
-## Runtime user DRAM size in GiB.
-## Example: 1 = 1GB, 2 = 2GB.
-## If this key is missing, runtime DeviceConfig default is used.
-
-user_dram_size_gb: 8
-
-
-# Enable additional Triton MAT_MUL shapes beyond stable baseline.
-# false = old behavior
-# true  = new offload shapes
-advanced_matmul_shape_offload: false
-
-# Enable Triton MAT_MUL small-N transpose optimization.
-# false = old behavior
-# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
-triton_matmul_small_n_transpose_opt: false
-EOF
-
-  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false, triton_matmul_small_n_transpose_opt:false; ggml.sh updates txe_count and preserves both MAT_MUL flags."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 
