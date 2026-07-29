@@ -1,6 +1,6 @@
 # Tsavorite deployment config
 txe_count: 1
-multi_thread_enable: false
+multi_thread_enable: true
 
 ## Runtime user DRAM size in GiB.
 ##
@@ -14,9 +14,10 @@ multi_thread_enable: false
 ##
 ## Examples:
 ##   user_dram_size_gb: 4
+##   user_dram_size_gb: 8
 ##   user_dram_size_gb: 12
 ##   user_dram_size_gb: 24
-user_dram_size_gb: 4
+user_dram_size_gb: 8
 
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
 # false = old behavior

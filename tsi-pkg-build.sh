@@ -77,20 +77,21 @@
 # - If present, the Tsavorite backend loads this file at runtime to determine
 #   TXE configuration and multi-threading behavior.
 #
-# ------------------------------------------------------------------------------
-# FPGA Packaging – Source Selection Order
-# ------------------------------------------------------------------------------
-#
-# When creating an FPGA bundle, the deployment file is picked up using the
-# following priority order:
-#
-# 1) TSAVORITE_DEPLOYMENT_YAML_SRC=/path/to/tsavorite-model-deployment.yaml
-# 2) ./tsavorite-model-deployment.yaml
-# 3) <script-dir>/tsavorite-model-deployment.yaml
-#
-# The resolved file is then copied into the FPGA bundle alongside the
-# Tsavorite shared libraries.
-# ------------------------------------------------------------------------------
+## ------------------------------------------------------------------------------
+## FPGA Packaging – Deployment File
+## ------------------------------------------------------------------------------
+##
+## FPGA packaging requires ./tsavorite-model-deployment.yaml to exist in the
+## current working directory.
+##
+## tsi-pkg-build.sh does not generate deployment configuration files.
+## The deployment configuration is maintained only in
+## tsavorite-model-deployment.yaml.
+##
+## During packaging, the file is copied directly into the FPGA bundle
+## alongside the Tsavorite shared libraries.
+##
+## ------------------------------------------------------------------------------
 #
 #
 # Build modes (optional):
@@ -237,10 +238,11 @@
 # 13) Package only (existing FPGA build dir already built):
 #     SDK_VERSION=0.4.1 source tsi-pkg-build.sh package
 #
-# 14) Override tsavorite-model-deployment.yaml source for packaging:
-#     TSAVORITE_DEPLOYMENT_YAML_SRC=/abs/path/tsavorite-model-deployment.yaml \
-#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
+# 14) FPGA packaging:
+#     Ensure ./tsavorite-model-deployment.yaml exists in the current
+#     working directory before running package.
 #
+#       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
 # ==============================================================================
 
 log_error(){ echo "ERROR: $*" >&2; }
@@ -1061,7 +1063,7 @@ update_one_tsavorite_deployment_yaml() {
   local txe_count="$2"
   local advanced_matmul_shape_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
-local user_dram_size_gb="1"
+local user_dram_size_gb="8"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1227,30 +1229,12 @@ EOL
   cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
-  cat > "${TSI_GGML_BUNDLE_INSTALL_DIR}/tsavorite-model-deployment.yaml" <<'EOF'
-# Tsavorite deployment config
-txe_count: 1
-multi_thread_enable: true
+if [ ! -f "./tsavorite-model-deployment.yaml" ]; then
+    die "required ./tsavorite-model-deployment.yaml not found for FPGA package"
+fi
+cp "./tsavorite-model-deployment.yaml" "$TSI_GGML_BUNDLE_INSTALL_DIR/tsavorite-model-deployment.yaml" || return 1
+log_info "included ./tsavorite-model-deployment.yaml in FPGA package"
 
-## Runtime user DRAM size in GiB.
-## Example: 1 = 1GB, 2 = 2GB.
-## If this key is missing, runtime DeviceConfig default is used.
-
-user_dram_size_gb: 1
-
-
-# Enable additional Triton MAT_MUL shapes beyond stable baseline.
-# false = old behavior
-# true  = new offload shapes
-advanced_matmul_shape_offload: false
-
-# Enable Triton MAT_MUL small-N transpose optimization.
-# false = old behavior
-# true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
-triton_matmul_small_n_transpose_opt: false
-EOF
-
-  log_info "included default tsavorite-model-deployment.yaml with txe_count:1, multi_thread_enable:true, advanced_matmul_shape_offload:false, triton_matmul_small_n_transpose_opt:false; ggml.sh updates txe_count and preserves both MAT_MUL flags."
 
   tar -cvzf "${TSI_GGML_BUNDLE_INSTALL_DIR}-${TSI_GGML_VERSION}.tz" "${TSI_GGML_BUNDLE_INSTALL_DIR}"/* || return 1
 
