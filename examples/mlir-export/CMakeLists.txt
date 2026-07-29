@@ -28,3 +28,29 @@ target_compile_features(decode_cpu_check PRIVATE cxx_std_20)
 add_executable(mlir-export-cases mlir_export_cases.cpp)
 target_link_libraries(mlir-export-cases PRIVATE ggml)
 target_compile_features(mlir-export-cases PRIVATE cxx_std_20)
+
+# ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at
+# line 303 only when LLAMA_BUILD_TESTS=ON - without this guard, configuring with
+# -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON would fail on add_test().
+if (BUILD_TESTING)
+    set(MLIR_COMPILER_DIR "$ENV{HOME}/repo/mlir-compiler" CACHE PATH
+        "TSI mlir-compiler checkout; must contain venv/bin/python with the tsavorite package")
+    set(TSI_VENV_PYTHON "${MLIR_COMPILER_DIR}/venv/bin/python")
+
+    if (EXISTS "${TSI_VENV_PYTHON}")
+        add_test(NAME mlir-export-suite
+                 COMMAND "${TSI_VENV_PYTHON}" -m pytest -v
+                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mlir_export.py"
+                         --cases-bin "$<TARGET_FILE:mlir-export-cases>"
+                         --target ffm)
+        set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export" TIMEOUT 1800)
+    else()
+        # Never a hard error: a plain host build must not start requiring the compiler repo.
+        message(STATUS "mlir-export: ${TSI_VENV_PYTHON} not found; mlir-export-suite will skip "
+                       "(configure with -DMLIR_COMPILER_DIR=<path> to enable)")
+        add_test(NAME mlir-export-suite COMMAND ${CMAKE_COMMAND} -E echo
+                 "SKIPPED: mlir-compiler venv not found at ${TSI_VENV_PYTHON}")
+        set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export"
+                             SKIP_REGULAR_EXPRESSION "SKIPPED")
+    endif()
+endif()
