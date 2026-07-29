@@ -114,6 +114,9 @@ std::map<std::string, std::vector<float>> g_wcap;
 // reconstruction reads freed memory as token ids and ggml_get_rows aborts on an out-of-range index.
 std::vector<int32_t> g_ids_cap;
 
+// The real positions, captured for validation only (see the ROPE branch below).
+std::vector<int32_t> g_pos_cap;
+
 extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
     (void) ud;
     if (ask) return true;
@@ -141,6 +144,17 @@ extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * 
         const int64_t n = ggml_nelements(t->src[1]);
         g_ids_cap.resize((size_t) n);
         memcpy(g_ids_cap.data(), t->src[1]->data, (size_t) n * sizeof(int32_t));
+    }
+
+    // Positions, from the first ROPE node - same place build_cachefree_from_live reads them. Needed
+    // only so that reconstruction can *check* them: it rebuilds positions as 0..n-1, and must refuse
+    // a graph whose real positions differ (a decode step, or a continued prefill) instead of
+    // silently emitting a graph that computes something else.
+    if (g_pos_cap.empty() && t->op == GGML_OP_ROPE && t->src[1] &&
+        t->src[1]->type == GGML_TYPE_I32 && t->src[1]->data) {
+        const int64_t n = ggml_nelements(t->src[1]);
+        g_pos_cap.resize((size_t) n);
+        memcpy(g_pos_cap.data(), t->src[1]->data, (size_t) n * sizeof(int32_t));
     }
     return true;
 }

@@ -46,6 +46,15 @@ VERIFY compiled vs per-op:    rel_sq_err=1.10e-07  argmax 504 vs 504 -> MATCH
 Note that the graph llama runs first is its **warmup** graph (BOS+EOS), not your prompt. Use
 `TSI_WG_SKIP` to reach the real prompt graph.
 
+Capture is **prefill-from-scratch only**, and enforces it: the reconstruction rebuilds positions as
+`0..n-1` and attends over the current tokens with no cache, so it checks the live graph's real
+positions and refuses anything else rather than emitting valid-looking MLIR for a different function.
+Skipping too far lands on a decode graph and reports:
+
+```
+capture SKIPPED: live graph is not a prefill-from-scratch: position[0] is 2, expected 0.
+```
+
 ---
 
 ## Build (x86 build box)

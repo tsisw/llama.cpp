@@ -25,6 +25,10 @@ extern std::map<std::string, std::vector<float>> g_wcap;
 // which is why the reconstruction falls back to the live buffer at capture time.
 extern std::vector<int32_t> g_ids_cap;
 
+// The real positions of the live graph, captured for validation only: this reconstruction rebuilds
+// positions as 0..n-1, so it must refuse any graph whose actual positions differ.
+extern std::vector<int32_t> g_pos_cap;
+
 // Drop the scheduler's split annotations: "CPU#blk.0.attn_q.weight#0" -> "blk.0.attn_q.weight".
 static std::string wg_core_name(const char * raw) {
     std::string s = raw ? raw : "";
@@ -160,6 +164,33 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
         }
     }
     if (!pos_live || HEAD_DIM == 0) throw tsi::mlir_export::mlir_export_error("live graph: could not find ROPE/positions");
+
+    // This reconstruction is prefill-from-scratch: it rebuilds positions as 0..n-1 and attends only
+    // over the current tokens, with no KV cache. A decode graph (or a continued prefill) has
+    // positions offset by the cache length and attends over history, so reconstructing it this way
+    // would silently compute something entirely different - correct-looking MLIR for the wrong
+    // function. Refuse it instead. Checked against the snapshot when there is one, since the live
+    // position buffer is recycled scratch by the time maybe_run() reads it.
+    {
+        const int32_t * pos_src = nullptr;
+        int64_t         pos_n   = 0;
+        if (g_pos_cap.size() == (size_t) ggml_nelements(pos_live)) {
+            pos_src = g_pos_cap.data();
+            pos_n   = (int64_t) g_pos_cap.size();
+        } else if (pos_live->data) {
+            pos_src = (const int32_t *) pos_live->data;
+            pos_n   = ggml_nelements(pos_live);
+        }
+        for (int64_t i = 0; i < pos_n; i++) {
+            if (pos_src[i] == (int32_t) i) continue;
+            throw tsi::mlir_export::mlir_export_error(
+                "live graph is not a prefill-from-scratch: position[" + std::to_string(i) + "] is " +
+                std::to_string(pos_src[i]) + ", expected " + std::to_string(i) +
+                ". This is a decode or continued-prefill graph, which needs the KV cache as an "
+                "input and cannot be expressed by the cache-free reconstruction. Lower TSI_WG_SKIP "
+                "to reach the prefill graph, or use decode_cpu_check --emit for decode.");
+        }
+    }
 
     // attention scale from the first SOFT_MAX (op_params[0])
     for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
