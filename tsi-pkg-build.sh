@@ -975,13 +975,6 @@ build_fpga_impl() {
 
   run cmake --build "${build_dir}" --config Release || return 1
 
-  # decode_run (KV-cache decode runner) is EXCLUDE_FROM_ALL, so build it explicitly here. Warn-only:
-  # a decode_run build issue must never abort the fpga build / package.
-  if cmake --build "${build_dir}" --target decode_run --config Release; then
-    log_info "built decode_run (KV-cache decode runner)"
-  else
-    log_info "decode_run not built (skipped); the KV-cache decode flow will be unavailable on the box"
-  fi
   return 0
 }
 
@@ -1173,16 +1166,8 @@ EOL
   cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
-  # decode_run (KV-cache decode runner), driven by decode.sh (below). Ship the binary next to
-  # llama-cli. Warn-only: absence must never break a normal package build.
-  if [ -f "${build_dir}/bin/decode_run" ]; then
-    cp "${build_dir}/bin/decode_run" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" && log_info "bundled decode_run (KV-cache decode runner)"
-  else
-    log_info "decode_run not found (skipped): ${build_dir}/bin/decode_run"
-  fi
-
-  # whole-graph + decode tooling: ship the drivers + compile step + fpga compiler config next to
-  # llama-cli so the box can capture->compile->run (prefill) and emit->compile->run (decode) locally.
+  # whole-graph tooling: ship the compile step + fpga compiler config next to llama-cli so the box
+  # can capture->compile->run prefill locally (TSI_WHOLEGRAPH, via llama-cli itself).
   # Warn-only: a missing file must never break a normal package build.
   __wg_src="${__TSI_SCRIPT_DIR}/examples/mlir-export"
   for __wg in compile_graph_fpga.py tsi_raw_backend.py; do

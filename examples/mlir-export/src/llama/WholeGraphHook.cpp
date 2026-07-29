@@ -107,6 +107,13 @@ int manifest_nodes() {
 // valid. We snapshot each weight leaf here because the reconstruction can't read it later: the
 // scheduler's CPU# copies sit in recycled scratch and q/k/v have no persistent leaf.
 std::map<std::string, std::vector<float>> g_wcap;
+
+// The token ids, snapshotted for the same reason as the weights. build_cachefree_from_live rebuilds
+// positions and the causal mask arithmetically, so those need no snapshot, but it copies the ids out
+// of the live buffer - which is recycled scratch by the time maybe_run() executes. Without this the
+// reconstruction reads freed memory as token ids and ggml_get_rows aborts on an out-of-range index.
+std::vector<int32_t> g_ids_cap;
+
 extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * ud) {
     (void) ud;
     if (ask) return true;
@@ -123,6 +130,17 @@ extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * 
             v.resize((size_t) n);
             memcpy(v.data(), sc->data, (size_t) n * sizeof(float));
         }
+    }
+
+    // Token ids, identified exactly as build_cachefree_from_live identifies them: the i32 src1 of the
+    // GET_ROWS that reads the embedding table. Structural rather than by name, because llama names
+    // this input differently across versions.
+    if (g_ids_cap.empty() && t->op == GGML_OP_GET_ROWS && t->src[0] && t->src[1] &&
+        wg_core_name(t->src[0]->name) == "token_embd.weight" &&
+        t->src[1]->type == GGML_TYPE_I32 && t->src[1]->data) {
+        const int64_t n = ggml_nelements(t->src[1]);
+        g_ids_cap.resize((size_t) n);
+        memcpy(g_ids_cap.data(), t->src[1]->data, (size_t) n * sizeof(int32_t));
     }
     return true;
 }
@@ -231,6 +249,17 @@ bool tsi_wholegraph_maybe_run(struct ggml_cgraph * live) {
     }
     fprintf(stderr, "\n");
 
+    // Bring the TSI host runtime up before the first tsi_alloc. On a TSI build the ggml-tsavorite
+    // backend has already done this during llama_backend_init, but a plain host/FFM build has no
+    // such backend, and calling tsi_alloc on an uninitialized runtime segfaults. Initialize once per
+    // process; tsi_finalize runs after the compiled call below.
+    static bool rt_up = false;
+    if (!rt_up) {
+        tsi_initialize(1);
+        rt_up = true;
+        fprintf(stderr, "[tsi-wholegraph] TSI host runtime initialized (1 TXE)\n");
+    }
+
     // copy every arg into a device buffer the Xtensa blob can read (host pointers won't do)
     const size_t N = r.runtime_args.size();
     std::vector<void *> argv(N + 1);
@@ -239,11 +268,30 @@ bool tsi_wholegraph_maybe_run(struct ggml_cgraph * live) {
         const ggml_tensor * t = r.runtime_args[i];
         size_t nb  = ggml_nbytes(t);
         void * dev = tsi_alloc((int64_t) nb);
+        if (!dev) {
+            // Out of simulated DRAM: report it rather than segfaulting in the memcpy below.
+            fprintf(stderr, "[tsi-wholegraph] tsi_alloc failed for arg %zu (%zu bytes). Raise "
+                            "USER_DRAM_SIZE (MiB) and retry.\n", i, nb);
+            for (void * d : devbufs) tsi_dealloc(d);
+            ggml_free(r.ctx);
+            tsi_finalize();   // else the process will not exit
+            rt_up = false;
+            return false;
+        }
         memcpy(dev, t->data, nb);
         devbufs.push_back(dev);
         argv[i] = make_desc(t, dev);
     }
     void * dev_out = tsi_alloc(n_out * (int64_t) sizeof(float));
+    if (!dev_out) {
+        fprintf(stderr, "[tsi-wholegraph] tsi_alloc failed for the output buffer (%lld bytes). "
+                        "Raise USER_DRAM_SIZE (MiB) and retry.\n", (long long) (n_out * 4));
+        for (void * d : devbufs) tsi_dealloc(d);
+        ggml_free(r.ctx);
+        tsi_finalize();   // else the process will not exit
+        rt_up = false;
+        return false;
+    }
     devbufs.push_back(dev_out);
     argv[N] = make_desc(rout, dev_out);
 
@@ -289,5 +337,12 @@ bool tsi_wholegraph_maybe_run(struct ggml_cgraph * live) {
 
     for (void * d : devbufs) tsi_dealloc(d);
     ggml_free(r.ctx);
+
+    // Tear the runtime down explicitly. Without this the process does not exit: the runtime keeps
+    // state alive past main() and the wait never completes, so llama-cli appears to hang long after
+    // it has printed its final timings. The verify/run hook fires once, so finalizing here is safe.
+    tsi_finalize();
+    rt_up = false;
+
     return false;   // per-op already ran; nothing for the caller to skip
 }

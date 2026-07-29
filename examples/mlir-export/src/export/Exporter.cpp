@@ -31,8 +31,10 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
     if (n_nodes == 0) {
         unsupported("graph has no nodes");
     }
-    if (opts.runtime_args.empty()) {
-        unsupported("graph has no runtime input tensors");
+    // A graph with no runtime args is legal when every leaf was baked in as a constant, so the
+    // check is for no bound leafs at all, which would leave interior values undefined.
+    if (opts.runtime_args.empty() && opts.const_leafs.empty()) {
+        unsupported("graph has no runtime input tensors and no baked constants");
     }
 
     MLIRContext ctx;

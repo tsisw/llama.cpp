@@ -1,6 +1,6 @@
 // Public interface of the ggml-graph-to-linalg-MLIR exporter.
 //
-// Deliberately free of MLIR types. Consumers (tsi_wholegraph.cpp, decode_run.cpp, the tools) see
+// Deliberately free of MLIR types. Consumers (WholeGraphHook.cpp, the tools, the test generator) see
 // only ggml and std types, so they compile without MLIR's headers on their include path and merely
 // link the library. That keeps their compile times unaffected and lets them stay at C++20 while the
 // exporter itself is built at C++17 to match LLVM.
@@ -52,5 +52,22 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts);
 // Leaf/input tensors in first-seen order. Independent of which of them end up as arguments vs
 // baked constants; that split is the caller's, expressed through ExportOptions.
 std::vector<const ggml_tensor *> discoverLeafs(ggml_cgraph * gf);
+
+// True when a leaf is a model weight: a value fixed for the model's lifetime, as opposed to a
+// per-step input (token ids, positions, attention mask, KV cache). Matches the GGUF naming
+// convention - the core name, with any "BACKEND#" prefix and "#<copy>" suffix stripped, ends in
+// ".weight" - and additionally requires live data of a bakeable element type (f32 or i32).
+bool isModelWeight(const ggml_tensor * t);
+
+// Split `leafs` into the per-step inputs that stay function arguments and the model weights to
+// bake in as constants. Relative order within each output is preserved, so argument indices stay
+// the graph's first-seen order with the baked entries removed.
+//
+// Baking trades IR size for compile-time visibility of the weight values: the compiler can fold,
+// pre-tile and place them, and the resulting binary no longer depends on a matching weight buffer
+// at run time. Constants are printed in full, so total weight bytes bound what is practical.
+void partitionWeights(const std::vector<const ggml_tensor *> & leafs,
+                      std::vector<const ggml_tensor *> & args,
+                      std::vector<const ggml_tensor *> & consts);
 
 }  // namespace tsi::mlir_export

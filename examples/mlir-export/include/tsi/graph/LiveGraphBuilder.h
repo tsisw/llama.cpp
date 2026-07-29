@@ -17,9 +17,13 @@
 #include <string>
 #include <vector>
 
-// Weight data captured during llama's compute (defined in tsi_wholegraph.cpp). Keyed by core name,
+// Weight data captured during llama's compute (defined in WholeGraphHook.cpp). Keyed by core name,
 // empty until the graph has run once.
 extern std::map<std::string, std::vector<float>> g_wcap;
+
+// Token ids captured during llama's compute, for the same reason. Empty until the graph has run once,
+// which is why the reconstruction falls back to the live buffer at capture time.
+extern std::vector<int32_t> g_ids_cap;
 
 // Drop the scheduler's split annotations: "CPU#blk.0.attn_q.weight#0" -> "blk.0.attn_q.weight".
 static std::string wg_core_name(const char * raw) {
@@ -95,9 +99,24 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
         throw tsi::mlir_export::mlir_export_error("live graph missing tensor '" + core + "'");
     };
 
+    // Optional lookup: returns nullptr instead of throwing when the tensor is absent.
+    auto want = [&](const std::string & core) -> ggml_tensor * {
+        try {
+            return need(core);
+        } catch (const tsi::mlir_export::mlir_export_error &) {
+            return nullptr;
+        }
+    };
+
     ggml_tensor * embd_t    = need("token_embd.weight");
     ggml_tensor * outnorm_t = need("output_norm.weight");
-    ggml_tensor * outw_t    = need("output.weight");
+    // Tied embeddings (SmolLM2, Llama 3.2 1B, ...) have no separate output projection: the model
+    // reuses the embedding matrix for the final logits. DecodeModel.h makes the same substitution.
+    ggml_tensor * outw_t    = want("output.weight");
+    const bool    tied_embd = outw_t == nullptr;
+    if (tied_embd) {
+        outw_t = embd_t;
+    }
 
     const int HIDDEN  = (int) embd_t->ne[0];
     const int N_VOCAB = (int) embd_t->ne[1];
@@ -163,10 +182,11 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
 
     fprintf(stderr,
             "[tsi-wholegraph] live dims: layers=%d hidden=%d vocab=%d n_head=%d n_head_kv=%d "
-            "head_dim=%d inter=%d n_tokens=%d eps=%g\n"
+            "head_dim=%d inter=%d n_tokens=%d eps=%g tied_embd=%d\n"
             "[tsi-wholegraph] rope: n_dims=%d mode=%d freq_base=%g freq_scale=%g ext=%g attn=%g "
             "beta_fast=%g beta_slow=%g n_ctx_orig=%d  kq_scale=%g\n",
             N_LAYERS, HIDDEN, N_VOCAB, N_HEAD, N_HEAD_KV, HEAD_DIM, INTER, N_TOKENS, REAL_RMS_EPS,
+            (int) tied_embd,
             REAL_ROPE.n_dims, REAL_ROPE.mode, REAL_ROPE.freq_base, REAL_ROPE.freq_scale,
             REAL_ROPE.ext_factor, REAL_ROPE.attn_factor, REAL_ROPE.beta_fast, REAL_ROPE.beta_slow,
             REAL_ROPE.n_ctx_orig, REAL_KQ_SCALE);
@@ -215,10 +235,20 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     };
     embd_t    = bind_w("token_embd.weight",  embd_t);
     outnorm_t = bind_w("output_norm.weight", outnorm_t);
-    outw_t    = bind_w("output.weight",      outw_t);
+    // Tied: reuse the bound embedding rather than binding "output.weight" again. g_wcap has no entry
+    // under that name, so bind_w would fall back to the live buffer, which is recycled scratch by
+    // now - it would read garbage instead of the embedding matrix.
+    outw_t    = tied_embd ? embd_t : bind_w("output.weight", outw_t);
 
+    // Prefer the snapshot taken by tsi_wholegraph_eval_cb while the live buffer was still valid. At
+    // capture time (before compute) the callback has not run yet and the live buffer is correct; by
+    // maybe_run() time the live buffer is recycled scratch and only the snapshot is trustworthy.
     struct ggml_tensor * ids = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, N_TOKENS);
-    memcpy(ids->data, ids_live->data, ggml_nbytes(ids));
+    if (g_ids_cap.size() == (size_t) N_TOKENS) {
+        memcpy(ids->data, g_ids_cap.data(), ggml_nbytes(ids));
+    } else {
+        memcpy(ids->data, ids_live->data, ggml_nbytes(ids));
+    }
     // fresh prefill positions 0..n-1 (the live pos buffer is recycled after compute)
     struct ggml_tensor * pos = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, N_TOKENS);
     for (int i = 0; i < N_TOKENS; i++) ((int32_t *) pos->data)[i] = i;
@@ -259,8 +289,22 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     ggml_build_forward_expand(r.gf, logits);
 
     r.leafs = tsi::mlir_export::discoverLeafs(r.gf);
-    r.runtime_args = r.leafs;   // every leaf is a runtime arg; nothing baked
-        tsi::mlir_export::ExportOptions opts;
+
+    tsi::mlir_export::ExportOptions opts;
+    // TSI_WG_BAKE_WEIGHTS=1 bakes the model weights into the IR as constants, leaving only the
+    // per-step inputs (ids, positions, mask) as %args. That lets the compiler see the weight values,
+    // at the cost of printing all of them: a 1.1B f32 model is ~4.3 GiB of tensor data, which is an
+    // order of magnitude more as ASCII float literals. Default off - weights stay arguments.
+    const char * bake = getenv("TSI_WG_BAKE_WEIGHTS");
+    if (bake && atoi(bake) != 0) {
+        std::vector<const ggml_tensor *> consts;
+        tsi::mlir_export::partitionWeights(r.leafs, r.runtime_args, consts);
+        fprintf(stderr, "[tsi-wholegraph] baking %zu weight tensors as constants, %zu args remain\n",
+                consts.size(), r.runtime_args.size());
+        opts.const_leafs = consts;
+    } else {
+        r.runtime_args = r.leafs;   // every leaf is a runtime arg; nothing baked
+    }
     opts.runtime_args = r.runtime_args;
     r.func_text       = tsi::mlir_export::exportGraph(r.gf, opts);
     return r;

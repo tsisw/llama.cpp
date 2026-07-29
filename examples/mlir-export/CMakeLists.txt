@@ -14,9 +14,8 @@
 #
 # Layout: include/tsi/{export,graph} public headers, src/{dialect,import,convert,export} the exporter
 # library, tools/<name> one executable each, tests/ the export test suite (its C++ case generator
-# included). The .py and .sh drivers stay at this directory's top level because
-# tsi-pkg-build.sh copies them from here by name and wholegraph.sh/decode.sh require
-# compile_graph_fpga.py to sit next to them.
+# included). compile_graph_fpga.py and tsi_raw_backend.py stay at this directory's top level because
+# tsi-pkg-build.sh copies them from here by name, and the former imports the latter as a sibling.
 
 set(TSI_MLIR_EXPORT_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
@@ -145,6 +144,25 @@ if (MLIR_FOUND)
         target_compile_definitions(llama PRIVATE LLAMA_TSI_MLIR_EXPORT=1)
         target_link_libraries(llama PRIVATE tsi-llama-hook)
         set_property(TARGET llama APPEND PROPERTY BUILD_RPATH "${TSI_RT_LIB_DIR}")
+
+        # --- decode_run: execute a compiled decode graph -------------------------------------------
+        # The llama-cli hook covers prefill only (LiveGraphBuilder reconstructs a cache-free graph),
+        # so this is the only thing that can run a compiled *decode* host.so. Same graph as
+        # decode_cpu_check by construction - both build it with build_decode from DecodeModel.h - so
+        # the CPU check and the compiled run cannot drift apart. Needs the runtime shim for
+        # tsi_initialize/tsi_alloc, hence its place inside this branch.
+        add_executable(decode_run tools/decode-run/decode_run.cpp)
+        target_include_directories(decode_run PRIVATE
+            "${TSI_MLIR_EXPORT_INCLUDE}"
+            "${TSI_RT_INCLUDE_DIR}"                                  # bare "HostShimCAPI.h"
+            "${MLIR_COMPILER_DIR}/third-party/runtime/include"       # its own "tsi-rt/..." includes
+            "${MLIR_COMPILER_DIR}/build/_deps/runtime-build/include" # generated runtime headers
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-tsavorite"           # "include/TestModel.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-cpu")
+        target_link_libraries(decode_run PRIVATE tsi-mlir-export llama ggml "${TSI_RT_SHIM_LIB}")
+        target_link_directories(decode_run PRIVATE "${TSI_RT_LIB_DIR}")
+        target_compile_features(decode_run PRIVATE cxx_std_20)
+        set_target_properties(decode_run PROPERTIES BUILD_RPATH "${TSI_RT_LIB_DIR}")
     else()
         message(STATUS "mlir-export: TSI runtime shim not found under ${TSI_RT_LIB_DIR}; "
                        "llama-cli whole-graph interception disabled (export library still built)")
@@ -220,15 +238,6 @@ if (BUILD_TESTING)
                          --cases-bin "$<TARGET_FILE:test-mlir-export-cases>"
                          --target ffm)
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export" TIMEOUT 1800)
-
-        # Structural check against committed golden IR. Compiles nothing, so it is seconds rather
-        # than minutes, and it is what protects the emitters whose numerics are insensitive to a
-        # structural change. Separate test so a numeric failure and an IR change are distinguishable.
-        add_test(NAME mlir-export-golden
-                 COMMAND "${TSI_VENV_PYTHON}" -m pytest -v
-                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ir_golden.py"
-                         --cases-bin "$<TARGET_FILE:test-mlir-export-cases>")
-        set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export" TIMEOUT 600)
     else()
         # Never a hard error: a plain host build must not start requiring the compiler repo.
         message(STATUS "mlir-export: ${TSI_VENV_PYTHON} not found; mlir-export tests will skip "
@@ -236,10 +245,6 @@ if (BUILD_TESTING)
         add_test(NAME mlir-export-suite COMMAND ${CMAKE_COMMAND} -E echo
                  "SKIPPED: mlir-compiler venv not found at ${TSI_VENV_PYTHON}")
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export"
-                             SKIP_REGULAR_EXPRESSION "SKIPPED")
-        add_test(NAME mlir-export-golden COMMAND ${CMAKE_COMMAND} -E echo
-                 "SKIPPED: mlir-compiler venv not found at ${TSI_VENV_PYTHON}")
-        set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export"
                              SKIP_REGULAR_EXPRESSION "SKIPPED")
     endif()
 

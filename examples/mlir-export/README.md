@@ -3,28 +3,48 @@
 Compile the **entire** ggml forward pass as one MLIR `func @forward` with the TSI mlir-compiler, run
 it on tsisim/FPGA, and verify the next token against llama.cpp's own per-op output.
 
-The flow has three steps (capture → compile → verify/run), wrapped by `wholegraph.sh`:
+There are **no wrapper scripts**. The hook is compiled into `libllama`, so plain `llama-cli` drives
+it and the flow is three steps: capture → compile → verify/run.
 
-```
-./wholegraph.sh -m <model.gguf> -p "<prompt>" -n <ntokens> --mode verify
+```sh
+RT=~/repo/mlir-compiler/build/_deps/runtime-build/lib
+
+# 1. capture: export the prefill graph as linalg MLIR
+TSI_WHOLEGRAPH=capture TSI_WG_DIR=. \
+  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv     # -> ./forward.mlir
+
+# 2. compile: MLIR -> host.so  (--target posix also covers host FFM, despite the file name)
+USER_DRAM_SIZE=16348 TSI_RT_LIB_DIR=$RT \
+  ~/repo/mlir-compiler/venv/bin/python compile_graph_fpga.py forward.mlir out_ffm
+
+# 3. verify: run the compiled forward, diff its next-token argmax against llama's per-op result
+USER_DRAM_SIZE=16348 DYLD_LIBRARY_PATH=$RT TSI_WHOLEGRAPH=verify TSI_WG_DIR=. \
+TSI_WG_LIB=$PWD/out_ffm/host/host.so \
+  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv
 ```
 
-| flag | meaning |
+| env var | meaning |
 |---|---|
-| `-m` | model gguf path |
-| `-p` | prompt |
-| `-n` | number of tokens (used by `gen`) |
-| `--mode` | `capture` \| `dump` \| `verify` \| `run` \| `gen` |
+| `TSI_WHOLEGRAPH` | `capture` \| `dump` \| `verify` \| `run`; unset = the hook is a no-op |
+| `TSI_WG_DIR` | where `forward.mlir` / `forward.manifest` are written and read |
+| `TSI_WG_LIB` | compiled `host.so` to load (`verify`, `run`) |
+| `TSI_WG_SKIP` | skip N graphs before capturing (skips llama's warmup graphs) |
+| `TSI_WG_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
+| `TSI_WG_BAKE_WEIGHTS` | bake weights as constants instead of args (see the size caveat below) |
+| `TSI_DUMP_GGML_IR` | also dump the ggml dialect before lowering to linalg |
+| `USER_DRAM_SIZE` | simulated device DRAM budget; a 1.1B f32 model needs `16348` |
+| `TSI_RT_LIB_DIR` | where `libTsavRTShimCAPI` lives, for linking `host.o` -> `host.so` |
 
-Modes: `capture` exports `forward.mlir`; `dump` writes `graph.txt`; `verify` runs the compiled
-forward and diffs its next-token argmax against the per-op reference; `run` also samples the
-compiled token; `gen` generates `-n` tokens, each from the compiled forward (prefill-only:
-re-capture + recompile over the growing sequence per token — a correctness demo, not the fast path).
+Verified end to end on SmolLM2-135M f32 (30 layers, tied embeddings): 874 nodes, 275 args, and
 
-Example — generate 16 tokens on the compiled forward:
 ```
-./wholegraph.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" -n 16 --mode gen
+VERIFY recon-CPU vs per-op:   rel_sq_err=1.09e-07  argmax 504 vs 504 -> MATCH
+VERIFY compiled vs recon-CPU: rel_sq_err=2.25e-12  argmax 504 vs 504 -> MATCH
+VERIFY compiled vs per-op:    rel_sq_err=1.10e-07  argmax 504 vs 504 -> MATCH
 ```
+
+Note that the graph llama runs first is its **warmup** graph (BOS+EOS), not your prompt. Use
+`TSI_WG_SKIP` to reach the real prompt graph.
 
 ---
 
@@ -62,8 +82,8 @@ cd /root/tsi-ggml
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/bin/tsi/bin/tsi-ggml
 # 3. copy the TXE blobs into the runtime's load path:
 ./ggml.sh
-# 4. run:
-./wholegraph.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" -n 1 --mode verify
+# 4. capture, compile, verify - same three commands as the host flow above, with
+#    TXE_FPGA_CONFIG=txe_arm.json and --target fpga on the compile step.
 ```
 
 Expected tail:
@@ -77,41 +97,59 @@ Expected tail:
 - **Activate the compiler venv before running** — the compile step (`compile_graph_fpga.py`) imports
   the mlir-compiler wheel packages.
 - **`./ggml.sh` must run once after deploy** so the runtime finds the TXE blobs.
-- `wholegraph.sh` bakes the SDK/Xtensa environment; override any path with the matching env var
-  (`MLIR_SDK_VERSION`, `XT_TOOLS_DIR`, `XT_SYSTEM_DIR`, `TSI_RT_LIB_DIR`, `TXE_FPGA_CONFIG`, …) or the
-  `--host tsisim|x86`, `--sdk`, `-c`, `-d` flags. `--host tsisim` (default) uses `txe_arm.json`.
-- Host-only CPU checks (no FPGA): build `ref_check` + `recon_cpu_check` and compare argmax
+- The SDK/Xtensa paths are read from the environment (`MLIR_SDK_VERSION`, `XT_TOOLS_DIR`,
+  `XT_SYSTEM_DIR`, `TSI_RT_LIB_DIR`, `TXE_FPGA_CONFIG`); `txe_arm.json` is the tsisim/arm config.
+- Host-only CPU checks (no device): build `ref_check` + `recon_cpu_check` and compare argmax
   (`ref_check <gguf> "<prompt>"` prints the ids + reference token; `recon_cpu_check <gguf> <ids…>`
-  prints the reconstruction's argmax).
+  prints the reconstruction's argmax). These cover `build_layer` in `ModelLayer.h`, which is what the
+  capture path reconstructs with.
 
 ---
 
-## KV-cache decode (fast multi-token)
+## KV-cache decode
 
-`wholegraph.sh --mode gen` recompiles per token (O(n²)). `decode.sh` is the fast path: it compiles
-**one** fixed-length decode graph and reuses it for every token, with the KV cache held on the host
-(each step's `k_new`/`v_new` are read back and appended). Design details are in the
-`WHOLEGRAPH-TSI-FLOW.md` doc (§13).
+The `llama-cli` hook covers **prefill only**: `LiveGraphBuilder` rebuilds a *cache-free* graph,
+because llama's in-place KV cache cannot be expressed as a pure tensor function.
 
-`decode_run` + `decode.sh` are built and bundled into the `.tz` by the same package build, so on
-tsisim there's no extra build step — same deploy as above (untar, repoint symlink, `./ggml.sh`),
-then:
+The decode graph is a separate, fixed-length graph — one MLIR func returning logits plus per-layer
+`k_new`/`v_new`, reused for every token with the cache held on the host. Two tools share it, both
+building it with `build_decode` from `DecodeModel.h`, so the checked graph and the compiled graph
+cannot drift apart: `decode_cpu_check` emits it and checks it on CPU, `decode_run` executes the
+compiled result.
 
+```sh
+cmake --build build --target decode_cpu_check decode_run
+ids=$(./build/bin/ref_check smollm2-135m-f32.gguf "hello world" | sed -n 's/^ids: //p')
+
+# CPU check + emit: decode step k (cache = tokens 0..k-1) must equal prefill(0..k) at the last position
+./build/bin/decode_cpu_check smollm2-135m-f32.gguf $ids --L 6 --emit decode.mlir
+
+# compile, exactly as for prefill
+USER_DRAM_SIZE=16348 TSI_RT_LIB_DIR=$RT \
+  ~/repo/mlir-compiler/venv/bin/python compile_graph_fpga.py decode.mlir out_decode
+
+# run the compiled decode graph, diffing every step against a CPU prefill of the same prefix
+USER_DRAM_SIZE=16348 DYLD_LIBRARY_PATH=$RT ./build/bin/decode_run smollm2-135m-f32.gguf \
+    --lib out_decode/host/host.so --prompt "hello world" --L 6 --gen 2 --verify
 ```
-./decode.sh -m /root/tinyllama-v0-f32.gguf -p "hello world" --gen 16 --verify
-```
 
-| flag | meaning |
-|---|---|
-| `-m` | model gguf path |
-| `-p` | prompt (tokenized by llama); or `--ids "id0 id1 …"` for raw token ids |
-| `--gen` | number of tokens to generate |
-| `--L` | cache cap (default `n_prompt + gen + 2`); must be ≥ prompt + gen |
-| `--verify` | also run a CPU prefill each step and diff the argmax |
+`decode_cpu_check <gguf> <id0> [id1 …]` takes `--L` (cache cap, ≥ number of ids), `--emit <file>` and
+`--dump-io <dir>` (every input/output of step 0 plus a `manifest.json`). `decode_run` takes
+`--lib`/`--emit`, `--prompt` or raw ids, `--L`, `--gen` and `--verify`.
 
-It prints the generated ids and the detokenized text; `--verify` adds a per-step `MATCH` line and a
-`compiled-decode vs prefill: k/k MATCH` tail. Use the 1.1B gguf for coherent text — `tinyllama-v0` is
-a toy model (the decode is numerically exact regardless).
+Verified on SmolLM2-135M f32: 336 args, 61 outputs, `_mlir_ciface_forward` 397 pointer args, and
+`compiled-decode vs prefill: 3/3 MATCH` with rel_sq_err ≤ 1.2e-12.
+
+---
+
+## Notes on the host runtime
+
+`tsi_initialize()` must be called before the first `tsi_alloc()`, and `tsi_finalize()` before exit.
+On a TSI build the ggml-tsavorite backend does both during `llama_backend_init` / `ggml_backend_free`;
+a plain host/FFM build has no such backend, so `WholeGraphHook.cpp` and `decode_run.cpp` do it
+themselves. Skipping the init segfaults on the first allocation; skipping the finalize makes the
+process **hang at exit**, idling long after it has printed its results — which looks like slow compute
+but is not.
 
 Host-only check (no FPGA): `decode_cpu_check <gguf> <ids…> --L <n>` runs the same fixed-L decode
 against a CPU prefill and prints the per-step MATCH.
@@ -188,44 +226,39 @@ model file and no hardware.
 ctest --test-dir build -L mlir-export --output-on-failure
 ```
 
-Three tests, deliberately separate so a failure names its own cause:
+Two tests, deliberately separate so a failure names its own cause:
 
 | Test | What it proves | Needs | Time |
 |---|---|---|---|
-| `mlir-export-suite` | the compiled graph matches ggml numerically | TSI compiler venv | ~17 s |
-| `mlir-export-golden` | the emitted linalg is structurally unchanged | venv (parse only) | ~0.4 s |
+| `mlir-export-suite` | the compiled graph matches ggml numerically | TSI compiler venv | ~12 s |
 | `mlir-export-lit` | each ggml op lowers to the expected linalg | `llvm-lit`, `FileCheck` | ~0.2 s |
 
 `MLIR_COMPILER_DIR` defaults to `~/repo/mlir-compiler`; point it elsewhere with
 `cmake -B build -DMLIR_COMPILER_DIR=<path>`. If its `venv/bin/python` is missing the suite reports
 **skipped** and configure still succeeds — a host build never starts requiring the compiler repo.
 
-21 cases, covering every one of the exporter's op lowerings: `add`, `mul`, `scale`, `silu`,
+23 cases, covering every one of the exporter's op lowerings: `add`, `mul`, `scale`, `silu`,
 `rms_norm`, `soft_max`, `matmul`, `matmul_add`, `matmul_vec`, `matmul_3d`, `matmul_gqa`, `permute`,
 `permute_size1`, `reshape_split`, `reshape_merge`, `concat`, `get_rows`, `get_rows_1tok`, `rope_2d`,
-`rope_3d`, plus `add_negative`.
+`rope_3d`, plus `matmul_const_w` / `get_rows_const_w` (baked-constant weights) and `add_negative`.
 
 The seven pure data-movement cases are held to **bit-exact** equality (`rtol=atol=0`); they measure
 0.0 error, so that is a real constraint rather than an accident. rope measures 1.5e-07/1.8e-07 max
 abs and the matmul variants 2.4e-07 to 9.5e-07. Tolerances are measured, never guessed.
 
-### Golden IR
+### Weights as arguments or as constants
 
-`tests/golden/<case>.mlir` holds the linalg each case is expected to produce. Both sides are parsed
-and re-printed with MLIR before comparison, so differences that are legitimate between one emitter
-and another cancel out (inline `affine_map` vs hoisted `#map` aliases, SSA numbering, auto names like
-`%transposed`, whitespace, attribute order) while real structure survives: op sequence, types,
-shapes, permutations, reassociation indices, iterator types, constant values.
+By default every leaf becomes a `%arg`, weights included, so the compiled `host.so` is independent of
+the weight values and one compile serves any checkpoint of the same architecture. `ExportOptions`
+also supports baking weights in as `arith.constant`, selected by `partitionWeights()` (leaf name ends
+in `.weight`) and enabled on the capture path with `TSI_WG_BAKE_WEIGHTS=1`. Baking lets the compiler
+see the values and fold, pre-tile and place them.
 
-These goldens were captured from the original string emitter, so they are what proves the MLIR C++
-rewrite preserved behavior. Regenerating them is deliberate:
-
-```
-./build/bin/test-mlir-export-cases --emit-all /tmp/c
-for d in /tmp/c/*/; do cp "$d/forward.mlir" tests/golden/"$(basename $d)".mlir; done
-```
-
-Only do that when you intend the IR to change, and review the diff.
+The cost is IR size, and it is severe. MLIR prints a large `dense<>` as hex, exactly 2 characters per
+byte, so a TinyLlama-1.1B f32 prefill graph goes from **0.69 MiB to 8.20 GiB** (measured, 201 weights
+baked, 3 args left). The two `*_const_w` test cases prove the path is correct at test scale; treat
+whole-model baking as impractical until the constants move to `dense_resource` with a bytecode or
+sidecar payload.
 
 ### Per-op lowering tests (lit + FileCheck)
 

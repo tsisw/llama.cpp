@@ -20,7 +20,6 @@ endif()
 # accepted. Warn with the reason rather than leaving a bare undefined-symbol error to interpret.
 if (TARGET tsi-mlir-export)
     target_link_libraries(ggml-tsavorite PRIVATE tsi-mlir-export)
-    target_link_libraries(decode_run PRIVATE tsi-mlir-export)
 else()
     message(WARNING
         "ggml-tsavorite: tsi-mlir-export target not present, so TSI_WHOLEGRAPH capture will not "
@@ -58,16 +57,4 @@ set_target_properties(ggml-tsavorite PROPERTIES
   BUILD_RPATH "${CMAKE_BINARY_DIR}/lib/ollama"
 )
 endif()
-
-# Standalone runner for the compiled KV-cache decode graph. Needs the TSI runtime (tsi_alloc, via
-# TLIBS) and, at run time, the compiled decode host.so. EXCLUDE_FROM_ALL so it never blocks the
-# package build - build on demand: cmake --build <dir> --target decode_run
-add_executable(decode_run EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/mlir-export/tools/decode-run/decode_run.cpp)
-target_include_directories(decode_run PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/mlir-export/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu)
-target_link_libraries(decode_run PRIVATE llama ggml-tsavorite ggml ggml-base ggml-cpu ${TLIBS} dl rt)
-target_compile_features(decode_run PRIVATE cxx_std_20)
 

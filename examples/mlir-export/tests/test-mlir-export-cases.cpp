@@ -105,6 +105,10 @@ struct case_spec {
     float        atol;
     const char * expect;   // "pass" | "mismatch"
     bool         corrupt;  // deliberately poison expected_0.bin (harness self-check)
+    // Bake the leafs isModelWeight() accepts (name ends ".weight") into the IR as constants instead
+    // of passing them as %args. Uses the same classifier as the llama capture path, so this covers
+    // the production rule and not a test-only approximation.
+    bool         bake_weights;
 };
 
 static ggml_tensor * build_add(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
@@ -343,43 +347,80 @@ static ggml_tensor * build_rope_3d(ggml_context * ctx, std::vector<const ggml_te
     return ggml_rope(ctx, x, pos, head_dim, GGML_ROPE_TYPE_NORMAL);
 }
 
+// --- baked-constant weights ------------------------------------------------------------------
+// Both cases name one leaf "*.weight" so isModelWeight() selects it and emit_case bakes it in as an
+// arith.constant, leaving the other leaf as the sole %arg. The math is identical to the non-baked
+// case above, so a broken bake shows up as a numeric mismatch against ggml, not a shape error.
+// These two cover the only two ways llama consumes a weight: as a matmul operand, and as a
+// get_rows table (token_embd.weight, the first op of every llama graph).
+
+static ggml_tensor * build_matmul_const_w(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    const int K = 32, M = 32, N = 32;
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_set_name(w, "proj.weight");
+    ggml_set_name(x, "x");
+    args.push_back(w);
+    args.push_back(x);
+    return ggml_mul_mat(ctx, w, x);
+}
+
+static ggml_tensor * build_get_rows_const_w(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    const int     n_embd = 32, n_vocab = 16, n_tokens = 4;
+    ggml_tensor * tbl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(tbl, "token_embd.weight");
+    ggml_set_name(ids, "ids");
+    fill_seeded_i32(ids, 0x5EEDu, n_vocab);
+    args.push_back(tbl);
+    args.push_back(ids);
+    return ggml_get_rows(ctx, tbl, ids);
+}
+
 static const case_spec CASES[] = {
-    { "add",          build_add, 0.0f, 0.0f, "pass",     false },
+    //  name              build              rtol   atol   expect      corrupt  bake
+    { "add",          build_add, 0.0f, 0.0f, "pass",     false, false },
     // Proves the comparison in test_mlir_export.py actually compares. If a harness bug made the
     // check vacuous, every other case would still pass and this one would too - so this must fail
     // to match, by construction.
-    { "add_negative", build_add, 0.0f, 0.0f, "mismatch", true  },
-    { "mul",          build_mul,      0.0f,  0.0f,  "pass", false },
-    { "scale",        build_scale,    0.0f,  0.0f,  "pass", false },
-    { "silu",         build_silu,     1e-5f, 1e-6f, "pass", false },
-    { "rms_norm",     build_rms_norm, 1e-5f, 1e-6f, "pass", false },
-    { "soft_max",     build_soft_max, 1e-5f, 1e-6f, "pass", false },
+    { "add_negative", build_add, 0.0f, 0.0f, "mismatch", true,  false },
+    { "mul",          build_mul,      0.0f,  0.0f,  "pass", false, false },
+    { "scale",        build_scale,    0.0f,  0.0f,  "pass", false, false },
+    { "silu",         build_silu,     1e-5f, 1e-6f, "pass", false, false },
+    { "rms_norm",     build_rms_norm, 1e-5f, 1e-6f, "pass", false, false },
+    { "soft_max",     build_soft_max, 1e-5f, 1e-6f, "pass", false, false },
     // atol 1e-5, not 1e-6: a 32x32x32 f32 matmul measures max abs err ~5.7e-06 from reduction
     // reassociation in the lowered code. Measured, not guessed.
-    { "matmul",       build_matmul,     1e-5f, 1e-5f, "pass", false },
-    { "matmul_add",   build_matmul_add, 1e-5f, 1e-5f, "pass", false },
+    { "matmul",       build_matmul,     1e-5f, 1e-5f, "pass", false, false },
+    { "matmul_add",   build_matmul_add, 1e-5f, 1e-5f, "pass", false, false },
 
     // Same reduction-reassociation tolerance as matmul, for the same reason. Measured max abs err
     // on FFM: vec 2.4e-07, 3d 5.1e-07, gqa 9.5e-07 - all inside atol 1e-5 with ~10x headroom.
-    { "matmul_vec",   build_matmul_vec, 1e-5f, 1e-5f, "pass", false },
-    { "matmul_3d",    build_matmul_3d,  1e-5f, 1e-5f, "pass", false },
-    { "matmul_gqa",   build_matmul_gqa, 1e-5f, 1e-5f, "pass", false },
+    { "matmul_vec",   build_matmul_vec, 1e-5f, 1e-5f, "pass", false, false },
+    { "matmul_3d",    build_matmul_3d,  1e-5f, 1e-5f, "pass", false, false },
+    { "matmul_gqa",   build_matmul_gqa, 1e-5f, 1e-5f, "pass", false, false },
 
     // Pure data movement, no arithmetic, so these are held to BIT-EXACT equality (rtol=atol=0).
     // All seven measure max abs err exactly 0.0, so the zero tolerance is a real constraint and
     // not an accident waiting to flake.
-    { "permute",        build_permute,        0.0f, 0.0f, "pass", false },
-    { "permute_size1",  build_permute_size1,  0.0f, 0.0f, "pass", false },
-    { "reshape_split",  build_reshape_split,  0.0f, 0.0f, "pass", false },
-    { "reshape_merge",  build_reshape_merge,  0.0f, 0.0f, "pass", false },
-    { "concat",         build_concat,         0.0f, 0.0f, "pass", false },
-    { "get_rows",       build_get_rows,       0.0f, 0.0f, "pass", false },
-    { "get_rows_1tok",  build_get_rows_1tok,  0.0f, 0.0f, "pass", false },
+    { "permute",        build_permute,        0.0f, 0.0f, "pass", false, false },
+    { "permute_size1",  build_permute_size1,  0.0f, 0.0f, "pass", false, false },
+    { "reshape_split",  build_reshape_split,  0.0f, 0.0f, "pass", false, false },
+    { "reshape_merge",  build_reshape_merge,  0.0f, 0.0f, "pass", false, false },
+    { "concat",         build_concat,         0.0f, 0.0f, "pass", false, false },
+    { "get_rows",       build_get_rows,       0.0f, 0.0f, "pass", false, false },
+    { "get_rows_1tok",  build_get_rows_1tok,  0.0f, 0.0f, "pass", false, false },
 
     // RoPE recomputes cos/sin in the emitted IR rather than reusing ggml's, so it cannot be exact.
     // Measured max abs err on FFM: 2d 1.5e-07, 3d 1.8e-07, both well inside atol 1e-6.
-    { "rope_2d",      build_rope_2d,    1e-5f, 1e-6f, "pass", false },
-    { "rope_3d",      build_rope_3d,    1e-5f, 1e-6f, "pass", false },
+    { "rope_2d",      build_rope_2d,    1e-5f, 1e-6f, "pass", false, false },
+    { "rope_3d",      build_rope_3d,    1e-5f, 1e-6f, "pass", false, false },
+
+    // Weights baked into the IR as constants instead of passed as %args (bake = true). Tolerances
+    // match their non-baked twins: baking changes where a value comes from, not the arithmetic, so
+    // get_rows stays bit-exact and matmul keeps the reduction-reassociation allowance.
+    { "matmul_const_w",   build_matmul_const_w,   1e-5f, 1e-5f, "pass", false, true },
+    { "get_rows_const_w", build_get_rows_const_w, 0.0f,  0.0f,  "pass", false, true },
 };
 
 static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);
@@ -422,11 +463,27 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
         return false;
     }
 
+    // Split off the weights to bake, if this case asks for it. `runtime` is what stays as %args and
+    // therefore what the runner has to supply; the baked leafs are read out of the graph by the
+    // exporter, so they must still hold their filled data here (they do - fill ran above).
+    std::vector<const ggml_tensor *> runtime = args;
+    std::vector<const ggml_tensor *> baked;
+    if (spec.bake_weights) {
+        runtime.clear();
+        tsi::mlir_export::partitionWeights(args, runtime, baked);
+        if (baked.empty()) {
+            fprintf(stderr, "%s: bake_weights set but no leaf matched isModelWeight()\n", spec.name);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+
     std::string expect = spec.expect;
     std::string mlir;
     try {
         tsi::mlir_export::ExportOptions opts;
-        opts.runtime_args = args;
+        opts.runtime_args = runtime;
+        opts.const_leafs  = baked;
         mlir              = tsi::mlir_export::exportGraph(gf, opts);
     } catch (const tsi::mlir_export::mlir_export_error & e) {
         // Exporter gap: record it so the runner xfails with a reason instead of the build breaking.
@@ -438,12 +495,12 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
     std::ofstream(dir / "forward.mlir") << mlir;
 
     std::string args_json;
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < runtime.size(); i++) {
         std::string fn = "input_" + std::to_string(i) + ".bin";
-        write_tensor(dir / fn, args[i]);
+        write_tensor(dir / fn, runtime[i]);
         if (i) args_json += ",\n             ";
-        args_json += "{\"file\": \"" + fn + "\", \"shape\": " + shape_json(mlir_shape_of(args[i])) +
-                     ", \"dtype\": \"" + dtype_of(args[i]) + "\"}";
+        args_json += "{\"file\": \"" + fn + "\", \"shape\": " + shape_json(mlir_shape_of(runtime[i])) +
+                     ", \"dtype\": \"" + dtype_of(runtime[i]) + "\"}";
     }
 
     if (spec.corrupt) {

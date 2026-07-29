@@ -10,7 +10,9 @@
 #include "include/TestModel.h"     // MemRefDescriptor<N>, tsi_alloc, tsi_dealloc
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "ggml-tsavorite.h"        // ggml_backend_tsavorite_init/_free (clean TSI runtime finalize)
+// No ggml-tsavorite dependency: this builds and runs on a plain host (FFM) build. The TSI host
+// runtime is brought up directly with tsi_initialize / torn down with tsi_finalize, rather than
+// relying on the ggml-tsavorite backend to do it during llama_backend_init.
 #include "llama.h"                 // tokenize a --prompt, detokenize the output
 
 #include <dlfcn.h>
@@ -127,9 +129,11 @@ int main(int argc, char ** argv) {
     auto leafs = tsi::mlir_export::discoverLeafs(gf);
     fprintf(stderr, "graph: leafs=%zu outputs=%zu\n", leafs.size(), outs.size());
 
-    // handle only for a clean finalize: the runtime is already up (llama_backend_init), and
-    // ggml_backend_free below runs hal_lib_deinit so the static destructor doesn't abort.
-    ggml_backend_t tsi_be = ggml_backend_tsavorite_init();
+    // Bring the TSI host runtime up. On a TSI build the ggml-tsavorite backend does this during
+    // llama_backend_init; a plain host/FFM build has no such backend, so do it explicitly here or
+    // the first tsi_alloc segfaults. The matching tsi_finalize at the end is mandatory - without it
+    // the process never exits, it just sits idle after printing its results.
+    tsi_initialize(1);
 
     // --emit: write this graph as the multi-output MLIR func (same leaf order as the run below)
     if (emit) {
@@ -140,7 +144,7 @@ int main(int argc, char ** argv) {
         // exportGraph returns a complete module, so no wrapping here any more.
         std::ofstream f(emit); f << tsi::mlir_export::exportGraph(gf, opts);
         fprintf(stderr, "emitted decode graph: L=%d leafs=%zu outputs=%zu -> %s\n", L, leafs.size(), outs.size(), emit);
-        if (!lib) { ggml_free(dc); ggml_free(M.wc); llama_model_free(lmodel); ggml_backend_free(tsi_be); return 0; }
+        if (!lib) { ggml_free(dc); ggml_free(M.wc); llama_model_free(lmodel); tsi_finalize(); return 0; }
     }
 
     // device buffers + descriptors: argv = [desc(leaf0..), desc(out0..)]
@@ -240,6 +244,6 @@ int main(int argc, char ** argv) {
     for (void * d : dev_out)  tsi_dealloc(d);
     ggml_free(dc); ggml_free(M.wc);
     llama_model_free(lmodel);
-    ggml_backend_free(tsi_be);   // hal_lib_deinit / tsi_finalize - clean runtime teardown
+    tsi_finalize();   // mandatory: without it the process hangs at exit instead of returning
     return mism == 0 ? 0 : 1;
 }

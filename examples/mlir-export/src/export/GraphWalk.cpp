@@ -1,7 +1,9 @@
-// Leaf discovery. The ggml-op dispatch now lives in the importer (src/import/Importer.cpp).
+// Leaf discovery and weight/input classification. The ggml-op dispatch now lives in the importer
+// (src/import/Importer.cpp).
 #include "Builder.h"
 
 #include <map>
+#include <string>
 
 using namespace mlir;
 
@@ -28,6 +30,46 @@ std::vector<const ggml_tensor *> discoverLeafs(ggml_cgraph * gf) {
         }
     }
     return leafs;
+}
+
+// Strip the scheduler's decorations from a tensor name: a leading "BACKEND#" and a trailing
+// "#<copy-index>". Mirrors wg_core_name in LiveGraphBuilder.h; duplicated rather than shared
+// because that header is llama-specific and this library must not depend on it.
+static std::string core_name(const char * raw) {
+    std::string s = raw ? raw : "";
+    auto h1 = s.find('#');
+    if (h1 != std::string::npos) {
+        s = s.substr(h1 + 1);
+    }
+    auto h2 = s.rfind('#');
+    if (h2 != std::string::npos) {
+        s = s.substr(0, h2);
+    }
+    return s;
+}
+
+bool isModelWeight(const ggml_tensor * t) {
+    if (t == nullptr || t->data == nullptr) {
+        return false;   // no data to bake
+    }
+    // Only f32/i32 can be baked; bakedConstant reads those two element types.
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const std::string cn = core_name(t->name);
+    return cn.size() >= 7 && cn.compare(cn.size() - 7, 7, ".weight") == 0;
+}
+
+void partitionWeights(const std::vector<const ggml_tensor *> & leafs,
+                      std::vector<const ggml_tensor *> & args,
+                      std::vector<const ggml_tensor *> & consts) {
+    for (const ggml_tensor * t : leafs) {
+        if (isModelWeight(t)) {
+            consts.push_back(t);
+        } else {
+            args.push_back(t);
+        }
+    }
 }
 
 }  // namespace tsi::mlir_export
