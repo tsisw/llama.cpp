@@ -5,9 +5,6 @@
 
 namespace tsi::mlir_export {
 
-void populateNormPatterns(mlir::RewritePatternSet &) {}    // ggml.rms_norm, ggml.soft_max
-void populateMatmulPatterns(mlir::RewritePatternSet &) {}  // ggml.mul_mat
-void populateShapePatterns(mlir::RewritePatternSet &) {}    // permute, reshape, cont, concat, get_rows
 void populateRopePatterns(mlir::RewritePatternSet &) {}     // ggml.rope
 
 }  // namespace tsi::mlir_export

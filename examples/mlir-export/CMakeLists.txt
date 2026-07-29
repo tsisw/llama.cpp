@@ -75,6 +75,9 @@ if (MLIR_FOUND)
         src/convert/GgmlToLinalg.cpp
         src/convert/PatternSupport.cpp
         src/convert/PatternsElementwise.cpp
+        src/convert/PatternsNorm.cpp
+        src/convert/PatternsMatmul.cpp
+        src/convert/PatternsShape.cpp
         src/convert/PatternsTodo.cpp
         src/export/Builder.cpp
         src/export/Exporter.cpp
