@@ -260,8 +260,8 @@ struct tsi_deploy_cfg_t {
     bool mt_enable = false;
     bool has_mt    = false;
 
-int  user_dram_size_gb = -1;
-bool has_user_dram_size_gb = false;
+    int  user_dram_size_gb = -1;
+    bool has_user_dram_size_gb = false;
 
 #if TRITON_MAT_MUL
     bool advanced_matmul_shape_offload = false;
