@@ -1,4 +1,4 @@
-// Emits self-contained test cases for the ggml -> linalg MLIR exporter.
+// Stage 1 of the ggml -> linalg MLIR export test suite: emits self-contained test cases.
 //
 // Per case: build a small ggml graph, fill its inputs from a fixed seed, compute the CPU reference
 // with ggml_graph_compute_with_ctx, export the graph via tsi/export/Exporter.h, and write it to a case
@@ -6,9 +6,9 @@
 //
 // Links ggml only (never llama) - see the note in CMakeLists.txt.
 //
-//   mlir-export-cases --list
-//   mlir-export-cases --emit <name> <dir>
-//   mlir-export-cases --emit-all <dir>
+//   test-mlir-export-cases --list
+//   test-mlir-export-cases --emit <name> <dir>
+//   test-mlir-export-cases --emit-all <dir>
 #include "tsi/export/Exporter.h"
 
 #include "ggml.h"

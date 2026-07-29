@@ -17,7 +17,7 @@ reassociation indices, iterator types, and constant values. If those differ, thi
 
 Regenerating the goldens is deliberate, not automatic:
 
-    ./build/bin/mlir-export-cases --emit-all /tmp/c
+    ./build/bin/test-mlir-export-cases --emit-all /tmp/c
     for d in /tmp/c/*/; do cp "$d/forward.mlir" examples/mlir-export/tests/golden/"$(basename $d)".mlir; done
 
 Only do that when you intend the IR to change, and review the diff.

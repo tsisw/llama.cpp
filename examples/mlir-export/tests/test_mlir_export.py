@@ -1,7 +1,7 @@
 """End-to-end: a ggml graph exported to linalg MLIR compiles and executes with numerics matching
 ggml's own CPU result.
 
-Each case directory is produced by mlir-export-cases. case.json's "expect" field decides the
+Each case directory is produced by test-mlir-export-cases. case.json's "expect" field decides the
 assertion: pass -> must match, unsupported -> xfail with the exporter's reason, mismatch -> must
 NOT match (that case exists to prove this comparison is not vacuous).
 """
@@ -34,7 +34,7 @@ def test_case_matches_ggml_reference(case, target, tmp_path):
 
     if meta["expect"] == "unsupported":
         pytest.xfail(f"exporter does not support case {meta['name']!r} "
-                     f"(see stderr from mlir-export-cases)")
+                     f"(see stderr from test-mlir-export-cases)")
 
     mlir = (case_dir / "forward.mlir").read_text()
     assert "func.func @forward" in mlir, "case emitted no forward function"

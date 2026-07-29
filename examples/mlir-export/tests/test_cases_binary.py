@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-CASES_BIN = Path(__file__).resolve().parents[3] / "build" / "bin" / "mlir-export-cases"
+CASES_BIN = Path(__file__).resolve().parents[3] / "build" / "bin" / "test-mlir-export-cases"
 
 
 @pytest.mark.skipif(not CASES_BIN.exists(), reason=f"{CASES_BIN} not built")

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def pytest_addoption(parser):
     parser.addoption("--cases-bin", default=None,
-                     help="path to the mlir-export-cases binary; generates cases into a tmp dir")
+                     help="path to the test-mlir-export-cases binary; generates cases into a tmp dir")
     parser.addoption("--cases-root", default=None,
                      help="directory of pre-generated case dirs (skips generation)")
     parser.addoption("--target", default="ffm", choices=["ffm", "ten"],
@@ -42,8 +42,8 @@ def cases_root(request, tmp_path_factory):
         return Path(root)
     bin_path = request.config.getoption("--cases-bin")
     if not bin_path or not Path(bin_path).exists():
-        pytest.skip("pass --cases-bin <mlir-export-cases> or --cases-root <dir>")
-    out = tmp_path_factory.mktemp("mlir-export-cases")
+        pytest.skip("pass --cases-bin <test-mlir-export-cases> or --cases-root <dir>")
+    out = tmp_path_factory.mktemp("test-mlir-export-cases")
     subprocess.run([str(bin_path), "--emit-all", str(out)], check=True)
     return out
 

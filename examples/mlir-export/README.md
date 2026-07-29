@@ -137,7 +137,7 @@ ggml_cgraph ──[import]──► `ggml` dialect ──[convert-ggml-to-linalg
 Dump the intermediate to see what was read from the graph, separately from how it was lowered:
 
 ```
-TSI_DUMP_GGML_IR=1 ./build/bin/mlir-export-cases --emit silu /tmp/x
+TSI_DUMP_GGML_IR=1 ./build/bin/test-mlir-export-cases --emit silu /tmp/x
 ```
 ```mlir
 %0 = ggml.silu %arg0 : tensor<128xf32> -> tensor<128xf32>
@@ -216,7 +216,7 @@ These goldens were captured from the original string emitter, so they are what p
 rewrite preserved behavior. Regenerating them is deliberate:
 
 ```
-./build/bin/mlir-export-cases --emit-all /tmp/c
+./build/bin/test-mlir-export-cases --emit-all /tmp/c
 for d in /tmp/c/*/; do cp "$d/forward.mlir" tests/golden/"$(basename $d)".mlir; done
 ```
 
@@ -224,13 +224,13 @@ Only do that when you intend the IR to change, and review the diff.
 
 ### Two stages, each runnable alone
 
-`mlir-export-cases` (C++, links ggml only) writes a self-contained case directory —
+`test-mlir-export-cases` (C++, links ggml only) writes a self-contained case directory —
 `forward.mlir`, `input_<i>.bin`, `expected_0.bin`, `case.json`. The pytest runner consumes it and
 never touches ggml. So when a case misbehaves you can bisect the stages:
 
 ```
-./build/bin/mlir-export-cases --list
-./build/bin/mlir-export-cases --emit matmul /tmp/c          # stage 1: export + CPU reference
+./build/bin/test-mlir-export-cases --list
+./build/bin/test-mlir-export-cases --emit matmul /tmp/c          # stage 1: export + CPU reference
 ~/repo/mlir-compiler/venv/bin/python -m pytest \
     examples/mlir-export/tests/test_mlir_export.py \
     --cases-root /tmp --target ffm -v -k matmul             # stage 2: compile + run + compare

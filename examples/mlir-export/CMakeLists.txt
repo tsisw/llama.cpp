@@ -4,7 +4,7 @@
 # ggml pulls in libggml-tsavorite and the link fails):
 #
 #   cmake -B build-host -DLLAMA_CURL=OFF -DGGML_TSAVORITE_TARGET=posix
-#   cmake --build build-host --target ref_check recon_cpu_check decode_cpu_check mlir-export-cases
+#   cmake --build build-host --target ref_check recon_cpu_check decode_cpu_check test-mlir-export-cases
 #
 # ref_check prints llama.cpp's prompt ids and greedy next token; recon_cpu_check rebuilds build_layer
 # on CPU for the same ids; decode_cpu_check checks the KV-cache decode step reproduces the prefill.
@@ -12,8 +12,9 @@
 #   ./build-host/bin/recon_cpu_check    model.gguf <id0> <id1> ...   -> recon argmax per column
 #   ./build-host/bin/decode_cpu_check   model.gguf <id0> <id1> ...   -> decode-vs-prefill MATCH per step
 #
-# Layout: include/tsi/{export,graph} public headers, src/export the exporter library, tools/<name>
-# one executable each. The .py and .sh drivers stay at this directory's top level because
+# Layout: include/tsi/{export,graph} public headers, src/{dialect,import,convert,export} the exporter
+# library, tools/<name> one executable each, tests/ the export test suite (its C++ case generator
+# included). The .py and .sh drivers stay at this directory's top level because
 # tsi-pkg-build.sh copies them from here by name and wholegraph.sh/decode.sh require
 # compile_graph_fpga.py to sit next to them.
 
@@ -123,16 +124,19 @@ if (MLIR_FOUND)
     target_link_libraries(decode_cpu_check PRIVATE tsi-mlir-export)
 endif()
 
-# Case generator for the export test suite. Links ggml ONLY (not llama), same reason as the
-# checks above: in a TSI build linking llama/ggml pulls in libggml-tsavorite and the link fails.
-add_executable(mlir-export-cases tools/mlir-export-cases/mlir_export_cases.cpp)
-target_include_directories(mlir-export-cases PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
-target_link_libraries(mlir-export-cases PRIVATE ggml)
-target_compile_features(mlir-export-cases PRIVATE cxx_std_20)
+# Stage 1 of the export test suite: builds each ggml graph, computes the CPU reference, and writes a
+# self-contained case directory that the pytest runner in tests/ consumes. It lives in tests/ with
+# the rest of the suite rather than under tools/, since it is test scaffolding and not a usable tool.
+# Links ggml ONLY (not llama), same reason as the checks above: in a TSI build linking llama/ggml
+# pulls in libggml-tsavorite and the link fails.
+add_executable(test-mlir-export-cases tests/mlir_export_cases.cpp)
+target_include_directories(test-mlir-export-cases PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
+target_link_libraries(test-mlir-export-cases PRIVATE ggml)
+target_compile_features(test-mlir-export-cases PRIVATE cxx_std_20)
 
 # The generator needs the exporter library; without MLIR there is no exporter, so it is skipped.
 if (MLIR_FOUND)
-    target_link_libraries(mlir-export-cases PRIVATE tsi-mlir-export)
+    target_link_libraries(test-mlir-export-cases PRIVATE tsi-mlir-export)
 endif()
 
 # ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at
@@ -147,7 +151,7 @@ if (BUILD_TESTING)
         add_test(NAME mlir-export-suite
                  COMMAND "${TSI_VENV_PYTHON}" -m pytest -v
                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mlir_export.py"
-                         --cases-bin "$<TARGET_FILE:mlir-export-cases>"
+                         --cases-bin "$<TARGET_FILE:test-mlir-export-cases>"
                          --target ffm)
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export" TIMEOUT 1800)
 
@@ -157,7 +161,7 @@ if (BUILD_TESTING)
         add_test(NAME mlir-export-golden
                  COMMAND "${TSI_VENV_PYTHON}" -m pytest -v
                          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ir_golden.py"
-                         --cases-bin "$<TARGET_FILE:mlir-export-cases>")
+                         --cases-bin "$<TARGET_FILE:test-mlir-export-cases>")
         set_tests_properties(mlir-export-golden PROPERTIES LABELS "mlir-export" TIMEOUT 600)
     else()
         # Never a hard error: a plain host build must not start requiring the compiler repo.
