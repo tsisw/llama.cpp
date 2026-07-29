@@ -19,8 +19,13 @@ def _config(target):
     return TXECompilerConfig(log_mlir=True)
 
 
-def _load(path, shape):
-    a = np.fromfile(path, dtype=np.float32)
+# GET_ROWS ids and ROPE positions are i32 function arguments, so the dtype is per-arg. Older
+# case.json files have no "dtype" key; f32 is the right default for every one of them.
+_NP_DTYPE = {"f32": np.float32, "i32": np.int32}
+
+
+def _load(path, shape, dtype="f32"):
+    a = np.fromfile(path, dtype=_NP_DTYPE[dtype])
     return a.reshape(shape)
 
 
@@ -34,7 +39,7 @@ def test_case_matches_ggml_reference(case, target, tmp_path):
     mlir = (case_dir / "forward.mlir").read_text()
     assert "func.func @forward" in mlir, "case emitted no forward function"
 
-    inputs = [torch.from_numpy(_load(case_dir / a["file"], a["shape"]).copy())
+    inputs = [torch.from_numpy(_load(case_dir / a["file"], a["shape"], a.get("dtype", "f32")).copy())
               for a in meta["args"]]
     expected = _load(case_dir / meta["output"]["file"], meta["output"]["shape"])
 
