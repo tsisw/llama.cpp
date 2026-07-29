@@ -1061,7 +1061,7 @@ update_one_tsavorite_deployment_yaml() {
   local txe_count="$2"
   local advanced_matmul_shape_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
-local user_dram_size_gb="1"
+local user_dram_size_gb="8"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1236,7 +1236,7 @@ multi_thread_enable: true
 ## Example: 1 = 1GB, 2 = 2GB.
 ## If this key is missing, runtime DeviceConfig default is used.
 
-user_dram_size_gb: 1
+user_dram_size_gb: 8
 
 
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
