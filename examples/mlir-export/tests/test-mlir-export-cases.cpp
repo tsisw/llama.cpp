@@ -29,6 +29,11 @@ namespace fs = std::filesystem;
 // helpers
 // ---------------------------------------------------------------------------------------
 
+static bool ends_with(const char * s, const char * suffix) {
+    const size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
 // mt19937 is standard-specified, so this is reproducible across stdlib implementations;
 // std::uniform_real_distribution is not. Values land in [-1, 1].
 static void fill_seeded(ggml_tensor * t, uint32_t seed) {
@@ -105,9 +110,9 @@ struct case_spec {
     float        atol;
     const char * expect;   // "pass" | "mismatch"
     bool         corrupt;  // deliberately poison expected_0.bin (harness self-check)
-    // Bake the leafs isModelWeight() accepts (name ends ".weight") into the IR as constants instead
-    // of passing them as %args. Uses the same classifier as the llama capture path, so this covers
-    // the production rule and not a test-only approximation.
+    // Keep the "*.weight" leafs out of runtime_args, which is what makes the exporter bake them in
+    // as constants. Names are a test convention; the production rule is the same one either way -
+    // whatever the caller does not declare an argument becomes a constant.
     bool         bake_weights;
 };
 
@@ -348,9 +353,10 @@ static ggml_tensor * build_rope_3d(ggml_context * ctx, std::vector<const ggml_te
 }
 
 // --- baked-constant weights ------------------------------------------------------------------
-// Both cases name one leaf "*.weight" so isModelWeight() selects it and emit_case bakes it in as an
-// arith.constant, leaving the other leaf as the sole %arg. The math is identical to the non-baked
-// case above, so a broken bake shows up as a numeric mismatch against ggml, not a shape error.
+// Both cases name one leaf "*.weight" so emit_case leaves it out of runtime_args and the exporter
+// bakes it in as an arith.constant, leaving the other leaf as the sole %arg. The math is identical
+// to the non-baked case above, so a broken bake shows up as a numeric mismatch against ggml rather
+// than a shape error.
 // These two cover the only two ways llama consumes a weight: as a matmul operand, and as a
 // get_rows table (token_embd.weight, the first op of every llama graph).
 
@@ -463,16 +469,23 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
         return false;
     }
 
-    // Split off the weights to bake, if this case asks for it. `runtime` is what stays as %args and
-    // therefore what the runner has to supply; the baked leafs are read out of the graph by the
-    // exporter, so they must still hold their filled data here (they do - fill ran above).
+    // Drop the weights from the argument list, if this case asks for it. Whatever is left out of
+    // runtime_args is what the exporter bakes in, so `runtime` is exactly what the runner supplies.
+    // The dropped leafs are read out of the graph by the exporter, so they must still hold their
+    // filled data here (they do - fill ran above).
     std::vector<const ggml_tensor *> runtime = args;
-    std::vector<const ggml_tensor *> baked;
     if (spec.bake_weights) {
         runtime.clear();
-        tsi::mlir_export::partitionWeights(args, runtime, baked);
-        if (baked.empty()) {
-            fprintf(stderr, "%s: bake_weights set but no leaf matched isModelWeight()\n", spec.name);
+        size_t dropped = 0;
+        for (const ggml_tensor * t : args) {
+            if (ends_with(t->name, ".weight")) {
+                dropped++;
+            } else {
+                runtime.push_back(t);
+            }
+        }
+        if (dropped == 0) {
+            fprintf(stderr, "%s: bake_weights set but no leaf is named *.weight\n", spec.name);
             ggml_free(ctx);
             return false;
         }
@@ -483,7 +496,6 @@ static bool emit_case(const case_spec & spec, const fs::path & dir) {
     try {
         tsi::mlir_export::ExportOptions opts;
         opts.runtime_args = runtime;
-        opts.const_leafs  = baked;
         mlir              = tsi::mlir_export::exportGraph(gf, opts);
     } catch (const tsi::mlir_export::mlir_export_error & e) {
         // Exporter gap: record it so the runner xfails with a reason instead of the build breaking.

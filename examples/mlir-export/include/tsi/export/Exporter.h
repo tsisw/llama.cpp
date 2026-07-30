@@ -45,16 +45,27 @@ struct CacheSpec {
     std::vector<const ggml_tensor *> append;
 };
 
+// How the module is encoded.
+//
+// Bytecode keeps constant blobs as raw binary; text prints them as hex, which is exactly twice the
+// bytes and unusable for a real model's weights. Text stays the default because it is readable and
+// every test reads it.
+enum class Format {
+    Text,
+    Bytecode,
+};
+
 struct ExportOptions {
     // Function name. The TSI compiler and the host shim both expect "forward".
     std::string func_name = "forward";
 
     // Leafs that become func arguments, in %arg order -> `txe.name = "input_<i>"`.
+    //
+    // This list is the whole story: every OTHER leaf the exporter discovers is baked into the IR as
+    // a constant. There is no flag and no name heuristic - a leaf is either a per-step input the
+    // caller declares here, or it is a constant. Baked leafs must still hold live data when
+    // exportGraph runs, since the values are read out there.
     std::vector<const ggml_tensor *> runtime_args;
-
-    // Leafs baked into the IR as arith.constant dense<...> instead of passed in. Weight data must
-    // still be live when exportGraph runs, since the values are read out here.
-    std::vector<const ggml_tensor *> const_leafs;
 
     // Results, in order -> `txe.name = "res_<i>"`. Empty means "the graph's single output", i.e.
     // its last node. There is deliberately no separate multi-output entry point: one output is
@@ -64,35 +75,24 @@ struct ExportOptions {
     // KV caches, appended to the argument list after runtime_args, followed by a scalar `index`
     // named "slot" when any cache is present. Caches are never results; they are written in place.
     std::vector<CacheSpec> caches;
+
+    // Encoding of the returned module. Bytecode is required once real weights are baked in.
+    Format format = Format::Text;
 };
 
-// Builds the graph as an MLIR module, verifies it, and returns the printed IR.
+// Builds the graph as an MLIR module, verifies it, and returns the encoded IR.
 //
-// Verification runs before printing, so a structurally invalid graph fails here, naming the op,
+// With Format::Bytecode the returned string holds raw bytes, NUL bytes included, so write it with
+// an ofstream opened in binary mode and never treat it as text.
+//
+// Verification runs before encoding, so a structurally invalid graph fails here, naming the op,
 // rather than surfacing later as an opaque parse error inside the Python compiler driver.
 //
 // Throws mlir_export_error on an unsupported construct or a failed verification.
 std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts);
 
-// Leaf/input tensors in first-seen order. Independent of which of them end up as arguments vs
-// baked constants; that split is the caller's, expressed through ExportOptions.
+// Leaf/input tensors in first-seen order. Callers use this to decide which leafs to declare as
+// runtime_args; the rest become constants.
 std::vector<const ggml_tensor *> discoverLeafs(ggml_cgraph * gf);
-
-// True when a leaf is a model weight: a value fixed for the model's lifetime, as opposed to a
-// per-step input (token ids, positions, attention mask, KV cache). Matches the GGUF naming
-// convention - the core name, with any "BACKEND#" prefix and "#<copy>" suffix stripped, ends in
-// ".weight" - and additionally requires live data of a bakeable element type (f32 or i32).
-bool isModelWeight(const ggml_tensor * t);
-
-// Split `leafs` into the per-step inputs that stay function arguments and the model weights to
-// bake in as constants. Relative order within each output is preserved, so argument indices stay
-// the graph's first-seen order with the baked entries removed.
-//
-// Baking trades IR size for compile-time visibility of the weight values: the compiler can fold,
-// pre-tile and place them, and the resulting binary no longer depends on a matching weight buffer
-// at run time. Constants are printed in full, so total weight bytes bound what is practical.
-void partitionWeights(const std::vector<const ggml_tensor *> & leafs,
-                      std::vector<const ggml_tensor *> & args,
-                      std::vector<const ggml_tensor *> & consts);
 
 }  // namespace tsi::mlir_export

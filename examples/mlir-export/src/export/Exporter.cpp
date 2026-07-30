@@ -9,6 +9,7 @@
 #include "GgmlToLinalg.h"
 #include "Importer.h"
 
+#include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -22,21 +23,43 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
+#include <set>
 #include <string>
+#include <vector>
 
 using namespace mlir;
 
 namespace tsi::mlir_export {
+
+// Every discovered leaf that is not a declared runtime arg and not a cache read stands for a
+// constant. Weights therefore need no flag and no name heuristic: declaring the per-step inputs is
+// what makes everything else a constant.
+static std::vector<const ggml_tensor *> constLeafs(ggml_cgraph * gf, const ExportOptions & opts) {
+    std::set<const ggml_tensor *> bound(opts.runtime_args.begin(), opts.runtime_args.end());
+    for (const CacheSpec & c : opts.caches) {
+        bound.insert(c.read.begin(), c.read.end());
+    }
+
+    std::vector<const ggml_tensor *> consts;
+    for (const ggml_tensor * leaf : discoverLeafs(gf)) {
+        if (bound.count(leaf) == 0) {
+            consts.push_back(leaf);
+        }
+    }
+    return consts;
+}
 
 std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
     const int n_nodes = ggml_graph_n_nodes(gf);
     if (n_nodes == 0) {
         unsupported("graph has no nodes");
     }
+
+    const std::vector<const ggml_tensor *> consts = constLeafs(gf, opts);
     // A graph with no runtime args is legal when every leaf was baked in as a constant, so the
     // check is for no bound leafs at all, which would leave interior values undefined.
-    if (opts.runtime_args.empty() && opts.const_leafs.empty()) {
-        unsupported("graph has no runtime input tensors and no baked constants");
+    if (opts.runtime_args.empty() && consts.empty() && opts.caches.empty()) {
+        unsupported("graph has no runtime input tensors, constants or caches");
     }
 
     MLIRContext ctx;
@@ -52,7 +75,7 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
         outs.push_back(ggml_graph_node(gf, n_nodes - 1));
     }
 
-    OwningOpRef<ModuleOp> mod = importGraph(ctx, gf, opts, outs);
+    OwningOpRef<ModuleOp> mod = importGraph(ctx, gf, opts, outs, consts);
 
     if (failed(verify(*mod))) {
         // A dialect verifier rejected the imported graph, which means the graph violates one of
@@ -74,9 +97,16 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
         unsupported("the lowered module failed MLIR verification (diagnostics above)");
     }
 
-    std::string             out;
+    std::string              out;
     llvm::raw_string_ostream os(out);
-    mod->print(os);
+    if (opts.format == Format::Bytecode) {
+        // Binary. Resource blobs stay raw bytes here; printing would hex them at 2x the size.
+        if (failed(writeBytecodeToFile(*mod, os))) {
+            unsupported("writing MLIR bytecode failed");
+        }
+    } else {
+        mod->print(os);
+    }
     return out;
 }
 

@@ -95,7 +95,8 @@ class Importer {
 }  // namespace
 
 OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const ExportOptions & opts,
-                                  const std::vector<const ggml_tensor *> & outputs) {
+                                  const std::vector<const ggml_tensor *> & outputs,
+                                  const std::vector<const ggml_tensor *> & consts) {
     OpBuilder b(&ctx);
     Location  loc = b.getUnknownLoc();
 
@@ -150,7 +151,7 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
     for (size_t i = 0; i < n_args; i++) {
         h.setValue(opts.runtime_args[i], body->getArgument(i));
     }
-    for (const ggml_tensor * leaf : opts.const_leafs) {
+    for (const ggml_tensor * leaf : consts) {
         h.setValue(leaf, h.bakedConstant(leaf));
     }
 

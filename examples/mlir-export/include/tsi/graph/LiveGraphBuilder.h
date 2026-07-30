@@ -332,22 +332,19 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
 
     r.leafs = tsi::mlir_export::discoverLeafs(r.gf);
 
+    // Only the per-step inputs are arguments. Everything else the exporter finds - every weight - is
+    // baked into the IR as a constant, unconditionally: the compiler needs the weight values to fold
+    // and place them, and the compiled binary then no longer depends on a matching weight buffer at
+    // run time. Weights being arguments was the single biggest term in the old signature.
+    r.runtime_args = { ids, pos, mask };
+
     tsi::mlir_export::ExportOptions opts;
-    // TSI_WG_BAKE_WEIGHTS=1 bakes the model weights into the IR as constants, leaving only the
-    // per-step inputs (ids, positions, mask) as %args. That lets the compiler see the weight values,
-    // at the cost of printing all of them: a 1.1B f32 model is ~4.3 GiB of tensor data, which is an
-    // order of magnitude more as ASCII float literals. Default off - weights stay arguments.
-    const char * bake = getenv("TSI_WG_BAKE_WEIGHTS");
-    if (bake && atoi(bake) != 0) {
-        std::vector<const ggml_tensor *> consts;
-        tsi::mlir_export::partitionWeights(r.leafs, r.runtime_args, consts);
-        fprintf(stderr, "[tsi-wholegraph] baking %zu weight tensors as constants, %zu args remain\n",
-                consts.size(), r.runtime_args.size());
-        opts.const_leafs = consts;
-    } else {
-        r.runtime_args = r.leafs;   // every leaf is a runtime arg; nothing baked
-    }
     opts.runtime_args = r.runtime_args;
-    r.func_text       = tsi::mlir_export::exportGraph(r.gf, opts);
+    // Bytecode: the constants are the model, and text prints them as hex at twice the size.
+    opts.format = tsi::mlir_export::Format::Bytecode;
+    r.func_text = tsi::mlir_export::exportGraph(r.gf, opts);
+    fprintf(stderr, "[tsi-wholegraph] %zu leafs -> %zu args + %zu baked constants, %.2f MiB bytecode\n",
+            r.leafs.size(), r.runtime_args.size(), r.leafs.size() - r.runtime_args.size(),
+            (double) r.func_text.size() / (1024.0 * 1024.0));
     return r;
 }

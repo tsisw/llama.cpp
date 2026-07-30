@@ -16,9 +16,13 @@ namespace tsi::mlir_export {
 // dim order), applied once here. Anything ggml itself can express should import successfully; what
 // our lowering cannot handle is rejected later, by the conversion pass.
 //
+// `consts` are the leafs to bake in, already worked out by the caller as "every leaf that is not a
+// declared runtime arg or a cache read".
+//
 // Throws mlir_export_error for an op with no dialect equivalent.
 mlir::OwningOpRef<mlir::ModuleOp> importGraph(mlir::MLIRContext & ctx, ggml_cgraph * gf,
                                              const ExportOptions & opts,
-                                             const std::vector<const ggml_tensor *> & outputs);
+                                             const std::vector<const ggml_tensor *> & outputs,
+                                             const std::vector<const ggml_tensor *> & consts);
 
 }  // namespace tsi::mlir_export

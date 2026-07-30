@@ -11,11 +11,11 @@ RT=~/repo/mlir-compiler/build/_deps/runtime-build/lib
 
 # 1. capture: export the prefill graph as linalg MLIR
 TSI_WHOLEGRAPH=capture TSI_WG_DIR=. \
-  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv     # -> ./forward.mlir
+  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv     # -> ./forward.mlirbc
 
 # 2. compile: MLIR -> host.so  (--target posix also covers host FFM, despite the file name)
 USER_DRAM_SIZE=16348 TSI_RT_LIB_DIR=$RT \
-  ~/repo/mlir-compiler/venv/bin/python compile_graph_fpga.py forward.mlir out_ffm
+  ~/repo/mlir-compiler/venv/bin/python compile_graph_fpga.py forward.mlirbc out_ffm
 
 # 3. verify: run the compiled forward, diff its next-token argmax against llama's per-op result
 USER_DRAM_SIZE=16348 DYLD_LIBRARY_PATH=$RT TSI_WHOLEGRAPH=verify TSI_WG_DIR=. \
@@ -26,16 +26,15 @@ TSI_WG_LIB=$PWD/out_ffm/host/host.so \
 | env var | meaning |
 |---|---|
 | `TSI_WHOLEGRAPH` | `capture` \| `dump` \| `verify` \| `run`; unset = the hook is a no-op |
-| `TSI_WG_DIR` | where `forward.mlir` / `forward.manifest` are written and read |
+| `TSI_WG_DIR` | where `forward.mlirbc` / `forward.manifest` are written and read |
 | `TSI_WG_LIB` | compiled `host.so` to load (`verify`, `run`) |
 | `TSI_WG_SKIP` | skip N graphs before capturing (skips llama's warmup graphs) |
 | `TSI_WG_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
-| `TSI_WG_BAKE_WEIGHTS` | bake weights as constants instead of args (see the size caveat below) |
 | `TSI_DUMP_GGML_IR` | also dump the ggml dialect before lowering to linalg |
 | `USER_DRAM_SIZE` | simulated device DRAM budget; a 1.1B f32 model needs `16348` |
 | `TSI_RT_LIB_DIR` | where `libTsavRTShimCAPI` lives, for linking `host.o` -> `host.so` |
 
-Verified end to end on SmolLM2-135M f32 (30 layers, tied embeddings): 874 nodes, 275 args, and
+Verified end to end on SmolLM2-135M f32 (30 layers, tied embeddings): 874 nodes, and
 
 ```
 VERIFY recon-CPU vs per-op:   rel_sq_err=1.09e-07  argmax 504 vs 504 -> MATCH
@@ -255,19 +254,31 @@ The seven pure data-movement cases are held to **bit-exact** equality (`rtol=ato
 0.0 error, so that is a real constraint rather than an accident. rope measures 1.5e-07/1.8e-07 max
 abs and the matmul variants 2.4e-07 to 9.5e-07. Tolerances are measured, never guessed.
 
-### Weights as arguments or as constants
+### Weights as constants
 
-By default every leaf becomes a `%arg`, weights included, so the compiled `host.so` is independent of
-the weight values and one compile serves any checkpoint of the same architecture. `ExportOptions`
-also supports baking weights in as `arith.constant`, selected by `partitionWeights()` (leaf name ends
-in `.weight`) and enabled on the capture path with `TSI_WG_BAKE_WEIGHTS=1`. Baking lets the compiler
-see the values and fold, pre-tile and place them.
+`ExportOptions::runtime_args` is the whole rule: those leafs become `%arg`s, and every other leaf the
+exporter discovers is baked into the IR as a constant. There is no flag and no name heuristic - a
+leaf is either a per-step input the caller declares, or it is a constant. Baking lets the compiler
+see the weight values and fold, pre-tile and place them, and the compiled `host.so` then no longer
+needs a matching weight buffer at run time.
 
-The cost is IR size, and it is severe. MLIR prints a large `dense<>` as hex, exactly 2 characters per
-byte, so a TinyLlama-1.1B f32 prefill graph goes from **0.69 MiB to 8.20 GiB** (measured, 201 weights
-baked, 3 args left). The two `*_const_w` test cases prove the path is correct at test scale; treat
-whole-model baking as impractical until the constants move to `dense_resource` with a bytecode or
-sidecar payload.
+Two things make that affordable:
+
+- **`dense_resource`, not inline `dense<>`.** The data lives in a named blob outside the op. A
+  contiguous, 4-byte-aligned tensor is referenced in place with no copy, so exporting does not need a
+  second copy of the model in memory. A strided view is gathered through `nb[]` into a temporary.
+- **`Format::Bytecode`.** Text prints a blob as hex, exactly 2 characters per byte. Bytecode keeps it
+  raw, so the module is the weight bytes plus a few KB. Measured on the `test-bytecode-export`
+  fixture: text 17223 bytes, bytecode 8889, for an 8192-byte weight.
+
+The two `*_const_w` cases in the end-to-end suite check the values survive the round trip;
+`bytecode-export-compile` checks the compiler accepts a bytecode module with a blob in it.
+
+Measured on SmolLM2-135M f32: **275 leafs become 3 args and 272 baked constants**, a 513.24 MiB
+bytecode module written in 1.93 s at 2.64 GiB peak RSS. That is the weight bytes plus a rounding
+error, which is the point. **Compiling a module that size is not yet proven** - a 64 MiB constant took
+35.6 s at 3.42 GiB peak RSS, and extrapolating 8x from one point is not a prediction. Prefer f16
+weights and measure before assuming a whole model compiles.
 
 ### Per-op lowering tests (lit + FileCheck)
 

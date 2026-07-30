@@ -96,6 +96,13 @@ Outside the exporter: `compile_graph_fpga.py:89` uses `read_text()` and must rea
 both `host.so` define `@forward` at different arities, so load `RTLD_LOCAL` with separate handles; delete
 `TSI_WG_BAKE_WEIGHTS` and `partitionWeights()`.
 
+**Weights as constants is done and measured.** `runtime_args` is now the whole rule: whatever the caller
+does not declare becomes a `dense_resource` constant, with no flag and no name heuristic. On SmolLM2-135M
+f32 that turns 275 leafs into **3 args and 272 constants**, a 513.24 MiB bytecode module written in 1.93 s
+at 2.64 GiB peak RSS - the weight bytes plus a rounding error, and the 272 the table above predicted.
+Compiling a module that size is still unproven; 64 MiB took 35.6 s at 3.42 GiB, and extrapolating 8x from
+one point is not a prediction.
+
 Two implementation rules, both learned by getting them wrong:
 
 - **Every memref must carry memory space 1** (DRAM). That single omission accounts for every compile

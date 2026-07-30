@@ -191,9 +191,10 @@ void tsi_wholegraph_maybe_capture(struct ggml_cgraph * cgraph) {
                 "Continuing per-op.\n", e.what());
         return;
     }
-    std::string module = r.func_text;   // exportGraph already returns a complete module
-
-    { std::ofstream f(dir + "/forward.mlir"); f << module; }
+    // MLIR bytecode, not text: the weights are baked in as constants and text would hex-print them
+    // at twice the size. compile_graph_fpga.py detects the format from the magic bytes.
+    const std::string module = r.func_text;
+    { std::ofstream f(dir + "/forward.mlirbc", std::ios::binary); f << module; }
     {
         std::ofstream mf(dir + "/forward.manifest");
         // live_nodes identifies the prefill call at run time; args = the reconstructed runtime args.
@@ -206,7 +207,7 @@ void tsi_wholegraph_maybe_capture(struct ggml_cgraph * cgraph) {
         }
     }
     fprintf(stderr,
-            "[tsi-wholegraph] captured (cache-free reconstruction): %d nodes, %zu args -> %s/forward.mlir\n",
+            "[tsi-wholegraph] captured (cache-free reconstruction): %d nodes, %zu args -> %s/forward.mlirbc\n",
             ggml_graph_n_nodes(r.gf), r.runtime_args.size(), dir.c_str());
     ggml_free(r.ctx);
 }

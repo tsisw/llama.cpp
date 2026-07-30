@@ -103,6 +103,7 @@ if (MLIR_FOUND)
         ggml MLIRIR MLIRParser MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
         MLIRArithDialect MLIRMathDialect MLIRSupport
         MLIRMemRefDialect MLIRBufferizationDialect
+        MLIRBytecodeWriter                        # Format::Bytecode
         MLIRPass MLIRTransforms MLIRTransformUtils)
     # C++17 to match the standard their LLVM was built with. Consumers stay at C++20; they only see
     # the MLIR-free public header.
@@ -244,6 +245,12 @@ if (MLIR_FOUND)
     target_include_directories(test-cache-export PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
     target_link_libraries(test-cache-export PRIVATE tsi-mlir-export ggml)
     target_compile_features(test-cache-export PRIVATE cxx_std_20)
+
+    # Weights as dense_resource constants, and bytecode as the encoding that keeps them raw.
+    add_executable(test-bytecode-export tests/bytecode/test-bytecode-export.cpp)
+    target_include_directories(test-bytecode-export PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
+    target_link_libraries(test-bytecode-export PRIVATE tsi-mlir-export ggml)
+    target_compile_features(test-bytecode-export PRIVATE cxx_std_20)
 endif()
 
 # ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at
@@ -299,6 +306,25 @@ if (BUILD_TESTING)
                              "${CMAKE_CURRENT_BINARY_DIR}/cache-export/out")
             set_tests_properties(cache-export-compile PROPERTIES
                 LABELS "mlir-export" TIMEOUT 900 FIXTURES_REQUIRED CacheExport
+                ENVIRONMENT "USER_DRAM_SIZE=16348;TSI_RT_LIB_DIR=${TSI_RT_LIB_DIR}")
+        endif()
+
+        # Weights as constants: the emit step checks the IR and the size claim, the compile step
+        # checks the compiler accepts bytecode with a resource blob in it.
+        if (TARGET test-bytecode-export)
+            set(BYTECODE_OUT "${CMAKE_CURRENT_BINARY_DIR}/bytecode-export")
+            add_test(NAME bytecode-export-emit
+                     COMMAND "$<TARGET_FILE:test-bytecode-export>" "${BYTECODE_OUT}")
+            set_tests_properties(bytecode-export-emit PROPERTIES
+                LABELS "mlir-export" TIMEOUT 300 FIXTURES_SETUP BytecodeExport)
+
+            add_test(NAME bytecode-export-compile
+                     COMMAND "${TSI_VENV_PYTHON}"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/compile_graph_fpga.py"
+                             "${BYTECODE_OUT}/forward.mlirbc"
+                             "${BYTECODE_OUT}/out")
+            set_tests_properties(bytecode-export-compile PROPERTIES
+                LABELS "mlir-export" TIMEOUT 900 FIXTURES_REQUIRED BytecodeExport
                 ENVIRONMENT "USER_DRAM_SIZE=16348;TSI_RT_LIB_DIR=${TSI_RT_LIB_DIR}")
         endif()
     else()
