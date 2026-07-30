@@ -91,6 +91,18 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
         }
     }
 
+    // f16/bf16 -> f32 arithmetic, before lowering, so the patterns only ever see f32 and every
+    // reduction accumulates in f32. No-op on an all-f32 graph.
+    promoteGgmlToF32(*mod);
+
+    if (const char * dump = std::getenv("TSI_DUMP_GGML_IR")) {
+        if (dump[0] == '1') {
+            llvm::errs() << "--- ggml dialect (promoted to f32) ---\n";
+            mod->print(llvm::errs());
+            llvm::errs() << "--------------------------------------\n";
+        }
+    }
+
     convertGgmlToLinalg(*mod);
 
     if (failed(verify(*mod))) {

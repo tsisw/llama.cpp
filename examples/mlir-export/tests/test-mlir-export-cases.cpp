@@ -383,6 +383,30 @@ static ggml_tensor * build_get_rows_const_w(ggml_context * ctx, std::vector<cons
     return ggml_get_rows(ctx, tbl, ids);
 }
 
+// --- half precision ---------------------------------------------------------------------------
+// An f16 weight against an f32 activation, f32 out: exactly what an f16 llama model produces. The
+// weight is baked, so this also covers the 2-byte dense_resource blob path.
+//
+// The tolerance is f16's, not f32's. Rounding 32 weights to f16 costs ~1e-3 relative on a dot product
+// of that length, and the reference is ggml computing the same f16 values, so what is being checked is
+// that we read and widen the same bits ggml did - not that f16 is accurate.
+static ggml_tensor * build_matmul_f16_w(ggml_context * ctx, std::vector<const ggml_tensor *> & args) {
+    const int K = 32, M = 32, N = 8;
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, M);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_set_name(w, "proj.weight");
+    ggml_set_name(x, "x");
+    // Filled here rather than by fill_seeded, which only knows f32. Values are exactly representable
+    // in f16, so a mismatch means we misread the blob rather than that rounding differed.
+    ggml_fp16_t * wd = (ggml_fp16_t *) w->data;
+    for (int i = 0; i < K * M; i++) {
+        wd[i] = ggml_fp32_to_fp16((float) ((i % 9) - 4) * 0.25f);
+    }
+    args.push_back(w);
+    args.push_back(x);
+    return ggml_mul_mat(ctx, w, x);
+}
+
 static const case_spec CASES[] = {
     //  name              build              rtol   atol   expect      corrupt  bake
     { "add",          build_add, 0.0f, 0.0f, "pass",     false, false },
@@ -427,6 +451,9 @@ static const case_spec CASES[] = {
     // get_rows stays bit-exact and matmul keeps the reduction-reassociation allowance.
     { "matmul_const_w",   build_matmul_const_w,   1e-5f, 1e-5f, "pass", false, true },
     { "get_rows_const_w", build_get_rows_const_w, 0.0f,  0.0f,  "pass", false, true },
+
+    // f16 weight, f32 activation. Baked, so the f16 resource blob is covered too.
+    { "matmul_f16_w",     build_matmul_f16_w,     2e-3f, 2e-3f, "pass", false, true },
 };
 
 static const size_t N_CASES = sizeof(CASES) / sizeof(CASES[0]);

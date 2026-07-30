@@ -37,6 +37,15 @@ mlir::Value zeroFilled(mlir::OpBuilder & b, mlir::Location loc, mlir::RankedTens
 mlir::Value denseF32(mlir::OpBuilder & b, mlir::Location loc, llvm::ArrayRef<float> vals,
                      mlir::RankedTensorType ty);
 
+// --- element casts --------------------------------------------------------------------------
+// Elementwise float widen/narrow, e.g. f16 -> f32 on the way in and f32 -> f16 on the way out.
+// Returns `v` unchanged when it is already `toElem`.
+//
+// Emitted as linalg.generic rather than a tensor-level arith.extf/truncf: nothing downstream is
+// guaranteed to bufferize a bare tensor-level arith op, and linalg.generic is what the rest of this
+// lowering produces anyway.
+mlir::Value castElements(mlir::OpBuilder & b, mlir::Location loc, mlir::Value v, mlir::Type toElem);
+
 // --- affine maps and iterator types ---------------------------------------------------------
 mlir::AffineMap mapFull(mlir::MLIRContext * ctx, int rank);
 mlir::AffineMap mapDropLast(mlir::MLIRContext * ctx, int rank);

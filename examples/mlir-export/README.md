@@ -252,6 +252,29 @@ The seven pure data-movement cases are held to **bit-exact** equality (`rtol=ato
 0.0 error, so that is a real constraint rather than an accident. rope measures 1.5e-07/1.8e-07 max
 abs and the matmul variants 2.4e-07 to 9.5e-07. Tolerances are measured, never guessed.
 
+### Half precision: f16 and bf16
+
+The dialect admits `f16` and `bf16` so imported IR stays a faithful record of the graph, but no
+lowering pattern ever sees a half-precision operand. `promote-ggml-to-f32` runs between import and
+lowering, widening half inputs, rewriting the op at f32, and narrowing results back.
+
+**f32 accumulation is the reason, and it is not an optimization.** An f16 sum over 2048 elements loses
+most of its significance, so every reduction in the model — matmul, `rms_norm`, `soft_max` — has to
+accumulate in f32 whatever the weights are stored as. Promoting once gets that everywhere; the
+alternative, teaching five pattern files to widen their own accumulators, is the same rule written five
+times and five chances to miss one.
+
+It also covers the mixed case llama actually produces: an f16 weight against an f32 activation.
+Extending each float operand independently makes that fall out with no special case, and nothing is
+narrowed on the way out because the result was already f32.
+
+Casts are emitted as `linalg.generic` wrapping `arith.extf`/`truncf`, not as tensor-level `arith` ops,
+because that is the form the rest of the lowering produces and is guaranteed to bufferize.
+
+Covered by `tests/lit/promote-f32.mlir` (f16, bf16, the mixed matmul, and that an all-f32 graph comes
+out untouched) and end to end by the `matmul_f16_w` case, which is llama's f16-model shape and is
+checked against ggml's own f16 result.
+
 ### Weights as constants
 
 `ExportOptions::runtime_args` is the whole rule: those leafs become `%arg`s, and every other leaf the

@@ -45,6 +45,24 @@ Value denseF32(OpBuilder & b, Location loc, llvm::ArrayRef<float> vals, RankedTe
     return arith::ConstantOp::create(b, loc, DenseElementsAttr::get(ty, vals));
 }
 
+Value castElements(OpBuilder & b, Location loc, Value v, Type toElem) {
+    auto from = llvm::cast<RankedTensorType>(v.getType());
+    if (from.getElementType() == toElem) {
+        return v;
+    }
+    auto      to   = RankedTensorType::get(from.getShape(), toElem);
+    const int rank = to.getRank();
+    AffineMap id   = mapFull(b.getContext(), rank);
+    return generic(b, loc, to, ValueRange{v}, empty(b, loc, to), {id, id}, itersAllParallel(rank),
+                   [&](OpBuilder & nb, Location nloc, ValueRange args) -> Value {
+                       const unsigned fw = from.getElementType().getIntOrFloatBitWidth();
+                       if (toElem.getIntOrFloatBitWidth() > fw) {
+                           return arith::ExtFOp::create(nb, nloc, toElem, args[0]);
+                       }
+                       return arith::TruncFOp::create(nb, nloc, toElem, args[0]);
+                   });
+}
+
 AffineMap mapFull(MLIRContext * ctx, int rank) {
     return AffineMap::getMultiDimIdentityMap(rank, ctx);
 }

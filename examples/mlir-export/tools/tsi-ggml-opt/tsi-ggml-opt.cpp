@@ -48,9 +48,26 @@ struct ConvertGgmlToLinalgPass
     }
 };
 
+// Wraps promoteGgmlToF32, so the promotion is testable on its own and composes ahead of the lowering.
+struct PromoteGgmlToF32Pass : public PassWrapper<PromoteGgmlToF32Pass, OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PromoteGgmlToF32Pass)
+
+    llvm::StringRef getArgument() const final { return "promote-ggml-to-f32"; }
+    llvm::StringRef getDescription() const final {
+        return "Rewrite f16/bf16 ggml ops to compute in f32";
+    }
+
+    void getDependentDialects(DialectRegistry & registry) const override {
+        registry.insert<linalg::LinalgDialect, tensor::TensorDialect, arith::ArithDialect>();
+    }
+
+    void runOnOperation() final { tsi::mlir_export::promoteGgmlToF32(getOperation()); }
+};
+
 }  // namespace
 
 int main(int argc, char ** argv) {
+    PassRegistration<PromoteGgmlToF32Pass>();
     PassRegistration<ConvertGgmlToLinalgPass>();
 
     DialectRegistry registry;

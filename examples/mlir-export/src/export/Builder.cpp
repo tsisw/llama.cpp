@@ -4,6 +4,8 @@
 // MLIR object instead of its textual spelling.
 #include "Builder.h"
 
+#include "PatternSupport.h"   // ps::castElements, for the f32 -> cache-type narrowing
+
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AsmState.h"   // AsmResourceBlob, for dense_resource constants
@@ -42,13 +44,17 @@ Value GraphBuilder::valueOf(const ggml_tensor * t) const {
 // --- type mapping ---------------------------------------------------------------------------
 
 Type GraphBuilder::elementType(const ggml_tensor * t) const {
-    if (t->type == GGML_TYPE_F32) {
-        return b_.getF32Type();
+    switch (t->type) {
+        case GGML_TYPE_F32:  return b_.getF32Type();
+        case GGML_TYPE_F16:  return b_.getF16Type();
+        case GGML_TYPE_BF16: return b_.getBF16Type();
+        case GGML_TYPE_I32:  return b_.getI32Type();
+        default:
+            // Quantized types are the notable absence. They are not element types at all: a q8_0
+            // block interleaves scales with quants, so a tensor of them has no MLIR equivalent and
+            // would need dequantization in the graph.
+            unsupported("unsupported tensor type: %s", ggml_type_name(t->type));
     }
-    if (t->type == GGML_TYPE_I32) {
-        return b_.getI32Type();
-    }
-    unsupported("unsupported tensor type: %s", ggml_type_name(t->type));
 }
 
 llvm::SmallVector<int64_t> GraphBuilder::dims(const ggml_tensor * t) const {
@@ -124,35 +130,41 @@ Value GraphBuilder::bakedConstant(const ggml_tensor * t) {
         unsupported("leaf '%s' is neither a declared runtime input nor holds data to bake",
                     t->name[0] ? t->name : "<unnamed>");
     }
-    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
-        unsupported("cannot bake a constant of type %s", ggml_type_name(t->type));
+    RankedTensorType  ty   = tensorType(t);
+    const std::string name = blobName(t);
+
+    // Element width drives both the blob alignment and the gather type. f16/bf16 are copied as raw
+    // 16-bit patterns: nothing here does arithmetic on them, and the host has no bf16 type anyway.
+    size_t width = 0;
+    switch (t->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_I32:  width = 4; break;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16: width = 2; break;
+        default:
+            unsupported("cannot bake a constant of type %s", ggml_type_name(t->type));
     }
 
-    RankedTensorType  ty    = tensorType(t);
-    const bool        isI32 = t->type == GGML_TYPE_I32;
-    const std::string name  = blobName(t);
-    const size_t      bytes = (size_t) ggml_nelements(t) * 4;   // f32 and i32 are both 4 bytes
-
-    // Zero-copy when the layout already matches the blob's: contiguous and 4-byte aligned. This is
+    // Zero-copy when the layout already matches the blob's: contiguous and naturally aligned. That is
     // the case for every model weight, and it is the difference between one and two copies of the
     // model in memory during export.
-    const bool inPlace = ggml_is_contiguous(t) && ((uintptr_t) t->data % 4) == 0;
+    const bool inPlace = ggml_is_contiguous(t) && ((uintptr_t) t->data % width) == 0;
 
-    Attribute attr;
+    AsmResourceBlob blob;
     if (inPlace) {
-        auto blob = UnmanagedAsmResourceBlob::allocateWithAlign(
-            llvm::ArrayRef<char>((const char *) t->data, bytes), 4);
-        attr = isI32 ? Attribute(DenseI32ResourceElementsAttr::get(ty, name, std::move(blob)))
-                     : Attribute(DenseF32ResourceElementsAttr::get(ty, name, std::move(blob)));
-    } else if (isI32) {
-        std::vector<int32_t> v = gather<int32_t>(t);
-        attr = DenseI32ResourceElementsAttr::get(
-            ty, name, HeapAsmResourceBlob::allocateAndCopyInferAlign(llvm::ArrayRef<int32_t>(v)));
+        blob = UnmanagedAsmResourceBlob::allocateWithAlign(
+            llvm::ArrayRef<char>((const char *) t->data, (size_t) ggml_nelements(t) * width), width);
+    } else if (width == 4) {
+        std::vector<int32_t> v = gather<int32_t>(t);   // f32 and i32 both move as 32-bit words
+        blob = HeapAsmResourceBlob::allocateAndCopyInferAlign(llvm::ArrayRef<int32_t>(v));
     } else {
-        std::vector<float> v = gather<float>(t);
-        attr = DenseF32ResourceElementsAttr::get(
-            ty, name, HeapAsmResourceBlob::allocateAndCopyInferAlign(llvm::ArrayRef<float>(v)));
+        std::vector<uint16_t> v = gather<uint16_t>(t);
+        blob = HeapAsmResourceBlob::allocateAndCopyInferAlign(llvm::ArrayRef<uint16_t>(v));
     }
+
+    // The generic DenseResourceElementsAttr, not the typed DenseF32ResourceElementsAttr: the typed
+    // ones exist only for f32/f64 and the integer widths, so f16 and bf16 have no variant to use.
+    Attribute attr = DenseResourceElementsAttr::get(ty, name, std::move(blob));
     return arith::ConstantOp::create(b_, loc_, cast<TypedAttr>(attr));
 }
 
@@ -223,9 +235,12 @@ void GraphBuilder::cacheAppend(Value cache, const CacheSpec & spec, int64_t il, 
                                Value src) {
     auto st = cast<RankedTensorType>(src.getType());
     auto ct = cast<MemRefType>(cache.getType());
+    // The graph computes in f32 (see promoteGgmlToF32) but the cache is f16 to match llama bit for
+    // bit, so the append is where the narrowing happens. Emitted as linalg.generic for the same
+    // reason the promotion pass does: it is the form the rest of the lowering produces.
     if (st.getElementType() != ct.getElementType()) {
-        // Mixed precision needs an explicit truncf/extf here; not built yet.
-        unsupported("cache '%s': append element type differs from the cache", spec.name.c_str());
+        src = ps::castElements(b_, loc_, src, ct.getElementType());
+        st  = cast<RankedTensorType>(src.getType());
     }
     Value sub = cacheSlice(cache, spec, il, slot, st.getShape().back());
     auto  op  = bufferization::MaterializeInDestinationOp::create(b_, loc_, TypeRange{}, src, sub);

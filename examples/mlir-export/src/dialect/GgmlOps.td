@@ -35,10 +35,15 @@ def Ggml_Dialect : Dialect {
 
 class Ggml_Op<string mnemonic, list<Trait> traits = []> : Op<Ggml_Dialect, mnemonic, traits>;
 
-// Every tensor in an imported graph is a statically shaped f32 or i32 tensor.
+// Every tensor in an imported graph is statically shaped, with one of ggml's element types that we
+// map directly: f32, f16 and bf16 for data, i32 for indices and positions.
+//
+// The dialect admits f16/bf16 so the imported IR stays a faithful record of the graph. Arithmetic is
+// a different question: promote-ggml-to-f32 rewrites every op to f32 before lowering, so no pattern
+// ever sees a half-precision operand and every reduction accumulates in f32.
 def Ggml_Tensor : AnyTypeOf<[
-  TensorOf<[F32, I32]>
-], "a statically shaped f32 or i32 tensor">;
+  TensorOf<[F32, F16, BF16, I32]>
+], "a statically shaped f32, f16, bf16 or i32 tensor">;
 
 //===----------------------------------------------------------------------===//
 // elementwise / unary
