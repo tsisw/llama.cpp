@@ -82,7 +82,7 @@ struct case_result {
 
 // Reconstruct the cache-free prefill graph. Throws mlir_export_error if the live graph isn't the
 // expected llama shape, so capture can skip non-target graphs gracefully.
-static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
+static case_result build_cachefree_from_live(struct ggml_cgraph * live, bool weights_as_args = false) {
     std::map<std::string, ggml_tensor *> idx = wg_index_live(live);
 
     auto is_orig = [](const ggml_tensor * t) {
@@ -333,10 +333,20 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     r.leafs = tsi::mlir_export::discoverLeafs(r.gf);
 
     // Only the per-step inputs are arguments. Everything else the exporter finds - every weight - is
-    // baked into the IR as a constant, unconditionally: the compiler needs the weight values to fold
-    // and place them, and the compiled binary then no longer depends on a matching weight buffer at
-    // run time. Weights being arguments was the single biggest term in the old signature.
+    // baked into the IR as a constant: the compiler needs the weight values to fold and place them,
+    // and the compiled binary then no longer depends on a matching weight buffer at run time. Weights
+    // being arguments was the single biggest term in the old signature.
     r.runtime_args = { ids, pos, mask };
+
+    // Unless the caller asks for the opposite, because the whole constant pool must fit in one object
+    // file and a big model's does not. See Config::weight_args.
+    if (weights_as_args) {
+        for (const ggml_tensor * leaf : r.leafs) {
+            if (leaf != ids && leaf != pos && leaf != mask) {
+                r.runtime_args.push_back(leaf);
+            }
+        }
+    }
 
     tsi::mlir_export::ExportOptions opts;
     opts.runtime_args = r.runtime_args;

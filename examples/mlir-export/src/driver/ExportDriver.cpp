@@ -130,7 +130,7 @@ void compare(const char * label, const float * a, const float * b, int64_t n) {
 std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
     case_result r;
     try {
-        r = build_cachefree_from_live(live);
+        r = build_cachefree_from_live(live, cfg.weight_args);
     } catch (const std::exception & e) {
         fprintf(stderr, "[tsi-mlir] prefill SKIPPED: %s\n", e.what());
         return {};
@@ -333,7 +333,7 @@ bool seedCaches(const decode_case & r) {
 std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
     decode_case r;
     try {
-        r = build_decode_from_live(live);
+        r = build_decode_from_live(live, cfg.weight_args);
     } catch (const std::exception & e) {
         fprintf(stderr, "[tsi-mlir] decode SKIPPED: %s\n", e.what());
         return {};

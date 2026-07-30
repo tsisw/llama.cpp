@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -71,7 +72,8 @@ static inline float ldb_pf32(const ggml_tensor * t, int slot) {
 // compute llama has already written cell pos, so the graph would be consuming its own answer.
 //
 // Throws mlir_export_error when the live graph is not a decode step we can express.
-static inline decode_case build_decode_from_live(struct ggml_cgraph * live) {
+static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
+                                                 bool weights_as_args = false) {
     using tsi::mlir_export::mlir_export_error;
 
     std::map<std::string, ggml_tensor *> idx = wg_index_live(live);
@@ -282,6 +284,20 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live) {
     // knew/vnew become appends into it, so neither appears in the signature.
     r.runtime_args = { id, pt, mask };
     r.outputs      = { logits };
+
+    // Weights as arguments instead of baked constants, when the constant pool would be too big to
+    // land in one object file. See Config::weight_args. The cache leafs stay out of this: they are
+    // caches, not arguments, and adding them here would emit each layer's window twice.
+    if (weights_as_args) {
+        std::set<const ggml_tensor *> excl(r.runtime_args.begin(), r.runtime_args.end());
+        excl.insert(cK.begin(), cK.end());
+        excl.insert(cV.begin(), cV.end());
+        for (const ggml_tensor * leaf : tsi::mlir_export::discoverLeafs(r.gf)) {
+            if (!excl.count(leaf)) {
+                r.runtime_args.push_back(leaf);
+            }
+        }
+    }
 
     r.k_slices.assign(cK.begin(), cK.end());
     r.v_slices.assign(cV.begin(), cV.end());

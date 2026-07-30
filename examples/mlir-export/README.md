@@ -26,6 +26,7 @@ TSI compiler, runs it, and hands the logits back to llama, which samples from th
 | `TSI_MLIR_PYTHON` | venv python with the tsavorite package |
 | `TSI_MLIR_SCRIPT` | `compile_graph_fpga.py`, if not next to this source tree |
 | `TSI_MLIR_DUMP_GRAPH` | `1` writes each intercepted graph's nodes to `<dir>/graph-<phase>.txt` |
+| `TSI_MLIR_WEIGHT_ARGS` | `1` passes weights as arguments instead of baking them in as constants (see below) |
 | `TSI_MLIR_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
 | `TSI_DUMP_GGML_IR` | also dump the ggml dialect before lowering to linalg |
 | `USER_DRAM_SIZE` | simulated device DRAM budget; a 1.1B f32 model needs `16348` |

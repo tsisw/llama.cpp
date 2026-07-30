@@ -37,6 +37,7 @@ const Config & Config::get() {
         c.verify  = flag("TSI_MLIR_VERIFY");
         c.cpu_ref = flag("TSI_MLIR_CPU_REF");
         c.dump    = flag("TSI_MLIR_DUMP_GRAPH");
+        c.weight_args = flag("TSI_MLIR_WEIGHT_ARGS");
 
         const char * skip = getenv("TSI_MLIR_SKIP");
         c.skip            = skip ? atoi(skip) : 1;
