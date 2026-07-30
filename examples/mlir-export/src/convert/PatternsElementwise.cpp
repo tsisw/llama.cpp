@@ -1,5 +1,5 @@
 // ggml.add, ggml.mul, ggml.scale, ggml.silu -> linalg.
-#include "Builder.h"
+#include "IRBuilder.h"
 #include "GgmlDialect.h"
 #include "GgmlToLinalg.h"
 #include "PatternSupport.h"

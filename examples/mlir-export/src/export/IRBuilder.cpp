@@ -2,7 +2,7 @@
 //
 // Each function here replaces a string-formatting helper from the previous emitter, returning the
 // MLIR object instead of its textual spelling.
-#include "Builder.h"
+#include "IRBuilder.h"
 
 #include "PatternSupport.h"   // ps::castElements, for the f32 -> cache-type narrowing
 

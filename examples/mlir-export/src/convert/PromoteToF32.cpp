@@ -12,7 +12,7 @@
 //
 // Runs after import, so the ggml dialect IR remains a faithful record of the graph and
 // TSI_DUMP_GGML_IR still shows what ggml had. Set TSI_DUMP_GGML_IR=1 to see the promoted form too.
-#include "Builder.h"
+#include "IRBuilder.h"
 #include "GgmlDialect.h"
 #include "GgmlToLinalg.h"
 #include "PatternSupport.h"

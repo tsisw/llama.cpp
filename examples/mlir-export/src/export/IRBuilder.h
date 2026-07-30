@@ -1,5 +1,8 @@
 // ggml -> MLIR type mapping and the graph value map, used by the importer.
 //
+// Named IRBuilder, not Builder: `build*` in .gitignore matches `Builder.*` on a case-insensitive
+// filesystem, so a file called Builder.cpp is silently untracked on macOS.
+//
 // Replaces the previous emitter's string helpers (mlir_tensor_type, mlir_shape_dims,
 // mlir_dense_literal, ...) with functions returning MLIR objects. The linalg-building helpers live
 // separately in convert/PatternSupport.h, because by the time lowering runs the ggml graph is gone

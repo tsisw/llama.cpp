@@ -4,7 +4,7 @@
 // Splitting import from lowering is the point of the dialect: "did we read the graph correctly" and
 // "did we lower it correctly" become separately answerable questions. Set TSI_DUMP_GGML_IR=1 to see
 // the intermediate.
-#include "Builder.h"
+#include "IRBuilder.h"
 #include "GgmlDialect.h"
 #include "GgmlToLinalg.h"
 #include "Importer.h"

@@ -86,7 +86,7 @@ if (MLIR_FOUND)
         src/convert/PatternsShape.cpp
         src/convert/PatternsRope.cpp
         src/convert/PromoteToF32.cpp
-        src/export/Builder.cpp
+        src/export/IRBuilder.cpp
         src/export/Exporter.cpp
         src/export/GraphWalk.cpp
     )

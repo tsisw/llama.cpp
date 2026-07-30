@@ -1,7 +1,7 @@
 // ggml_cgraph -> ggml dialect, 1:1 with no lowering decisions.
 #include "Importer.h"
 
-#include "Builder.h"
+#include "IRBuilder.h"
 #include "GgmlDialect.h"
 
 #include <cstring>

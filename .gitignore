@@ -52,9 +52,6 @@ debug
 !build-info.sh
 !build.zig
 !docs/build.md
-# core.ignorecase is true on macOS, so `build*` above also swallows Builder.h/Builder.cpp.
-!examples/mlir-export/src/export/Builder.h
-!examples/mlir-export/src/export/Builder.cpp
 /libllama.so
 /llama-*
 /vulkan-shaders-gen

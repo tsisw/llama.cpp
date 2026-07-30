@@ -1,6 +1,6 @@
 #include "GgmlToLinalg.h"
 
-#include "Builder.h"
+#include "IRBuilder.h"
 #include "GgmlDialect.h"
 #include "PatternSupport.h"
 
