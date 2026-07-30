@@ -3892,12 +3892,6 @@ static inline void ensure_triton_full_buffers(
     const int64_t need_K =
         tsi_round_up_i64(K, TRITON_MATMUL_F32_K_DIM);
 
-    //
-    // IMPORTANT:
-    // tsi_free currently broken.
-    // Allocate ONCE and only grow when absolutely necessary.
-    // Never replace existing allocations with smaller shapes.
-    //
     if (g_triton_A_full &&
         g_triton_B_full &&
         g_triton_C_full &&
@@ -3906,6 +3900,10 @@ static inline void ensure_triton_full_buffers(
         need_K <= g_triton_K_cap) {
         return;
     }
+
+    float *old_A = g_triton_A_full;
+    float *old_B = g_triton_B_full;
+    float *old_C = g_triton_C_full;
 
     int64_t new_M =
         std::max<int64_t>(need_M,
@@ -3945,6 +3943,16 @@ static inline void ensure_triton_full_buffers(
     g_triton_M_cap = new_M;
     g_triton_N_cap = new_N;
     g_triton_K_cap = new_K;
+
+    if (old_A) {
+        tsi_dealloc(old_A);
+    }
+    if (old_B) {
+        tsi_dealloc(old_B);
+    }
+    if (old_C) {
+        tsi_dealloc(old_C);
+    }
 
 #if TRITON_DEBUG
     fprintf(stderr,
@@ -4099,11 +4107,10 @@ static inline void ensure_triton_full_buffers_for_device(
         return;
     }
 
-    /*
-     * tsi_free is currently not usable.
-     * Allocate persistent per-TXE buffers and grow only when required.
-     * Old smaller buffers are intentionally not freed due to runtime bug.
-     */
+    float *old_A = g_triton_A_full_mt[deviceId];
+    float *old_B = g_triton_B_full_mt[deviceId];
+    float *old_C = g_triton_C_full_mt[deviceId];
+
     const int64_t new_M =
         std::max<int64_t>(need_M,
         std::max<int64_t>(g_triton_M_cap_mt[deviceId], 64));
@@ -4140,6 +4147,16 @@ static inline void ensure_triton_full_buffers_for_device(
     g_triton_M_cap_mt[deviceId] = new_M;
     g_triton_N_cap_mt[deviceId] = new_N;
     g_triton_K_cap_mt[deviceId] = new_K;
+
+    if (old_A) {
+        tsi_dealloc(old_A);
+    }
+    if (old_B) {
+        tsi_dealloc(old_B);
+    }
+    if (old_C) {
+        tsi_dealloc(old_C);
+    }
 
 #if TRITON_DEBUG
     fprintf(stderr,
