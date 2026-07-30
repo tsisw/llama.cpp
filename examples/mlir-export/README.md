@@ -274,11 +274,20 @@ Two things make that affordable:
 The two `*_const_w` cases in the end-to-end suite check the values survive the round trip;
 `bytecode-export-compile` checks the compiler accepts a bytecode module with a blob in it.
 
-Measured on SmolLM2-135M f32: **275 leafs become 3 args and 272 baked constants**, a 513.24 MiB
-bytecode module written in 1.93 s at 2.64 GiB peak RSS. That is the weight bytes plus a rounding
-error, which is the point. **Compiling a module that size is not yet proven** - a 64 MiB constant took
-35.6 s at 3.42 GiB peak RSS, and extrapolating 8x from one point is not a prediction. Prefer f16
-weights and measure before assuming a whole model compiles.
+Measured end to end on SmolLM2-135M f32, a whole model with every weight baked in:
+
+| stage | result |
+|---|---|
+| export | 275 leafs -> **3 args + 272 constants**, 513.24 MiB bytecode, 1.93 s, 2.64 GiB peak RSS |
+| compile | `host.so` OK, `_mlir_ciface_forward takes 4 pointer args`, **140 s, 5.50 GiB peak RSS** |
+
+So a full model does compile with its weights as constants. Scaling is sublinear in memory: 8x the
+payload of the earlier 64 MiB probe cost 3.9x the time and 1.6x the RSS.
+
+The binding constraint is **disk, not memory**. For a 513 MiB module the pipeline writes 3.46 GiB of
+`host.ll` and 1.08 GiB of `host.llvm.mlir`, plus a 542 MB `host.so` - roughly 9x the weight bytes,
+because LLVM's textual IR spells out every constant. TinyLlama-1.1B f32 would need tens of GiB of
+scratch on that ratio, which is the case for f16 weights rather than any memory limit.
 
 ### Per-op lowering tests (lit + FileCheck)
 

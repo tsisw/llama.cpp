@@ -96,12 +96,17 @@ Outside the exporter: `compile_graph_fpga.py:89` uses `read_text()` and must rea
 both `host.so` define `@forward` at different arities, so load `RTLD_LOCAL` with separate handles; delete
 `TSI_WG_BAKE_WEIGHTS` and `partitionWeights()`.
 
-**Weights as constants is done and measured.** `runtime_args` is now the whole rule: whatever the caller
-does not declare becomes a `dense_resource` constant, with no flag and no name heuristic. On SmolLM2-135M
-f32 that turns 275 leafs into **3 args and 272 constants**, a 513.24 MiB bytecode module written in 1.93 s
-at 2.64 GiB peak RSS - the weight bytes plus a rounding error, and the 272 the table above predicted.
-Compiling a module that size is still unproven; 64 MiB took 35.6 s at 3.42 GiB, and extrapolating 8x from
-one point is not a prediction.
+**Weights as constants is done, and a whole model compiles.** `runtime_args` is now the whole rule:
+whatever the caller does not declare becomes a `dense_resource` constant, with no flag and no name
+heuristic. On SmolLM2-135M f32 that turns 275 leafs into **3 args and 272 constants** - the 272 the table
+above predicted - a 513.24 MiB bytecode module written in 1.93 s at 2.64 GiB peak RSS. That module then
+**compiles to a working `host.so` in 140 s at 5.50 GiB peak RSS**, reporting
+`_mlir_ciface_forward takes 4 pointer args`. Scaling is sublinear in memory: 8x the 64 MiB probe's payload
+cost 3.9x the time and 1.6x the RSS.
+
+The real limit is disk. The pipeline writes 3.46 GiB of `host.ll` and 1.08 GiB of `host.llvm.mlir` for a
+513 MiB module, about 9x the weight bytes, because LLVM's textual IR spells out every constant. That ratio,
+not memory, is why f16 weights matter for anything at 1B scale.
 
 Two implementation rules, both learned by getting them wrong:
 
