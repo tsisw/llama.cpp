@@ -9,6 +9,7 @@
 #include "DeviceArgs.h"
 #include "Runtime.h"
 
+#include "tsi/graph/LiveCache.h"          // live_cache_probe / _extract (llama's KV cache)
 #include "tsi/graph/LiveGraphBuilder.h"   // build_cachefree_from_live, case_result
 #include "ggml-cpu.h"                     // ggml_graph_compute_with_ctx (CPU reference)
 
@@ -188,6 +189,77 @@ std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & 
     return last;
 }
 
+// ---------------------------------------------------------------------------------------------
+// decode
+// ---------------------------------------------------------------------------------------------
+
+// Read llama's KV cache and report what was found, without building anything yet.
+//
+// This runs on the real decode graph, so the geometry the next step will rely on is measured here
+// rather than assumed. It also checks the one thing that could silently be wrong: that the cells
+// llama has written are non-zero and the cells beyond its position are still zero. If the layout
+// assumption in LiveCache.h were off, the boundary would land somewhere else and this would say so.
+void reportDecodeCache(ggml_cgraph * live) {
+    const int pos = g_pos_cap.empty() ? -1 : g_pos_cap[0];
+    fprintf(stderr, "[tsi-mlir] decode graph: %d nodes, pos %d\n", ggml_graph_n_nodes(live), pos);
+
+    // Geometry straight off the VIEW a decode step reads: [head_dim, n_head_kv, n_kv].
+    int head_dim = 0, n_head_kv = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
+        ggml_tensor * nd = ggml_graph_node(live, i);
+        if (nd->op == GGML_OP_VIEW && nd->src[0] && ggml_n_dims(nd) == 3 &&
+            wg_core_name(nd->src[0]->name).rfind("cache_k_l", 0) == 0) {
+            head_dim  = (int) nd->ne[0];
+            n_head_kv = (int) nd->ne[1];
+            break;
+        }
+    }
+    if (head_dim == 0) {
+        fprintf(stderr, "[tsi-mlir] no cache_k_l* view found; this is not a KV-cache decode graph\n");
+        return;
+    }
+
+    const LiveCacheInfo k = live_cache_probe(live, "k", head_dim, n_head_kv);
+    const LiveCacheInfo v = live_cache_probe(live, "v", head_dim, n_head_kv);
+    if (!k.found || !v.found) {
+        fprintf(stderr, "[tsi-mlir] cache_k/cache_v not both found\n");
+        return;
+    }
+    fprintf(stderr, "[tsi-mlir] cache: %d layers, head_dim %d, n_head_kv %d, capacity %d cells, "
+                    "live window n_kv %d\n",
+            k.n_layers, k.head_dim, k.n_head_kv, k.n_cells, k.n_kv);
+
+    // Extract layer 0's window and look at where the written cells stop.
+    ggml_init_params ip { (size_t) 64 << 20, nullptr, false };
+    ggml_context *   ctx = ggml_init(ip);
+    const int        L   = k.n_kv > 0 ? k.n_kv : k.n_cells;
+    ggml_tensor *    ck  = live_cache_extract(ctx, live, "k", 0, k, L);
+    if (!ck) {
+        ggml_free(ctx);
+        return;
+    }
+
+    const int64_t per_cell = (int64_t) k.head_dim * k.n_head_kv;
+    const float * d        = (const float *) ck->data;
+    int           last_nz  = -1;
+    for (int c = 0; c < L; c++) {
+        for (int64_t e = 0; e < per_cell; e++) {
+            if (d[(size_t) c * per_cell + e] != 0.0f) {
+                last_nz = c;
+                break;
+            }
+        }
+    }
+    // Called before compute, so llama has not yet written this step's cell: cells 0..pos-1 hold the
+    // prompt and everything from pos on is still zero. That is exactly the decode input we want, and
+    // it is why the snapshot cannot wait until after compute - by then cell pos is written too and the
+    // graph would be reading its own answer.
+    const bool as_expected = last_nz == pos - 1;
+    fprintf(stderr, "[tsi-mlir] cache_k_l0: last written cell %d, pos %d -> %s\n", last_nz, pos,
+            as_expected ? "layout CONFIRMED" : "UNEXPECTED (layout assumption is wrong)");
+    ggml_free(ctx);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -240,7 +312,28 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
     // misclassify the phase.
     g_ids_cap.clear();
     g_pos_cap.clear();
-    (void) cgraph;
+
+    // Positions are a graph INPUT, filled by llama before compute, so read them here rather than
+    // waiting for the eval callback. That matters because the phase decides whether we need a cache
+    // snapshot, and the snapshot has to happen now: after compute, llama has already written this
+    // step's cell and a decode graph would be reading its own answer.
+    for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
+        ggml_tensor * nd = ggml_graph_node(cgraph, i);
+        if (nd->op == GGML_OP_ROPE && nd->src[1] && nd->src[1]->type == GGML_TYPE_I32 &&
+            nd->src[1]->data) {
+            g_pos_cap.resize((size_t) ggml_nelements(nd->src[1]));
+            memcpy(g_pos_cap.data(), nd->src[1]->data, g_pos_cap.size() * sizeof(int32_t));
+            break;
+        }
+    }
+
+    static int  seen        = 0;
+    static bool did_report  = false;
+    const bool  is_warmup   = seen++ < cfg.skip;
+    if (!is_warmup && !did_report && classify() == Phase::Decode) {
+        did_report = true;
+        reportDecodeCache(cgraph);
+    }
 }
 
 bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
@@ -290,9 +383,8 @@ bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
 
     if (phase == Phase::Decode && !did_decode) {
         did_decode = true;
-        fprintf(stderr, "[tsi-mlir] decode graph seen (%d nodes, pos %d). The compiled decode path "
-                        "is not wired up yet; llama's own result stands.\n",
-                ggml_graph_n_nodes(live), g_pos_cap.empty() ? -1 : g_pos_cap[0]);
+        fprintf(stderr, "[tsi-mlir] decode: the compiled path is not wired up yet; llama's own "
+                        "result stands. The cache snapshot above is what it will consume.\n");
     }
     return false;
 }
