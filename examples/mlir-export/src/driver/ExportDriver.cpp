@@ -10,6 +10,7 @@
 #include "Runtime.h"
 
 #include "tsi/graph/LiveCache.h"          // live_cache_probe / _extract (llama's KV cache)
+#include "tsi/graph/LiveDecodeBuilder.h"   // build_decode_from_live, decode_case
 #include "tsi/graph/LiveGraphBuilder.h"   // build_cachefree_from_live, case_result
 #include "ggml-cpu.h"                     // ggml_graph_compute_with_ctx (CPU reference)
 
@@ -260,6 +261,75 @@ void reportDecodeCache(ggml_cgraph * live) {
     ggml_free(ctx);
 }
 
+// Compiled decode logits, produced in before_compute and consumed in after_compute. They cannot be
+// written straight into the live output: llama has not computed it yet, and its own pass would
+// overwrite them.
+std::vector<float> g_decode_logits;
+int64_t            g_decode_nvoc = 0;
+
+// Rebuild, compile and run one decode step. Returns its logits, or empty on any failure, in which
+// case llama's own result stands.
+std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
+    decode_case r;
+    try {
+        r = build_decode_from_live(live);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "[tsi-mlir] decode SKIPPED: %s\n", e.what());
+        return {};
+    }
+
+    auto cleanup = [&] {
+        if (r.ctx) ggml_free(r.ctx);
+        if (r.wc)  ggml_free(r.wc);
+    };
+
+    // A separate artifact from prefill: different arity, so a separate RTLD_LOCAL handle too.
+    forward_argv_fn fwd = buildForward(r.func_text, "decode", cfg);
+    if (!fwd) {
+        cleanup();
+        return {};
+    }
+
+    ggml_tensor * out  = const_cast<ggml_tensor *>(r.outputs[0]);   // logits [n_vocab, 1]
+    const int64_t nvoc = out->ne[0];
+    nvoc_out           = nvoc;
+
+    std::vector<float> reconcpu;
+    if (cfg.cpu_ref) {
+        reconcpu.resize((size_t) nvoc);
+        ggml_graph_compute_with_ctx(r.ctx, r.gf, 4);
+        memcpy(reconcpu.data(), out->data, (size_t) nvoc * sizeof(float));
+    }
+
+    runtimeUp();
+
+    DeviceArgs args;
+    bool       ok = true;
+    for (const ggml_tensor * t : r.runtime_args) {
+        ok = ok && args.addInput(t);
+    }
+    for (const ggml_tensor * t : r.outputs) {
+        ok = ok && args.addOutput(t);
+    }
+    if (!ok) {
+        cleanup();
+        return {};
+    }
+
+    fprintf(stderr, "[tsi-mlir] running compiled decode: %zu args, %zu outputs, logits [%lld]\n",
+            r.runtime_args.size(), r.outputs.size(), (long long) nvoc);
+    fwd(args.argv());
+
+    std::vector<float> compiled((size_t) nvoc);
+    memcpy(compiled.data(), args.buffer(r.runtime_args.size()), (size_t) nvoc * sizeof(float));
+
+    if (cfg.cpu_ref) {
+        compare("decode recon-CPU vs compiled:", reconcpu.data(), compiled.data(), nvoc);
+    }
+    cleanup();
+    return compiled;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -313,8 +383,8 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
     g_ids_cap.clear();
     g_pos_cap.clear();
 
-    // Positions are a graph INPUT, filled by llama before compute, so read them here rather than
-    // waiting for the eval callback. That matters because the phase decides whether we need a cache
+    // Positions AND token ids are graph INPUTS, filled by llama before compute, so read them here
+    // rather than waiting for the eval callback. That matters because the phase decides whether we need a cache
     // snapshot, and the snapshot has to happen now: after compute, llama has already written this
     // step's cell and a decode graph would be reading its own answer.
     for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
@@ -327,12 +397,33 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
         }
     }
 
-    static int  seen        = 0;
-    static bool did_report  = false;
-    const bool  is_warmup   = seen++ < cfg.skip;
-    if (!is_warmup && !did_report && classify() == Phase::Decode) {
-        did_report = true;
+    // The decode token id. Same reason as positions: needed before compute, and the eval callback
+    // has not run yet. Located structurally as the i32 src1 of the GET_ROWS over the embedding table,
+    // because llama names this input differently across versions.
+    //
+    // Reading it from g_ids_cap instead was a real bug: that is filled during compute and cleared
+    // just above, so decode ran on token id 0 and produced confidently wrong logits.
+    for (int i = 0; i < ggml_graph_n_nodes(cgraph); i++) {
+        ggml_tensor * nd = ggml_graph_node(cgraph, i);
+        if (nd->op == GGML_OP_GET_ROWS && nd->src[0] && nd->src[1] &&
+            wg_core_name(nd->src[0]->name) == "token_embd.weight" &&
+            nd->src[1]->type == GGML_TYPE_I32 && nd->src[1]->data) {
+            g_ids_cap.resize((size_t) ggml_nelements(nd->src[1]));
+            memcpy(g_ids_cap.data(), nd->src[1]->data, g_ids_cap.size() * sizeof(int32_t));
+            break;
+        }
+    }
+
+    static int  seen      = 0;
+    static bool did_decode = false;
+    const bool  is_warmup = seen++ < cfg.skip;
+
+    // Decode is handled HERE, not after compute. The graph reads cells 0..pos-1, and after compute
+    // llama has written cell pos, so a graph built then would consume its own answer.
+    if (!is_warmup && !did_decode && classify() == Phase::Decode) {
+        did_decode = true;
         reportDecodeCache(cgraph);
+        g_decode_logits = runDecode(cgraph, cfg, g_decode_nvoc);
     }
 }
 
@@ -381,10 +472,17 @@ bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
         return false;
     }
 
-    if (phase == Phase::Decode && !did_decode) {
-        did_decode = true;
-        fprintf(stderr, "[tsi-mlir] decode: the compiled path is not wired up yet; llama's own "
-                        "result stands. The cache snapshot above is what it will consume.\n");
+    if (phase == Phase::Decode && !g_decode_logits.empty()) {
+        ggml_tensor * live_out = ggml_graph_node(live, -1);
+        const int64_t n = ggml_nelements(live_out) < g_decode_nvoc ? ggml_nelements(live_out)
+                                                                  : g_decode_nvoc;
+        if (cfg.verify) {
+            compare("decode compiled vs llama:", g_decode_logits.data(),
+                    (const float *) live_out->data, n);
+        }
+        memcpy(live_out->data, g_decode_logits.data(), (size_t) n * sizeof(float));
+        g_decode_logits.clear();
     }
+    (void) did_decode;
     return false;
 }
