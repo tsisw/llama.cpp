@@ -1,6 +1,6 @@
 // Public interface of the ggml-graph-to-linalg-MLIR exporter.
 //
-// Deliberately free of MLIR types. Consumers (WholeGraphHook.cpp, the tools, the test generator) see
+// Deliberately free of MLIR types. Consumers (the driver, the tools, the test generator) see
 // only ggml and std types, so they compile without MLIR's headers on their include path and merely
 // link the library. That keeps their compile times unaffected and lets them stay at C++20 while the
 // exporter itself is built at C++17 to match LLVM.

@@ -118,7 +118,7 @@ def main():
     if not host_obj.exists():
         sys.exit(1)
 
-    # Link host.o -> host.so so the backend can dlopen it (TSI_WHOLEGRAPH=run). We also generate a
+    # Link host.o -> host.so so the driver can dlopen it (TSI_MLIR_EXPORT=1). We also generate a
     # tiny C shim `tsi_forward_argv(void**)` that unpacks a pointer array into the N-arg
     # _mlir_ciface_forward, so the backend can call the compiled forward WITHOUT libffi (the arg
     # count is fixed at compile time). N comes from the real ciface signature in host.ll.
@@ -153,7 +153,18 @@ def main():
     if rt_dir:
         link_cmd += [f"-L{rt_dir}", "-lTsavRTShimCAPI", f"-Wl,-rpath,{rt_dir}"]
     rc = subprocess.call(link_cmd)
-    print(f"host.so: {'OK ' + str(host_so) if (rc == 0 and host_so.exists()) else 'FAILED (link manually: ' + ' '.join(link_cmd) + ')'}")
+    if rc == 0 and host_so.exists():
+        print(f"host.so: OK {host_so}")
+        return
+    # Exit non-zero. Reporting success here used to hide a failed link behind a "FAILED" line on
+    # stdout, so a caller that only checked the exit status believed a several-minute compile had
+    # produced a loadable library. The usual cause is an unset $TSI_RT_LIB_DIR: without it the
+    # runtime shim is not on the link line and every tsi_* symbol is undefined.
+    print(f"host.so: FAILED (link manually: {' '.join(link_cmd)})", file=sys.stderr)
+    if not rt_dir:
+        print("hint: $TSI_RT_LIB_DIR is unset, so libTsavRTShimCAPI was not linked.",
+              file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == "__main__":

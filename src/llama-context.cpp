@@ -12,13 +12,14 @@
 #include <limits>
 
 #if defined(LLAMA_TSI_MLIR_EXPORT) || defined(GGML_USE_TSAVORITE)
-// Whole-graph interception. Defined in examples/mlir-export/src/llama/WholeGraphHook.cpp, which is
-// host-buildable: it needs the MLIR exporter and the TSI runtime shim, not the tsavorite backend.
-// That is what lets `llama-cli` alone capture/compile/run the whole forward, with no wrapper script.
-#  define LLAMA_HAS_TSI_WHOLEGRAPH 1
-void tsi_wholegraph_maybe_capture(struct ggml_cgraph * cgraph);
-bool tsi_wholegraph_maybe_run(struct ggml_cgraph * cgraph);
-extern "C" bool tsi_wholegraph_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+// Whole-graph MLIR export. Defined in examples/mlir-export/src/driver/, which is host-buildable: it
+// needs the MLIR exporter and the TSI runtime shim, not the tsavorite backend. That is what lets
+// `llama-cli` alone export/compile/run the whole forward, with no wrapper script. See
+// examples/mlir-export/include/tsi/driver/ExportDriver.h.
+#  define LLAMA_HAS_TSI_MLIR_EXPORT 1
+void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph);
+bool tsi_mlir_export_after_compute(struct ggml_cgraph * cgraph);
+extern "C" bool tsi_mlir_export_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 #endif
 #include <stdexcept>
 
@@ -1476,13 +1477,13 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
-#ifdef LLAMA_HAS_TSI_WHOLEGRAPH
+#ifdef LLAMA_HAS_TSI_MLIR_EXPORT
     // gf is the full forward graph before the scheduler splits it across backends, the only place
-    // the whole forward is visible. Capture/dump here, and install the weight-capture callback that
-    // the reconstruction depends on.
-    tsi_wholegraph_maybe_capture(gf);
-    if (getenv("TSI_WHOLEGRAPH")) {
-        ggml_backend_sched_set_eval_callback(sched.get(), tsi_wholegraph_eval_cb, nullptr);
+    // the whole forward is visible. Classify the phase here, and install the snapshot callback the
+    // reconstruction depends on.
+    tsi_mlir_export_before_compute(gf);
+    if (getenv("TSI_MLIR_EXPORT")) {
+        ggml_backend_sched_set_eval_callback(sched.get(), tsi_mlir_export_eval_cb, nullptr);
     }
 #endif
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
@@ -1506,9 +1507,9 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-#ifdef LLAMA_HAS_TSI_WHOLEGRAPH
-    // after the per-op pass: run/verify the compiled whole-graph forward against gf's output
-    tsi_wholegraph_maybe_run(gf);
+#ifdef LLAMA_HAS_TSI_MLIR_EXPORT
+    // after the per-op pass: export/compile/run the whole-graph forward and take its logits
+    tsi_mlir_export_after_compute(gf);
 #endif
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

@@ -6,7 +6,7 @@
 // prefill over an empty cache, attending to the cache is the same as attending to Kcur/Vcur, so we
 // rebuild the same math cache-free with build_layer (only the op set the exporter lowers to FPGA).
 //
-// Weights come from g_wcap (captured while llama computed, see tsi_wholegraph.cpp); the prompt
+// Weights come from g_wcap (captured while llama computed, see src/driver/ExportDriver.cpp); the prompt
 // tokens, positions and rope/softmax params come from the live graph, so the reconstruction can be
 // diffed against llama's own per-op logits.
 #include "tsi/export/Exporter.h"      // exportGraph, discoverLeafs, mlir_export_error
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-// Weight data captured during llama's compute (defined in WholeGraphHook.cpp). Keyed by core name,
+// Weight data captured during llama's compute (defined in src/driver/ExportDriver.cpp). Keyed by core name,
 // empty until the graph has run once.
 extern std::map<std::string, std::vector<float>> g_wcap;
 
@@ -193,7 +193,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
                 "live graph is not a prefill-from-scratch: position[" + std::to_string(i) + "] is " +
                 std::to_string(pos_src[i]) + ", expected " + std::to_string(i) +
                 ". This is a decode or continued-prefill graph, which needs the KV cache as an "
-                "input and cannot be expressed by the cache-free reconstruction. Lower TSI_WG_SKIP "
+                "input and cannot be expressed by the cache-free reconstruction. Lower TSI_MLIR_SKIP "
                 "to reach the prefill graph, or use decode_cpu_check --emit for decode.");
         }
     }
@@ -218,9 +218,9 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     }
 
     fprintf(stderr,
-            "[tsi-wholegraph] live dims: layers=%d hidden=%d vocab=%d n_head=%d n_head_kv=%d "
+            "[tsi-mlir] live dims: layers=%d hidden=%d vocab=%d n_head=%d n_head_kv=%d "
             "head_dim=%d inter=%d n_tokens=%d eps=%g tied_embd=%d\n"
-            "[tsi-wholegraph] rope: n_dims=%d mode=%d freq_base=%g freq_scale=%g ext=%g attn=%g "
+            "[tsi-mlir] rope: n_dims=%d mode=%d freq_base=%g freq_scale=%g ext=%g attn=%g "
             "beta_fast=%g beta_slow=%g n_ctx_orig=%d  kq_scale=%g\n",
             N_LAYERS, HIDDEN, N_VOCAB, N_HEAD, N_HEAD_KV, HEAD_DIM, INTER, N_TOKENS, REAL_RMS_EPS,
             (int) tied_embd,
@@ -244,10 +244,10 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     }
     // x2 for activations and the per-tensor object/padding overhead, floor at 256 MB for tiny models.
     size_t ctx_size = std::max((size_t) 256 << 20, weight_bytes * 2 + ((size_t) 64 << 20));
-    if (const char * env = getenv("TSI_WG_CTX_MB")) {
+    if (const char * env = getenv("TSI_MLIR_CTX_MB")) {
         ctx_size = (size_t) atoll(env) << 20;
     }
-    fprintf(stderr, "[tsi-wholegraph] reconstruction ctx: %.2f GiB (weights seen %.2f GiB)\n",
+    fprintf(stderr, "[tsi-mlir] reconstruction ctx: %.2f GiB (weights seen %.2f GiB)\n",
             (double) ctx_size / (1024.0 * 1024.0 * 1024.0),
             (double) weight_bytes / (1024.0 * 1024.0 * 1024.0));
     struct ggml_init_params params { /*.mem_size =*/ ctx_size, /*.mem_buffer =*/ NULL, /*.no_alloc =*/ false };
@@ -277,7 +277,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     // now - it would read garbage instead of the embedding matrix.
     outw_t    = tied_embd ? embd_t : bind_w("output.weight", outw_t);
 
-    // Prefer the snapshot taken by tsi_wholegraph_eval_cb while the live buffer was still valid. At
+    // Prefer the snapshot taken by tsi_mlir_export_eval_cb while the live buffer was still valid. At
     // capture time (before compute) the callback has not run yet and the live buffer is correct; by
     // maybe_run() time the live buffer is recycled scratch and only the snapshot is trustworthy.
     struct ggml_tensor * ids = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, N_TOKENS);
@@ -290,7 +290,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     struct ggml_tensor * pos = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, N_TOKENS);
     for (int i = 0; i < N_TOKENS; i++) ((int32_t *) pos->data)[i] = i;
 
-    fprintf(stderr, "[tsi-wholegraph] ids:");
+    fprintf(stderr, "[tsi-mlir] ids:");
     for (int i = 0; i < N_TOKENS; i++) fprintf(stderr, " %d", ((const int32_t *) ids->data)[i]);
     fprintf(stderr, "   pos:");
     for (int i = 0; i < N_TOKENS; i++) fprintf(stderr, " %d", ((const int32_t *) pos->data)[i]);
@@ -343,7 +343,7 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
     // Bytecode: the constants are the model, and text prints them as hex at twice the size.
     opts.format = tsi::mlir_export::Format::Bytecode;
     r.func_text = tsi::mlir_export::exportGraph(r.gf, opts);
-    fprintf(stderr, "[tsi-wholegraph] %zu leafs -> %zu args + %zu baked constants, %.2f MiB bytecode\n",
+    fprintf(stderr, "[tsi-mlir] %zu leafs -> %zu args + %zu baked constants, %.2f MiB bytecode\n",
             r.leafs.size(), r.runtime_args.size(), r.leafs.size() - r.runtime_args.size(),
             (double) r.func_text.size() / (1024.0 * 1024.0));
     return r;

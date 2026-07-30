@@ -3,56 +3,52 @@
 Compile the **entire** ggml forward pass as one MLIR `func @forward` with the TSI mlir-compiler, run
 it on tsisim/FPGA, and verify the next token against llama.cpp's own per-op output.
 
-There are **no wrapper scripts**. The hook is compiled into `libllama`, so plain `llama-cli` drives
-it and the flow is three steps: capture → compile → verify/run.
+There are **no wrapper scripts and no manual steps**. The driver is compiled into `libllama`, so one
+`llama-cli` command exports, compiles and runs:
 
 ```sh
 RT=~/repo/mlir-compiler/build/_deps/runtime-build/lib
 
-# 1. capture: export the prefill graph as linalg MLIR
-TSI_WHOLEGRAPH=capture TSI_WG_DIR=. \
-  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv     # -> ./forward.mlirbc
-
-# 2. compile: MLIR -> host.so  (--target posix also covers host FFM, despite the file name)
-USER_DRAM_SIZE=16348 TSI_RT_LIB_DIR=$RT \
-  ~/repo/mlir-compiler/venv/bin/python compile_graph_fpga.py forward.mlirbc out_ffm
-
-# 3. verify: run the compiled forward, diff its next-token argmax against llama's per-op result
-USER_DRAM_SIZE=16348 DYLD_LIBRARY_PATH=$RT TSI_WHOLEGRAPH=verify TSI_WG_DIR=. \
-TSI_WG_LIB=$PWD/out_ffm/host/host.so \
-  llama-cli -m tinyllama-f32.gguf -p "hello world" -n 1 -no-cnv
+USER_DRAM_SIZE=16348 DYLD_LIBRARY_PATH=$RT TSI_MLIR_EXPORT=1 \
+  llama-cli -m smollm2-135m-f32.gguf -p "hello world" -n 3 -no-cnv
 ```
+
+That intercepts the forward graph, rebuilds it as one MLIR `func @forward`, compiles it through the
+TSI compiler, runs it, and hands the logits back to llama, which samples from them and continues.
 
 | env var | meaning |
 |---|---|
-| `TSI_WHOLEGRAPH` | `capture` \| `dump` \| `verify` \| `run`; unset = the hook is a no-op |
-| `TSI_WG_DIR` | where `forward.mlirbc` / `forward.manifest` are written and read |
-| `TSI_WG_LIB` | compiled `host.so` to load (`verify`, `run`) |
-| `TSI_WG_SKIP` | skip N graphs before capturing (skips llama's warmup graphs) |
-| `TSI_WG_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
+| `TSI_MLIR_EXPORT` | `1` turns the driver on. Unset: every hook is a no-op |
+| `TSI_MLIR_VERIFY` | `1` also diffs the compiled logits against llama's own |
+| `TSI_MLIR_CPU_REF` | `1` also computes the reconstruction on CPU, for a 3-way split |
+| `TSI_MLIR_DIR` | artifact + cache directory (default `./tsi-mlir`) |
+| `TSI_MLIR_SKIP` | graphs to skip before acting (default `1`, llama's warmup graph) |
+| `TSI_MLIR_PYTHON` | venv python with the tsavorite package |
+| `TSI_MLIR_SCRIPT` | `compile_graph_fpga.py`, if not next to this source tree |
+| `TSI_MLIR_DUMP_GRAPH` | `1` writes each intercepted graph's nodes to `<dir>/graph-<phase>.txt` |
+| `TSI_MLIR_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
 | `TSI_DUMP_GGML_IR` | also dump the ggml dialect before lowering to linalg |
 | `USER_DRAM_SIZE` | simulated device DRAM budget; a 1.1B f32 model needs `16348` |
 | `TSI_RT_LIB_DIR` | where `libTsavRTShimCAPI` lives, for linking `host.o` -> `host.so` |
 
-Verified end to end on SmolLM2-135M f32 (30 layers, tied embeddings): 874 nodes, and
+**Comparison is layered**, because each level costs more than the last. `TSI_MLIR_EXPORT=1` alone runs
+the compiled forward and uses its result, comparing against nothing: the point is to run the model
+through the MLIR path, not to check it. `TSI_MLIR_VERIFY=1` adds a diff against llama. Expect
+`~1.1e-07`, essentially all of it unfused-attention vs llama's `FLASH_ATTN_EXT` rather than anything
+the compiler did; compiled-vs-reconstruction measures `2.25e-12`. `TSI_MLIR_CPU_REF=1` adds a full
+extra CPU forward pass to split a reconstruction bug from a compilation bug, which the 2-way diff
+rarely fails to locate on its own.
 
-```
-VERIFY recon-CPU vs per-op:   rel_sq_err=1.09e-07  argmax 504 vs 504 -> MATCH
-VERIFY compiled vs recon-CPU: rel_sq_err=2.25e-12  argmax 504 vs 504 -> MATCH
-VERIFY compiled vs per-op:    rel_sq_err=1.10e-07  argmax 504 vs 504 -> MATCH
-```
+**Compiled artifacts are cached** under `$TSI_MLIR_DIR/<phase>-<hash of the module>/`. A whole-model
+compile takes minutes, so a rerun with the same model and prompt length reuses the binary and skips it
+entirely. Different IR hashes to a different directory, so a stale hit is not possible.
 
-Note that the graph llama runs first is its **warmup** graph (BOS+EOS), not your prompt. Use
-`TSI_WG_SKIP` to reach the real prompt graph.
+Note that the graph llama runs first is its **warmup** graph (BOS+EOS), not your prompt, which is why
+`TSI_MLIR_SKIP` defaults to 1.
 
-Capture is **prefill-from-scratch only**, and enforces it: the reconstruction rebuilds positions as
+The prefill reconstruction is **from-scratch only**, and enforces it: it rebuilds positions as
 `0..n-1` and attends over the current tokens with no cache, so it checks the live graph's real
 positions and refuses anything else rather than emitting valid-looking MLIR for a different function.
-Skipping too far lands on a decode graph and reports:
-
-```
-capture SKIPPED: live graph is not a prefill-from-scratch: position[0] is 2, expected 0.
-```
 
 ---
 
@@ -90,20 +86,20 @@ cd /root/tsi-ggml
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/bin/tsi/bin/tsi-ggml
 # 3. copy the TXE blobs into the runtime's load path:
 ./ggml.sh
-# 4. capture, compile, verify - same three commands as the host flow above, with
-#    TXE_FPGA_CONFIG=txe_arm.json and --target fpga on the compile step.
+# 4. run - the same single command as the host flow above, with
+#    TXE_FPGA_CONFIG=txe_arm.json for the fpga target.
 ```
 
 Expected tail:
 
 ```
-[tsi-wholegraph] VERIFY compiled vs per-op:  argmax <N> vs <N>  -> MATCH
+[tsi-mlir] compiled vs llama:  rel_sq_err=1.1e-07  argmax <N> vs <N> -> MATCH
 ```
 
 ### Notes
 
-- **Activate the compiler venv before running** — the compile step (`compile_graph_fpga.py`) imports
-  the mlir-compiler wheel packages.
+- **Activate the compiler venv before running**, or point `TSI_MLIR_PYTHON` at it — the driver shells
+  out to `compile_graph_fpga.py`, which imports the mlir-compiler wheel packages.
 - **`./ggml.sh` must run once after deploy** so the runtime finds the TXE blobs.
 - The SDK/Xtensa paths are read from the environment (`MLIR_SDK_VERSION`, `XT_TOOLS_DIR`,
   `XT_SYSTEM_DIR`, `TSI_RT_LIB_DIR`, `TXE_FPGA_CONFIG`); `txe_arm.json` is the tsisim/arm config.
@@ -116,8 +112,10 @@ Expected tail:
 
 ## KV-cache decode
 
-The `llama-cli` hook covers **prefill only**: `LiveGraphBuilder` rebuilds a *cache-free* graph,
-because llama's in-place KV cache cannot be expressed as a pure tensor function.
+The driver covers **prefill only** so far: `LiveGraphBuilder` rebuilds a *cache-free* graph, because
+llama's in-place KV cache cannot be expressed as a pure tensor function. When the driver meets a
+decode graph it says so and leaves llama's own result in place. Wiring the compiled decode into
+`llama-cli` is the next step; the graph itself already exists, below.
 
 The decode graph is a separate, fixed-length graph — one MLIR func returning logits plus per-layer
 `k_new`/`v_new`, reused for every token with the cache held on the host. Two tools share it, both
@@ -154,7 +152,7 @@ Verified on SmolLM2-135M f32: 336 args, 61 outputs, `_mlir_ciface_forward` 397 p
 
 `tsi_initialize()` must be called before the first `tsi_alloc()`, and `tsi_finalize()` before exit.
 On a TSI build the ggml-tsavorite backend does both during `llama_backend_init` / `ggml_backend_free`;
-a plain host/FFM build has no such backend, so `WholeGraphHook.cpp` and `decode_run.cpp` do it
+a plain host/FFM build has no such backend, so `src/driver/Runtime.h` and `decode_run.cpp` do it
 themselves. Skipping the init segfaults on the first allocation; skipping the finalize makes the
 process **hang at exit**, idling long after it has printed its results — which looks like slow compute
 but is not.

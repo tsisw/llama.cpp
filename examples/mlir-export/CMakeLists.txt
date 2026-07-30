@@ -126,16 +126,24 @@ if (MLIR_FOUND)
 
     if (TSI_RT_SHIM_LIB AND EXISTS "${TSI_RT_INCLUDE_DIR}/HostShimCAPI.h" AND TARGET llama)
         message(STATUS "mlir-export: TSI runtime shim ${TSI_RT_SHIM_LIB}")
-        add_library(tsi-llama-hook STATIC src/llama/WholeGraphHook.cpp)
+        add_library(tsi-llama-hook STATIC
+            src/driver/ExportDriver.cpp
+            src/driver/Artifact.cpp
+            src/driver/Config.cpp)
         add_dependencies(tsi-llama-hook TsiGgmlOpsIncGen)
         target_include_directories(tsi-llama-hook PRIVATE
             "${TSI_MLIR_EXPORT_INCLUDE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/driver"
             "${TSI_RT_INCLUDE_DIR}"                                  # bare "HostShimCAPI.h"
             "${MLIR_COMPILER_DIR}/third-party/runtime/include"       # its own "tsi-rt/..." includes
             "${MLIR_COMPILER_DIR}/build/_deps/runtime-build/include" # generated runtime headers
             "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-tsavorite/include"   # TestModel.h
             "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src"
             ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+        # The driver shells out to compile_graph_fpga.py, whose final link step needs the runtime
+        # shim. Bake in the path this build used so TSI_MLIR_EXPORT=1 needs no extra environment.
+        target_compile_definitions(tsi-llama-hook PRIVATE
+            TSI_RT_LIB_DIR_DEFAULT="${TSI_RT_LIB_DIR}")
         target_link_libraries(tsi-llama-hook PUBLIC tsi-mlir-export ggml "${TSI_RT_SHIM_LIB}")
         target_link_directories(tsi-llama-hook PUBLIC "${TSI_RT_LIB_DIR}")
         target_compile_features(tsi-llama-hook PRIVATE cxx_std_20)
