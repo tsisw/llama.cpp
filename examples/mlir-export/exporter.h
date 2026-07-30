@@ -45,6 +45,9 @@ static std::string mlir_element_type(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F32) {
         return "f32";
     }
+    if (t->type == GGML_TYPE_BF16) {
+        return "bf16";
+    }
     if (t->type == GGML_TYPE_I32) {
         return "i32";
     }
@@ -255,9 +258,16 @@ struct linalg_exporter {
         const int64_t k = b->ne[0];
         const int64_t n = a->ne[1];
 
+        // bf16 weight: down-cast the activation so both matmul inputs are bf16 (see emit_mul_mat_2d).
+        std::string bsrc = values.at(b), belem = mlir_element_type(b);
+        if (a->type == GGML_TYPE_BF16 && b->type == GGML_TYPE_F32) {
+            bsrc  = cast_f32_to_bf16(b, values.at(b));
+            belem = "bf16";
+        }
+
         std::string b2 = new_id();
-        body << "    " << b2 << " = tensor.expand_shape " << values.at(b) << " [[0, 1]] output_shape [1, " << k
-             << "] : tensor<" << k << "x" << mlir_element_type(b) << "> into tensor<1x" << k << "x" << mlir_element_type(b) << ">\n";
+        body << "    " << b2 << " = tensor.expand_shape " << bsrc << " [[0, 1]] output_shape [1, " << k
+             << "] : tensor<" << k << "x" << belem << "> into tensor<1x" << k << "x" << belem << ">\n";
 
         std::string at_ty = mlir_transposed_tensor_type(a);   // [k, n]
         std::string at_init = new_id();
@@ -272,13 +282,30 @@ struct linalg_exporter {
         std::string filled = new_id();
         body << "    " << filled << " = linalg.fill ins(%cst : f32) outs(" << mm_init << " : " << mm_ty << ") -> " << mm_ty << "\n";
         std::string mm = new_id();
-        body << "    " << mm << " = linalg.matmul ins(" << b2 << ", " << at << " : tensor<1x" << k << "x" << mlir_element_type(b)
+        body << "    " << mm << " = linalg.matmul ins(" << b2 << ", " << at << " : tensor<1x" << k << "x" << belem
              << ">, " << at_ty << ") outs(" << filled << " : " << mm_ty << ") -> " << mm_ty << "\n";
 
         std::string result = new_id();
         body << "    " << result << " = tensor.collapse_shape " << mm << " [[0, 1]] : " << mm_ty << " into "
              << mlir_tensor_type(node) << "\n";
         return result;
+    }
+
+    // elementwise f32 -> bf16 (arith.truncf); returns the new SSA value id
+    std::string cast_f32_to_bf16(const ggml_tensor * t, const std::string & val) {
+        int R = ggml_n_dims(t);
+        std::string bf16_ty = "tensor<" + mlir_shape_dims(t) + "bf16>";
+        std::string init = new_id();
+        body << "    " << init << " = tensor.empty() : " << bf16_ty << "\n";
+        std::string out = new_id();
+        body << "    " << out << " = linalg.generic {indexing_maps = [" << affine_map_full(R) << ", "
+             << affine_map_full(R) << "], iterator_types = " << iterator_types_all_parallel(R) << "} ins("
+             << val << " : " << mlir_tensor_type(t) << ") outs(" << init << " : " << bf16_ty << ") {\n";
+        body << "    ^bb0(%in: f32, %o: bf16):\n";
+        body << "      %c = arith.truncf %in : f32 to bf16\n";
+        body << "      linalg.yield %c : bf16\n";
+        body << "    } -> " << bf16_ty << "\n";
+        return out;
     }
 
     std::string emit_mul_mat_2d(const ggml_tensor * node, const ggml_tensor * a, const ggml_tensor * b) {
@@ -302,9 +329,17 @@ struct linalg_exporter {
         body << "    " << filled << " = linalg.fill ins(%cst : f32) outs(" << out_init << " : "
              << out_ty << ") -> " << out_ty << "\n";
 
+        // bf16 weight: the TMU needs both matmul inputs the same type, so down-cast the f32
+        // activation to bf16 and matmul bf16 x bf16 -> f32 accumulate (bf16 on the TMU).
+        std::string lhs = b_val, lhs_ty = mlir_tensor_type(b);
+        if (a->type == GGML_TYPE_BF16 && b->type == GGML_TYPE_F32) {
+            lhs = cast_f32_to_bf16(b, b_val);
+            lhs_ty = "tensor<" + mlir_shape_dims(b) + "bf16>";
+        }
+
         std::string result = new_id();
-        body << "    " << result << " = linalg.matmul ins(" << b_val << ", " << at << " : "
-             << mlir_tensor_type(b) << ", " << at_ty << ") outs(" << filled << " : "
+        body << "    " << result << " = linalg.matmul ins(" << lhs << ", " << at << " : "
+             << lhs_ty << ", " << at_ty << ") outs(" << filled << " : "
              << out_ty << ") -> " << out_ty << "\n";
 
         return result;
@@ -849,7 +884,10 @@ struct linalg_exporter {
         std::string          pair_ty = "tensor<" + std::to_string(rows) + "x" + std::to_string(half) + "x" +
                                         mlir_element_type(x) + ">";
 
-        // freq_k = freq_base^(-2k/n_dims), k=0..half-1 - compile-time constant.
+        // freq_k = freq_base^(-2k/n_dims), k=0..half-1 - compile-time constant. llama3 rope divides
+        // each by freq_factors[k] (src[2]), matching ggml's theta/ff (Llama-3.x long-context scaling).
+        const ggml_tensor * ff = node->src[2];
+        const float * ffd = (ff && ff->data) ? (const float *) ff->data : nullptr;
         std::ostringstream freq_lit;
         freq_lit << "dense<[";
         for (int64_t k = 0; k < half; k++) {
@@ -857,6 +895,7 @@ struct linalg_exporter {
                 freq_lit << ", ";
             }
             float freq_k = powf(freq_base, -2.0f * (float) k / (float) rot_dims);
+            if (ffd) { freq_k /= ffd[k]; }
             freq_lit << format_f32_literal(freq_k);
         }
         freq_lit << "]>";
@@ -990,7 +1029,10 @@ struct linalg_exporter {
         std::string          pair_ty = "tensor<" + std::to_string(T) + "x" + std::to_string(H) + "x" +
                                         std::to_string(half) + "x" + elem + ">";
 
-        // freq_k = freq_base^(-2k/n_dims), k=0..half-1 - compile-time constant.
+        // freq_k = freq_base^(-2k/n_dims), k=0..half-1 - compile-time constant. llama3 rope divides
+        // each by freq_factors[k] (src[2]), matching ggml's theta/ff (Llama-3.x long-context scaling).
+        const ggml_tensor * ff = node->src[2];
+        const float * ffd = (ff && ff->data) ? (const float *) ff->data : nullptr;
         std::ostringstream freq_lit;
         freq_lit << "dense<[";
         for (int64_t k = 0; k < half; k++) {
@@ -998,6 +1040,7 @@ struct linalg_exporter {
                 freq_lit << ", ";
             }
             float freq_k = powf(freq_base, -2.0f * (float) k / (float) rot_dims);
+            if (ffd) { freq_k /= ffd[k]; }
             freq_lit << format_f32_literal(freq_k);
         }
         freq_lit << "]>";

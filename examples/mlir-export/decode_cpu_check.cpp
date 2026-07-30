@@ -18,15 +18,16 @@ int main(int argc, char ** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s model.gguf id0 [id1 ...] [--L N] [--emit file]\n", argv[0]); return 1; }
     const char * path = argv[1];
     std::vector<int32_t> ids;
-    int L_arg = -1; const char * emit = nullptr;
+    int L_arg = -1, bf16 = 0; const char * emit = nullptr;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--L") && i + 1 < argc)         L_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--emit") && i + 1 < argc) emit = argv[++i];
+        else if (!strcmp(argv[i], "--bf16"))                 bf16 = 1;
         else ids.push_back(atoi(argv[i]));
     }
     const int N = (int) ids.size();
 
-    DecodeModel M = load_decode_model(path);
+    DecodeModel M = load_decode_model(path, bf16);
     const int L = L_arg > 0 ? L_arg : (N + 4);   // padded cache length (extra slots exercise the mask)
     const int VOC = M.n_vocab, KV = M.hidden_kv;
     fprintf(stderr, "dims: layers=%d hidden=%d n_head=%d/%d head_dim=%d vocab=%d L=%d ntok=%d\n",

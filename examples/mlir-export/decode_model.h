@@ -42,7 +42,9 @@ struct DecodeModel {
 };
 
 // Load a GGUF, dequantize all weights into a persistent context, and set the REAL_* rope/rms globals.
-static inline DecodeModel load_decode_model(const char * path) {
+// bf16=true stores the matmul weights (wq/wk/wv/wo/gate/up/down/output) as GGML_TYPE_BF16 so the
+// exporter emits bf16 matmuls; norms and the embedding table stay f32.
+static inline DecodeModel load_decode_model(const char * path, bool bf16 = false) {
     ggml_context * gc = nullptr;
     gguf_init_params gp { false, &gc };
     gguf_context * gguf = gguf_init_from_file(path, gp);
@@ -87,18 +89,39 @@ static inline DecodeModel load_decode_model(const char * path) {
         W[il].u.resize((size_t) INT * HID);  dm_deq(dm_getT(gc, "blk.%d.ffn_up.weight", il),   INT, HID, W[il].u.data());
         W[il].d.resize((size_t) HID * INT);  dm_deq(dm_getT(gc, "blk.%d.ffn_down.weight", il), HID, INT, W[il].d.data());
     }
+    // llama3 rope scaling (Llama-3.x): the convert step writes the per-dim factors as rope_freqs.weight.
+    std::vector<float> rope_freqs_d;
+    if (ggml_tensor * rf_t = ggml_get_tensor(gc, "rope_freqs.weight")) {
+        rope_freqs_d.resize((size_t) rf_t->ne[0]);
+        memcpy(rope_freqs_d.data(), rf_t->data, rope_freqs_d.size() * sizeof(float));
+    }
     ggml_free(gc); gguf_free(gguf);
 
     size_t wb = (size_t) 2 * VOC * HID * 4 +
                 (size_t) M.n_layers * (2 * HID * HID + 2 * HKV * HID + 3 * INT * HID) * 4;
     ggml_init_params wp { wb + wb / 4 + ((size_t) 64 << 20), nullptr, false };
     M.wc = ggml_init(wp);
-    M.embd = ggml_new_tensor_2d(M.wc, GGML_TYPE_F32, HID, VOC); memcpy(M.embd->data, embd_d.data(), ggml_nbytes(M.embd));
-    M.onw  = ggml_new_tensor_1d(M.wc, GGML_TYPE_F32, HID);      memcpy(M.onw->data,  on_d.data(),  ggml_nbytes(M.onw));
-    M.oww  = ggml_new_tensor_2d(M.wc, GGML_TYPE_F32, HID, VOC); memcpy(M.oww->data,  ow_d.data(),  ggml_nbytes(M.oww));
-    M.lw.resize(M.n_layers);
+    if (!rope_freqs_d.empty()) {   // wg_rope passes this to ggml_rope_ext; emit_rope bakes it into the freqs
+        ggml_tensor * ff = ggml_new_tensor_1d(M.wc, GGML_TYPE_F32, (int64_t) rope_freqs_d.size());
+        memcpy(ff->data, rope_freqs_d.data(), rope_freqs_d.size() * sizeof(float));
+        REAL_ROPE.freq_factors = ff;
+    }
     auto mk1 = [&](std::vector<float> & s) { ggml_tensor * t = ggml_new_tensor_1d(M.wc, GGML_TYPE_F32, (int64_t) s.size()); memcpy(t->data, s.data(), ggml_nbytes(t)); return t; };
-    auto mk2 = [&](std::vector<float> & s, int a, int b) { ggml_tensor * t = ggml_new_tensor_2d(M.wc, GGML_TYPE_F32, a, b); memcpy(t->data, s.data(), ggml_nbytes(t)); return t; };
+    // matmul weight: bf16 (from_float) when requested, else f32
+    auto mk2 = [&](std::vector<float> & s, int a, int b) {
+        if (bf16) {
+            ggml_tensor * t = ggml_new_tensor_2d(M.wc, GGML_TYPE_BF16, a, b);
+            ggml_fp32_to_bf16_row(s.data(), (ggml_bf16_t *) t->data, (int64_t) a * b);
+            return t;
+        }
+        ggml_tensor * t = ggml_new_tensor_2d(M.wc, GGML_TYPE_F32, a, b);
+        memcpy(t->data, s.data(), ggml_nbytes(t));
+        return t;
+    };
+    M.embd = ggml_new_tensor_2d(M.wc, GGML_TYPE_F32, HID, VOC); memcpy(M.embd->data, embd_d.data(), ggml_nbytes(M.embd));  // f32 (get_rows)
+    M.onw  = ggml_new_tensor_1d(M.wc, GGML_TYPE_F32, HID);      memcpy(M.onw->data,  on_d.data(),  ggml_nbytes(M.onw));     // f32 (rms weight)
+    M.oww  = mk2(ow_d, HID, VOC);   // LM head matmul -> bf16 when requested
+    M.lw.resize(M.n_layers);
     for (int il = 0; il < M.n_layers; il++) {
         M.lw[il].attn_norm = mk1(W[il].an); M.lw[il].ffn_norm = mk1(W[il].fn);
         M.lw[il].wq = mk2(W[il].wq, HID, HID);  M.lw[il].wk = mk2(W[il].wk, HID, HKV);

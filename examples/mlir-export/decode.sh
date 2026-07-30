@@ -54,6 +54,7 @@ SDK=""
 VENV=""
 FORCE=0
 TXES=""              # multi-TXE: compile num_txes + runtime txe_count (1..20); empty = leave as configured
+BF16=0               # bf16 matmul weights (exporter emits bf16 x bf16 -> f32 on the TMU)
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -74,6 +75,7 @@ while [ $# -gt 0 ]; do
         --sdk)         SDK="$2"; shift 2 ;;
         --venv)        VENV="$2"; shift 2 ;;
         --txes)        TXES="$2"; shift 2 ;;
+        --bf16)        BF16=1; shift ;;
         --force)       FORCE=1; shift ;;
         -h|--help)     grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1  (use -h)" ;;
@@ -141,10 +143,11 @@ EOF
     export TSAVORITE_MODEL_DEPLOYMENT_YAML="$DIR/tsavorite-model-deployment.yaml"   # runtime: N TXEs
     FORCE=1                                                      # recompile (num_txes changes the blobs)
 fi
+[ "$BF16" = 1 ] && FORCE=1   # bf16 changes the compiled matmuls -> recompile
 
 echo "=== KV-cache decode ==="
 printf '  %-14s %s\n' host "$HOST" model "$MODEL" input "${PROMPT:-$IDS}" L "${L:-auto}" gen "$GEN" \
-       verify "$VERIFY" txes "${TXES:-default}" dir "$DIR" config "$CONFIG"
+       verify "$VERIFY" bf16 "$BF16" txes "${TXES:-default}" dir "$DIR" config "$CONFIG"
 
 # ---------------------------------------------------------------- 1) build decode_run
 if [ -z "$DECODE_RUN" ]; then
@@ -158,13 +161,14 @@ fi
 [ -x "$DECODE_RUN" ] || die "decode_run not found/executable: $DECODE_RUN  (pass --build-dir or --decode-run)"
 
 Largs=(); [ -n "$L" ] && Largs=(--L "$L")
+bf16flag=(); [ "$BF16" = 1 ] && bf16flag=(--bf16)
 
 # ---------------------------------------------------------------- 2) emit + 3) compile (unless --lib)
 if [ -z "$LIB" ]; then
     [ -f "$CONFIG" ] || die "fpga config not found: $CONFIG  (pass -c)"
     echo "--- [2/4] emit decode graph ---"
     # pass --gen so emit and run pick the same default L (L = n_ids + gen + 2) when --L is omitted
-    "$DECODE_RUN" "$MODEL" --emit "$DIR/forward_decode.mlir" "${Largs[@]}" --gen "$GEN" "${INPUT[@]}"
+    "$DECODE_RUN" "$MODEL" --emit "$DIR/forward_decode.mlir" "${Largs[@]}" --gen "$GEN" "${bf16flag[@]}" "${INPUT[@]}"
     grep -q 'func.func @forward' "$DIR/forward_decode.mlir" || die "emit produced no @forward"
     echo "--- [3/4] compile ---"
     if [ "$FORCE" = 1 ] || [ ! -f "$DIR/out_decode/host/host.so" ]; then
@@ -177,5 +181,5 @@ fi
 # ---------------------------------------------------------------- 4) run
 echo "--- [4/4] run (gen=$GEN, verify=$VERIFY) ---"
 vflag=(); [ "$VERIFY" = 1 ] && vflag=(--verify)
-"$DECODE_RUN" "$MODEL" --lib "$LIB" "${Largs[@]}" --gen "$GEN" "${vflag[@]}" "${INPUT[@]}"
+"$DECODE_RUN" "$MODEL" --lib "$LIB" "${Largs[@]}" --gen "$GEN" "${vflag[@]}" "${bf16flag[@]}" "${INPUT[@]}"
 echo "=== done (decode) ==="

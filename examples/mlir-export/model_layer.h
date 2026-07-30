@@ -21,6 +21,7 @@ struct RopeParams {
     float attn_factor = 1.0f;
     float beta_fast   = 0.0f;
     float beta_slow   = 0.0f;
+    struct ggml_tensor * freq_factors = nullptr;   // llama3 rope scaling (per-dim), NULL for plain rope
 };
 static RopeParams REAL_ROPE;
 static float      REAL_KQ_SCALE = -1.0f;   // <0 -> 1/sqrt(head_dim)
@@ -32,7 +33,7 @@ struct LayerW {
 static struct ggml_tensor * wg_rope(struct ggml_context * ctx, struct ggml_tensor * x,
                                      struct ggml_tensor * pos, int head_dim) {
     int nd = REAL_ROPE.n_dims > 0 ? REAL_ROPE.n_dims : head_dim;
-    return ggml_rope_ext(ctx, x, pos, NULL, nd, REAL_ROPE.mode, REAL_ROPE.n_ctx_orig,
+    return ggml_rope_ext(ctx, x, pos, REAL_ROPE.freq_factors, nd, REAL_ROPE.mode, REAL_ROPE.n_ctx_orig,
                          REAL_ROPE.freq_base, REAL_ROPE.freq_scale, REAL_ROPE.ext_factor,
                          REAL_ROPE.attn_factor, REAL_ROPE.beta_fast, REAL_ROPE.beta_slow);
 }

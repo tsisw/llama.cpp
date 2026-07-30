@@ -54,7 +54,7 @@ int main(int argc, char ** argv) {
     const char * path = argc > 1 ? argv[1] : nullptr;
     const char * lib = nullptr, * emit = nullptr, * prompt = nullptr;
     std::vector<int32_t> ids;
-    int L_arg = -1, gen = 0, verify = 0;
+    int L_arg = -1, gen = 0, verify = 0, bf16 = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--lib") && i + 1 < argc)     lib = argv[++i];
         else if (!strcmp(argv[i], "--emit") && i + 1 < argc) emit = argv[++i];
@@ -62,6 +62,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--L") && i + 1 < argc)  L_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify"))             verify = 1;
+        else if (!strcmp(argv[i], "--bf16"))               bf16 = 1;
         else ids.push_back(atoi(argv[i]));
     }
     if (!path || (!lib && !emit) || (ids.empty() && !prompt)) {
@@ -99,7 +100,7 @@ int main(int argc, char ** argv) {
         if (!fwd) { fprintf(stderr, "dlsym tsi_forward_argv failed: %s\n", dlerror()); return 1; }
     }
 
-    DecodeModel M = load_decode_model(path);
+    DecodeModel M = load_decode_model(path, bf16);
     const int L = L_arg > 0 ? L_arg : (N + gen + 2);
     const int VOC = M.n_vocab, KV = M.hidden_kv;
     fprintf(stderr, "dims: layers=%d hidden=%d n_head=%d/%d head_dim=%d vocab=%d L=%d prompt=%d gen=%d\n",
