@@ -104,10 +104,24 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
 
     GraphBuilder h(b, loc);
 
+    // Argument order: [runtime_args..., caches..., slot?]. Caches are memrefs written in place, so
+    // they are arguments only and never appear in the results. `slot` is the cell to append at, and
+    // exists only when there is a cache to append to.
+    const size_t n_args   = opts.runtime_args.size();
+    const size_t n_caches = opts.caches.size();
+    const bool   want_slot = n_caches > 0;
+
     SmallVector<Type> argTys;
     for (const ggml_tensor * t : opts.runtime_args) {
         argTys.push_back(h.tensorType(t));
     }
+    for (const CacheSpec & c : opts.caches) {
+        argTys.push_back(h.cacheType(c));
+    }
+    if (want_slot) {
+        argTys.push_back(b.getIndexType());
+    }
+
     SmallVector<Type> resTys;
     for (const ggml_tensor * t : outputs) {
         resTys.push_back(h.tensorType(t));
@@ -115,10 +129,16 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
 
     auto fn = func::FuncOp::create(b, loc, opts.func_name, b.getFunctionType(argTys, resTys));
     // emit-c-interface appends the result out-params after the inputs, so the ciface arg order is
-    // [runtime_args..., outputs...]. The host shims rely on that.
+    // [runtime_args..., caches..., slot?, outputs...]. The host shims rely on that.
     fn->setAttr("llvm.emit_c_interface", b.getUnitAttr());
-    for (size_t i = 0; i < opts.runtime_args.size(); i++) {
+    for (size_t i = 0; i < n_args; i++) {
         fn.setArgAttr(i, "txe.name", b.getStringAttr("input_" + std::to_string(i)));
+    }
+    for (size_t i = 0; i < n_caches; i++) {
+        fn.setArgAttr(n_args + i, "txe.name", b.getStringAttr(opts.caches[i].name));
+    }
+    if (want_slot) {
+        fn.setArgAttr(n_args + n_caches, "txe.name", b.getStringAttr("slot"));
     }
     for (size_t i = 0; i < outputs.size(); i++) {
         fn.setResultAttr(i, "txe.name", b.getStringAttr("res_" + std::to_string(i)));
@@ -127,11 +147,24 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
     Block * body = fn.addEntryBlock();
     b.setInsertionPointToEnd(body);
 
-    for (size_t i = 0; i < opts.runtime_args.size(); i++) {
+    for (size_t i = 0; i < n_args; i++) {
         h.setValue(opts.runtime_args[i], body->getArgument(i));
     }
     for (const ggml_tensor * leaf : opts.const_leafs) {
         h.setValue(leaf, h.bakedConstant(leaf));
+    }
+
+    // Each cache leaf resolves to a read of that layer's window, so the graph body needs no
+    // knowledge of where the cache lives.
+    Value slot = want_slot ? body->getArgument(n_args + n_caches) : Value();
+    for (size_t ci = 0; ci < n_caches; ci++) {
+        const CacheSpec & c     = opts.caches[ci];
+        Value             cache = body->getArgument(n_args + ci);
+        for (int64_t il = 0; il < (int64_t) c.read.size(); il++) {
+            if (c.read[il]) {
+                h.setValue(c.read[il], h.cacheRead(cache, c, il));
+            }
+        }
     }
 
     Importer imp(b, loc, h);
@@ -139,6 +172,17 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * n = ggml_graph_node(gf, i);
         h.setValue(n, imp.node(n));
+    }
+
+    // Appends run after the body, once the values to store exist.
+    for (size_t ci = 0; ci < n_caches; ci++) {
+        const CacheSpec & c     = opts.caches[ci];
+        Value             cache = body->getArgument(n_args + ci);
+        for (int64_t il = 0; il < (int64_t) c.append.size(); il++) {
+            if (c.append[il]) {
+                h.cacheAppend(cache, c, il, slot, h.valueOf(c.append[il]));
+            }
+        }
     }
 
     SmallVector<Value> rets;

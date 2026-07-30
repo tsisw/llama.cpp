@@ -10,9 +10,11 @@
 #include "Importer.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -38,8 +40,10 @@ std::string exportGraph(ggml_cgraph * gf, const ExportOptions & opts) {
     }
 
     MLIRContext ctx;
+    // memref/bufferization are for the KV cache only; see CacheSpec in Exporter.h.
     ctx.loadDialect<ggml::GgmlDialect, func::FuncDialect, arith::ArithDialect, tensor::TensorDialect,
-                    linalg::LinalgDialect, math::MathDialect>();
+                    linalg::LinalgDialect, math::MathDialect, memref::MemRefDialect,
+                    bufferization::BufferizationDialect>();
 
     // Empty `outputs` means the graph's single output, which is its last node. ggml graphs are
     // already topologically sorted, so the last node is the sink.

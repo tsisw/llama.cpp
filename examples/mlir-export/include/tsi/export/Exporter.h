@@ -24,6 +24,27 @@ struct mlir_export_error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A KV cache held in device DRAM as a memref argument and written in place.
+//
+// This cannot be expressed in the ggml graph: ggml has no memref type, and the exporter has no
+// lowering for a strided view, so a per-layer slice of one big buffer is not representable. The cache
+// is therefore described here and emitted around the graph rather than built into it.
+//
+// Emitted as one `memref<n_layers x d0 x d1 x cells, elem, 1>` argument (memory space 1 is DRAM).
+// Wherever `read[il]` appears in the graph the exporter substitutes layer il's slice, and after the
+// body it appends `append[il]` at cell `slot`. The append width comes from the appended tensor, so
+// prefill writing N cells and decode writing 1 use the same path.
+struct CacheSpec {
+    std::string name;                            // becomes txe.name, e.g. "cache_k"
+    int64_t     n_layers = 0;
+    int64_t     cells    = 0;                    // capacity L
+
+    // Per layer, both sized n_layers. `read` entries are graph leafs standing for that layer's
+    // slice; a null `append` entry skips the write for that layer.
+    std::vector<const ggml_tensor *> read;
+    std::vector<const ggml_tensor *> append;
+};
+
 struct ExportOptions {
     // Function name. The TSI compiler and the host shim both expect "forward".
     std::string func_name = "forward";
@@ -39,6 +60,10 @@ struct ExportOptions {
     // its last node. There is deliberately no separate multi-output entry point: one output is
     // just the N=1 case, and keeping two functions in sync had already let them drift apart.
     std::vector<const ggml_tensor *> outputs;
+
+    // KV caches, appended to the argument list after runtime_args, followed by a scalar `index`
+    // named "slot" when any cache is present. Caches are never results; they are written in place.
+    std::vector<CacheSpec> caches;
 };
 
 // Builds the graph as an MLIR module, verifies it, and returns the printed IR.

@@ -98,9 +98,11 @@ if (MLIR_FOUND)
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/convert"
                 "${CMAKE_CURRENT_BINARY_DIR}"          # generated .inc files land here
                 ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    # memref + bufferization are for the KV cache path only (CacheSpec in Exporter.h).
     target_link_libraries(tsi-mlir-export PRIVATE
         ggml MLIRIR MLIRParser MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
         MLIRArithDialect MLIRMathDialect MLIRSupport
+        MLIRMemRefDialect MLIRBufferizationDialect
         MLIRPass MLIRTransforms MLIRTransformUtils)
     # C++17 to match the standard their LLVM was built with. Consumers stay at C++20; they only see
     # the MLIR-free public header.
@@ -235,6 +237,13 @@ target_compile_features(test-mlir-export-cases PRIVATE cxx_std_20)
 # The generator needs the exporter library; without MLIR there is no exporter, so it is skipped.
 if (MLIR_FOUND)
     target_link_libraries(test-mlir-export-cases PRIVATE tsi-mlir-export)
+
+    # Emits a graph that reads and appends a DRAM cache, so the exporter's cache path is checked
+    # independently of any model.
+    add_executable(test-cache-export tests/dram-cache/test-cache-export.cpp)
+    target_include_directories(test-cache-export PRIVATE "${TSI_MLIR_EXPORT_INCLUDE}")
+    target_link_libraries(test-cache-export PRIVATE tsi-mlir-export ggml)
+    target_compile_features(test-cache-export PRIVATE cxx_std_20)
 endif()
 
 # ctest wiring. BUILD_TESTING is set by include(CTest), which the top-level CMakeLists.txt runs at
@@ -272,6 +281,25 @@ if (BUILD_TESTING)
             set_tests_properties(dram-cache-persist PROPERTIES
                 LABELS "mlir-export" TIMEOUT 300 FIXTURES_REQUIRED DramCache
                 ENVIRONMENT "USER_DRAM_SIZE=16348;DYLD_LIBRARY_PATH=${TSI_RT_LIB_DIR};LD_LIBRARY_PATH=${TSI_RT_LIB_DIR}")
+        endif()
+
+        # The exporter's cache path: emit a graph that reads and appends a DRAM cache, then compile it.
+        # Emitting alone would not catch an invalid memref or a bad subview type, so both stages run.
+        if (TARGET test-cache-export)
+            set(CACHE_EXPORT_MLIR "${CMAKE_CURRENT_BINARY_DIR}/cache-export/forward.mlir")
+            add_test(NAME cache-export-emit
+                     COMMAND "$<TARGET_FILE:test-cache-export>" "${CACHE_EXPORT_MLIR}")
+            set_tests_properties(cache-export-emit PROPERTIES
+                LABELS "mlir-export" TIMEOUT 300 FIXTURES_SETUP CacheExport)
+
+            add_test(NAME cache-export-compile
+                     COMMAND "${TSI_VENV_PYTHON}"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/compile_graph_fpga.py"
+                             "${CACHE_EXPORT_MLIR}"
+                             "${CMAKE_CURRENT_BINARY_DIR}/cache-export/out")
+            set_tests_properties(cache-export-compile PROPERTIES
+                LABELS "mlir-export" TIMEOUT 900 FIXTURES_REQUIRED CacheExport
+                ENVIRONMENT "USER_DRAM_SIZE=16348;TSI_RT_LIB_DIR=${TSI_RT_LIB_DIR}")
         endif()
     else()
         # Never a hard error: a plain host build must not start requiring the compiler repo.
