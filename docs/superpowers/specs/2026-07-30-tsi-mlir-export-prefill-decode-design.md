@@ -146,11 +146,44 @@ f16/bf16 turned out smaller than planned, not larger. Promoting the whole graph 
 and lowering meant no lowering pattern changed at all, and f32 accumulation came for free rather than
 needing five separate accumulator widenings. The estimate that this was the largest piece was wrong.
 
-What remains is `build_decode_from_live`: reconstruct the decode graph from llama's live one the way
-`build_cachefree_from_live` does for prefill, which needs the `Model` struct in `DecodeModel.h` to be
-constructible from a live graph rather than only from a GGUF, plus reading llama's `cache_k_l`/`cache_v_l`
-(f16, `[n_embd_k_gqa, n_ctx]`) and honoring `attn_v_trans = !flash_attn`. The graph itself already exists
-and is CPU-checked by `decode_cpu_check`; what is missing is the bridge from a live llama step to it.
+### Decode: cache reading is done, graph reconstruction is not
+
+`LiveCache.h` reads llama's cache and the driver self-checks it on every real decode graph. Measured on
+SmolLM2-135M, so these are facts rather than plans:
+
+| | |
+|---|---|
+| `cache_k_l0` | f16 `[192, 4096]`; `ne[0]` = head_dim x n_head_kv, cells are `ne[1]` |
+| decode's `VIEW` | f16 `[64, 3, 256]`; `ne[2]` = `n_kv`, the live window |
+| geometry | 30 layers, head_dim 64, n_head_kv 3, capacity 4096, window 256 |
+
+Two questions this design left open are now answered:
+
+- **The layout already matches.** The first L cells reinterpreted as `[head_dim, n_head_kv, L]` are
+  exactly what `build_decode` consumes. No shuffling, no per-cell gather.
+- **V is not transposed.** `attn_v_trans = !flash_attn`, flash attention is on, so `cache_v` has
+  `cache_k`'s shape. The extractor refuses a transposed V (`-fa off`) rather than misreading it.
+
+**The snapshot must be taken before compute.** `after_compute` runs once `SET_ROWS` has written the
+current step's cell, so a decode graph built from that state reads its own answer. Positions are a graph
+input and are available before compute, so the driver reads them there and snapshots the cache there.
+Verified: `last written cell 1, pos 2 -> layout CONFIRMED`, i.e. cells `0..pos-1`.
+
+Remaining, in order:
+
+1. **Factor out the live-model probe.** Dimension, RoPE, eps and kq_scale discovery currently lives
+   inside `build_cachefree_from_live`. Decode needs the same values, and two copies that can disagree
+   between prefill and decode is exactly the drift to avoid, so extract it before duplicating it.
+2. **`build_decode_from_live`.** Assemble a `DecodeModel` from the live graph plus `g_wcap` instead of
+   from a GGUF (`bind_w` already does the weight materialization), build id/pos/mask, pass the extracted
+   cK/cV, and export. Verify against llama's logits the way prefill is.
+3. **Then the DRAM memref cache.** This collapses decode's ~62 host-cache arguments to the 7 above, and
+   it also requires **prefill to fill the cache** rather than discard its K/V - which is why `build_layer`
+   was taught to expose per-layer K/V early, and why that exposure is still inert.
+
+Note that steps 1 and 2 produce a working compiled decode with the cache passed as host tensors. That is
+not the design's signature, but it is the shortest path to a verified decode, and step 3 is a
+signature change on a path that already computes the right answer.
 
 ## llama-server compatibility
 
