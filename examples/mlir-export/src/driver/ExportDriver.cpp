@@ -176,7 +176,7 @@ std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & 
     fwd(args.argv());
 
     std::vector<float> compiled((size_t) n_out);
-    memcpy(compiled.data(), args.buffer(r.runtime_args.size()), (size_t) n_out * sizeof(float));
+    memcpy(compiled.data(), args.output(0), (size_t) n_out * sizeof(float));
 
     // llama emits only the last token's logits, so that is what the diffs compare.
     const float * clast = compiled.data() + (size_t) (ntok - 1) * nvoc;
@@ -267,6 +267,67 @@ void reportDecodeCache(ggml_cgraph * live) {
 std::vector<float> g_decode_logits;
 int64_t            g_decode_nvoc = 0;
 
+// ---------------------------------------------------------------------------------------------
+// the KV cache in DRAM
+// ---------------------------------------------------------------------------------------------
+
+// Allocated once and reused by every decode step, never freed: surviving between calls is the entire
+// point, and a per-call DeviceArgs must not own them (see DeviceArgs::addCache).
+void * g_cache_k     = nullptr;
+void * g_cache_v     = nullptr;
+size_t g_cache_bytes = 0;
+
+// Allocate the device caches if needed, then fill them from llama's live window.
+//
+// Seeding on every step is deliberate and temporary: it makes the compiled decode correct while the
+// compiled prefill still does not write the cache. Once prefill fills it, this copy goes away and the
+// buffers carry the state forward on their own - which is also the only thing that would prove the
+// round trip through DRAM actually works, since right now a broken append would be masked by the
+// fresh copy arriving next step.
+bool seedCaches(const decode_case & r) {
+    if (g_cache_bytes != r.cache_bytes) {
+        // A different window needs a different buffer. That also invalidates the compiled binary, so
+        // there is nothing worth preserving across the change.
+        if (g_cache_k) {
+            tsi_dealloc(g_cache_k);
+        }
+        if (g_cache_v) {
+            tsi_dealloc(g_cache_v);
+        }
+        g_cache_k     = tsi_alloc((int64_t) r.cache_bytes);
+        g_cache_v     = tsi_alloc((int64_t) r.cache_bytes);
+        g_cache_bytes = r.cache_bytes;
+        if (!g_cache_k || !g_cache_v) {
+            fprintf(stderr, "[tsi-mlir] tsi_alloc failed for a %zu-byte KV cache. "
+                            "Raise USER_DRAM_SIZE (MiB).\n", r.cache_bytes);
+            if (g_cache_k) {
+                tsi_dealloc(g_cache_k);
+            }
+            if (g_cache_v) {
+                tsi_dealloc(g_cache_v);
+            }
+            g_cache_k = g_cache_v = nullptr;
+            g_cache_bytes         = 0;
+            return false;
+        }
+    }
+
+    const size_t lbytes = r.layer_floats * sizeof(float);
+    for (size_t il = 0; il < r.k_slices.size(); il++) {
+        // A shape disagreement here would copy a wrong-sized window into the right-sized buffer and
+        // corrupt every layer after it, with plausible-looking logits as the only symptom.
+        if ((size_t) ggml_nelements(r.k_slices[il]) != r.layer_floats ||
+            (size_t) ggml_nelements(r.v_slices[il]) != r.layer_floats) {
+            fprintf(stderr, "[tsi-mlir] layer %zu cache slice is %lld elements, expected %zu\n", il,
+                    (long long) ggml_nelements(r.k_slices[il]), r.layer_floats);
+            return false;
+        }
+        memcpy((char *) g_cache_k + il * lbytes, r.k_slices[il]->data, lbytes);
+        memcpy((char *) g_cache_v + il * lbytes, r.v_slices[il]->data, lbytes);
+    }
+    return true;
+}
+
 // Rebuild, compile and run one decode step. Returns its logits, or empty on any failure, in which
 // case llama's own result stands.
 std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
@@ -303,11 +364,21 @@ std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & n
 
     runtimeUp();
 
+    if (!seedCaches(r)) {
+        cleanup();
+        return {};
+    }
+
+    // argv order is the ciface order the exporter documents:
+    // [runtime_args..., cache_k, cache_v, slot, outputs...].
     DeviceArgs args;
     bool       ok = true;
     for (const ggml_tensor * t : r.runtime_args) {
         ok = ok && args.addInput(t);
     }
+    ok = ok && args.addCache(g_cache_k, r.cache_shape);
+    ok = ok && args.addCache(g_cache_v, r.cache_shape);
+    args.addScalar(r.pos);   // the cell this step appends at
     for (const ggml_tensor * t : r.outputs) {
         ok = ok && args.addOutput(t);
     }
@@ -316,12 +387,13 @@ std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & n
         return {};
     }
 
-    fprintf(stderr, "[tsi-mlir] running compiled decode: %zu args, %zu outputs, logits [%lld]\n",
-            r.runtime_args.size(), r.outputs.size(), (long long) nvoc);
+    fprintf(stderr, "[tsi-mlir] running compiled decode: %zu args + 2 caches + slot %d, "
+                    "%zu outputs, logits [%lld]\n",
+            r.runtime_args.size(), r.pos, r.outputs.size(), (long long) nvoc);
     fwd(args.argv());
 
     std::vector<float> compiled((size_t) nvoc);
-    memcpy(compiled.data(), args.buffer(r.runtime_args.size()), (size_t) nvoc * sizeof(float));
+    memcpy(compiled.data(), args.output(0), (size_t) nvoc * sizeof(float));
 
     if (cfg.cpu_ref) {
         compare("decode recon-CPU vs compiled:", reconcpu.data(), compiled.data(), nvoc);

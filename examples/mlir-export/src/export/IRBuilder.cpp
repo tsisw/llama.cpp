@@ -176,15 +176,18 @@ MemRefType GraphBuilder::cacheType(const CacheSpec & spec) const {
     }
     const ggml_tensor * slice = spec.read[0];
 
-    // [n_layers, ...slice dims...]; the slice's last dim is already the cell count.
+    // [n_layers, cells, ...rest...]. Cells is the FIRST slice dim, not the last, because that is
+    // llama's own layout: cell c of a layer starts at c * head_dim * n_head_kv, so one cell's values
+    // are contiguous and cells are strided. A cells-last memref would be the transpose of llama's
+    // cache, so it could never alias it and every read would need a shuffle.
     SmallVector<int64_t> shape;
     shape.push_back(spec.n_layers);
     for (int64_t d : dims(slice)) {
         shape.push_back(d);
     }
-    if (shape.back() != spec.cells) {
-        unsupported("cache '%s': slice last dim %lld != cells %lld", spec.name.c_str(),
-                    (long long) shape.back(), (long long) spec.cells);
+    if (shape.size() < 2 || shape[1] != spec.cells) {
+        unsupported("cache '%s': slice's first dim %lld != cells %lld", spec.name.c_str(),
+                    (long long) (shape.size() > 1 ? shape[1] : 0), (long long) spec.cells);
     }
     // Memory space 1 is DRAM and is not optional: any other space is rejected downstream.
     return MemRefType::get(shape, elementType(slice), MemRefLayoutAttrInterface{},
@@ -192,28 +195,40 @@ MemRefType GraphBuilder::cacheType(const CacheSpec & spec) const {
 }
 
 Value GraphBuilder::cacheSlice(Value cache, const CacheSpec & spec, int64_t il, Value slot,
-                               int64_t width) {
+                               int64_t width, int64_t resultRank) {
     (void) spec;
     auto      ct   = cast<MemRefType>(cache.getType());
     const int rank = (int) ct.getRank();
 
-    // Take one layer and `width` cells: offset [il, 0.., slot], size [1, full.., width].
+    // Take one layer and `width` cells: offset [il, slot, 0..], size [1, width, full..].
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t>      resultShape;
     offsets.push_back(b_.getIndexAttr(il));
     sizes.push_back(b_.getIndexAttr(1));
     strides.push_back(b_.getIndexAttr(1));
     for (int d = 1; d < rank; d++) {
-        const bool last = (d == rank - 1);
-        if (last && slot) {
+        const bool cell = (d == 1);   // cells sit immediately after the layer dim
+        if (cell && slot) {
             offsets.push_back(slot);
         } else {
             offsets.push_back(b_.getIndexAttr(0));
         }
-        const int64_t n = last ? width : ct.getDimSize(d);
+        const int64_t n = cell ? width : ct.getDimSize(d);
         sizes.push_back(b_.getIndexAttr(n));
         strides.push_back(b_.getIndexAttr(1));
         resultShape.push_back(n);   // drops the leading layer dim
+    }
+
+    // ggml_n_dims ignores trailing 1s, so a tensor of ne [head_dim, n_head_kv, 1] - exactly what a
+    // decode step appends - is rank 2 in MLIR, not 3. Its destination has to lose the unit cell dim
+    // too, or materialize_in_destination fails verification with a rank mismatch. Only unit dims are
+    // ever dropped, so this cannot silently discard real cells.
+    while (resultRank > 0 && (int64_t) resultShape.size() > resultRank && resultShape.front() == 1) {
+        resultShape.erase(resultShape.begin());
+    }
+    if (resultRank > 0 && (int64_t) resultShape.size() != resultRank) {
+        unsupported("cache '%s': cannot reduce a %zu-dim slice to the appended value's rank %lld",
+                    spec.name.c_str(), resultShape.size(), (long long) resultRank);
     }
 
     auto resTy = memref::SubViewOp::inferRankReducedResultType(resultShape, ct, offsets, sizes,
@@ -242,7 +257,24 @@ void GraphBuilder::cacheAppend(Value cache, const CacheSpec & spec, int64_t il, 
         src = ps::castElements(b_, loc_, src, ct.getElementType());
         st  = cast<RankedTensorType>(src.getType());
     }
-    Value sub = cacheSlice(cache, spec, il, slot, st.getShape().back());
+    // How many cells this append covers. Normally the source's first MLIR dim, matching the
+    // cells-first layout. But ggml_n_dims drops trailing 1s, so a 1-cell append arrives already
+    // rank-reduced with its cell dim gone and its first dim meaning something else entirely - reading
+    // the width off it there would append n_head_kv cells' worth at the wrong stride.
+    const int64_t sliceRank = ct.getRank() - 1;   // the cache minus its layer dim
+    int64_t       width;
+    if (st.getRank() == sliceRank) {
+        width = st.getShape().front();
+    } else if (st.getRank() == sliceRank - 1) {
+        width = 1;
+    } else {
+        unsupported("cache '%s': appended value has rank %lld, expected %lld or %lld",
+                    spec.name.c_str(), (long long) st.getRank(), (long long) sliceRank,
+                    (long long) (sliceRank - 1));
+        return;
+    }
+
+    Value sub = cacheSlice(cache, spec, il, slot, width, st.getRank());
     auto  op  = bufferization::MaterializeInDestinationOp::create(b_, loc_, TypeRange{}, src, sub);
     op.setWritable(true);   // the destination is a memref we own
 }

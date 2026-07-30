@@ -30,10 +30,16 @@ struct mlir_export_error : std::runtime_error {
 // lowering for a strided view, so a per-layer slice of one big buffer is not representable. The cache
 // is therefore described here and emitted around the graph rather than built into it.
 //
-// Emitted as one `memref<n_layers x d0 x d1 x cells, elem, 1>` argument (memory space 1 is DRAM).
+// Emitted as one `memref<n_layers x cells x d1 x d0, elem, 1>` argument (memory space 1 is DRAM).
 // Wherever `read[il]` appears in the graph the exporter substitutes layer il's slice, and after the
 // body it appends `append[il]` at cell `slot`. The append width comes from the appended tensor, so
 // prefill writing N cells and decode writing 1 use the same path.
+//
+// Cells are the SECOND dim, right after the layer, because MLIR shape is ggml's ne reversed and the
+// cell count is the slice's OUTERMOST ggml dim: a [head_dim, n_head_kv, cells] slice becomes
+// memref<n_layers x cells x n_head_kv x head_dim>. That is byte-for-byte llama's own layout, where
+// cell c starts at c * head_dim * n_head_kv. Building the slice the other way round is the one easy
+// mistake here, and it is rejected rather than silently transposed.
 struct CacheSpec {
     std::string name;                            // becomes txe.name, e.g. "cache_k"
     int64_t     n_layers = 0;

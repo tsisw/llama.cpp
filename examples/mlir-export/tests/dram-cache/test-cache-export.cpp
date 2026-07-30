@@ -4,8 +4,10 @@
 // Shapes are tiny but the structure is the real one: one memref argument for the cache, a scalar
 // slot, a read of the whole window feeding the body, and an append after it.
 //
-// MLIR shape is ggml's ne reversed, so a [head_dim, n_head_kv, cells] slice is built as
-// ggml_new_tensor_3d(ctx, F32, cells, n_head_kv, head_dim).
+// MLIR shape is ggml's ne reversed, and the cache wants cells as its outermost slice dim, so a slice
+// is built with cells LAST in ggml terms: ggml_new_tensor_3d(ctx, F32, head_dim, n_head_kv, cells)
+// becomes memref<... x cells x n_head_kv x head_dim>. Same for the appended value, whose cell count
+// is 1 for a decode step.
 //
 // Usage: test-cache-export <out.mlir>
 #include "tsi/export/Exporter.h"
@@ -28,11 +30,11 @@ int main(int argc, char ** argv) {
 
     // Stands for one layer's cache window. Never a real argument: the exporter replaces it with a
     // read of the memref.
-    ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, CELLS, N_HEAD_KV, HEAD_DIM);
+    ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HEAD_DIM, N_HEAD_KV, CELLS);
     ggml_set_name(slice, "cache_slice");
 
     // The token's K/V, and the value actually appended (a node, so valueOf resolves a computed value).
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, N_NEW, N_HEAD_KV, HEAD_DIM);
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HEAD_DIM, N_HEAD_KV, N_NEW);
     ggml_set_name(x, "k_new");
     ggml_tensor * appended = ggml_scale(ctx, x, 3.0f);
 

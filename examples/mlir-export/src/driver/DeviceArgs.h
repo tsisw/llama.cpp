@@ -43,6 +43,34 @@ inline void * makeDesc(const ggml_tensor * t, void * p) {
     }
 }
 
+// Same, but for a shape given directly in MLIR order. The KV cache has no ggml_tensor to describe
+// it: it is a memref the exporter synthesizes, one rank higher than any tensor in the graph.
+template <int N>
+void * makeDescShapeN(const int64_t * shape, void * p) {
+    auto * d  = (MemRefDescriptor<N> *) malloc(sizeof(MemRefDescriptor<N>));
+    d->base   = p;
+    d->data   = p;
+    d->offset = 0;
+    for (int i = 0; i < N; i++) {
+        d->shape[i] = shape[i];
+    }
+    d->strides[N - 1] = 1;
+    for (int i = N - 2; i >= 0; i--) {
+        d->strides[i] = d->strides[i + 1] * d->shape[i + 1];
+    }
+    return d;
+}
+
+inline void * makeDescShape(const std::vector<int64_t> & shape, void * p) {
+    switch (shape.size()) {
+        case 1:  return makeDescShapeN<1>(shape.data(), p);
+        case 2:  return makeDescShapeN<2>(shape.data(), p);
+        case 3:  return makeDescShapeN<3>(shape.data(), p);
+        case 4:  return makeDescShapeN<4>(shape.data(), p);
+        default: return makeDescShapeN<5>(shape.data(), p);
+    }
+}
+
 // argv for one forward call, in the ciface order the exporter documents:
 // [runtime_args..., caches..., slot?, outputs...].
 class DeviceArgs {
@@ -52,7 +80,7 @@ class DeviceArgs {
             tsi_dealloc(d);
         }
         for (void * d : descs_) {
-            operator delete(d);
+            free(d);   // malloc'd by makeDesc*, so free, not operator delete
         }
     }
 
@@ -65,12 +93,44 @@ class DeviceArgs {
     bool addInput(const ggml_tensor * t) { return add(t, /*copy=*/true); }
 
     // Space for a result, uninitialized.
-    bool addOutput(const ggml_tensor * t) { return add(t, /*copy=*/false); }
+    bool addOutput(const ggml_tensor * t) {
+        if (!add(t, /*copy=*/false)) {
+            return false;
+        }
+        outs_.push_back(bufs_.size() - 1);
+        return true;
+    }
+
+    // A KV cache: a descriptor over a buffer this object does NOT own.
+    //
+    // The buffer outlives the call by design - that is the whole point of a cache in DRAM - so it is
+    // allocated once by the caller and passed in every step. Registering it in bufs_ would free it
+    // in the destructor and the next step would read freed device memory.
+    //
+    // `shape` is in MLIR order, [n_layers, cells, ...rest...], matching CacheSpec's memref.
+    bool addCache(void * dev, const std::vector<int64_t> & shape) {
+        if (!dev || shape.empty()) {
+            return false;
+        }
+        void * desc = makeDescShape(shape, dev);
+        descs_.push_back(desc);
+        argv_.push_back(desc);
+        return true;
+    }
+
+    // An index-typed scalar, e.g. the cache slot.
+    //
+    // Passed BY VALUE in the argv slot, not by pointer. The generated shim declares every parameter
+    // as void* and forwards a[i] straight into _mlir_ciface_forward(..., i64, ...), so an i64
+    // argument reads the slot itself. Passing a pointer here makes the address the slot number,
+    // which writes the new cell at a garbage offset instead of failing.
+    void addScalar(int64_t v) { argv_.push_back((void *) (intptr_t) v); }
 
     void ** argv() { return argv_.data(); }
 
-    // Device pointer of the i'th added entry, for reading a result back.
-    void * buffer(size_t i) const { return bufs_[i]; }
+    // Device pointer of the k'th addOutput, for reading a result back. Indexed by output order
+    // rather than argv position, because caches and scalars sit between the inputs and the outputs.
+    void * output(size_t k) const { return bufs_[outs_[k]]; }
 
   private:
     bool add(const ggml_tensor * t, bool copy) {
@@ -94,6 +154,7 @@ class DeviceArgs {
     std::vector<void *> bufs_;
     std::vector<void *> descs_;
     std::vector<void *> argv_;
+    std::vector<size_t> outs_;   // indices into bufs_, in addOutput order
 };
 
 }  // namespace tsi::driver

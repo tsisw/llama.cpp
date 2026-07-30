@@ -8,10 +8,16 @@
 // lower, via build_decode in DecodeModel.h - the same builder decode_cpu_check validates on CPU, so
 // the checked graph and the exported one cannot drift apart.
 //
-// The cache comes in as plain tensor arguments here, one pair per layer. That is not the design's
-// end state (a DRAM memref written in place, which would make this 7 arguments instead of ~62), but it
-// is the shortest path to a decode that computes the right answer, and the memref change is then a
-// signature change on a working path rather than two unknowns at once.
+// The cache is a pair of DRAM memrefs written in place (see CacheSpec in Exporter.h), so the
+// signature is {id, pos, mask} + cache_k + cache_v + slot -> logits: 6 arguments and one result,
+// independent of layer count. It went through an intermediate form first, with one tensor argument
+// per layer per kind (63 arguments, 61 results on SmolLM2), which is why the numbers in the git
+// history jump: that form proved the decode math produced the right logits, and this one is a
+// signature change on top of an already-correct path rather than two unknowns at once.
+//
+// The host still seeds the DRAM buffers from llama's live cache on every step. Letting the compiled
+// prefill fill them instead is the next step, and it is the one that proves the cache round-trips
+// through DRAM rather than being re-supplied each time.
 #include "tsi/graph/DecodeModel.h"      // DecodeModel, build_decode
 #include "tsi/graph/LiveCache.h"        // live_cache_probe / live_cache_extract
 #include "tsi/graph/LiveGraphBuilder.h" // wg_core_name, wg_index_live, case_result, g_wcap
@@ -29,14 +35,23 @@ struct decode_case {
     // leave the graph with dangling weights, which only bites whoever computes it on CPU later.
     struct ggml_context * wc  = nullptr;
 
-    // [id, pos, mask, cacheK per layer..., cacheV per layer...]
+    // [id, pos, mask]. The caches and the slot follow in the ciface argument order, but they are not
+    // ggml tensors, so they are described below instead.
     std::vector<const ggml_tensor *> runtime_args;
-    // [logits, k_new/v_new per layer...]. The K/V outputs are how the host advances the cache while
-    // it still lives on the host side.
+    // [logits]. K/V are no longer results: the graph appends them into the cache memrefs in place.
     std::vector<const ggml_tensor *> outputs;
 
+    // The two DRAM caches, in argument order after runtime_args: cache_k then cache_v, then `slot`.
+    //
+    // `k_slices`/`v_slices` are the host-side f32 windows read out of llama, one per layer, which the
+    // driver copies into the device buffers. They live in `ctx`, so they are valid until it is freed.
+    std::vector<const ggml_tensor *> k_slices, v_slices;
+    std::vector<int64_t>             cache_shape;    // MLIR order: [n_layers, cells, n_head_kv, head_dim]
+    size_t                           cache_bytes = 0;   // one cache, all layers
+    size_t                           layer_floats = 0;  // floats per layer, for seeding
+
     std::string func_text;
-    int         pos   = 0;   // position of the token being decoded
+    int         pos   = 0;   // position of the token being decoded; also the cache slot to append at
     int         cells = 0;   // cache window this graph was built for
 };
 
@@ -263,30 +278,49 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live) {
         ggml_build_forward_expand(r.gf, vnew[il]);
     }
 
+    // Only the per-step inputs are arguments. The cache leafs become reads of the memref, and
+    // knew/vnew become appends into it, so neither appears in the signature.
     r.runtime_args = { id, pt, mask };
-    for (int il = 0; il < M.n_layers; il++) {
-        r.runtime_args.push_back(cK[il]);
-    }
-    for (int il = 0; il < M.n_layers; il++) {
-        r.runtime_args.push_back(cV[il]);
-    }
+    r.outputs      = { logits };
 
-    r.outputs.push_back(logits);
-    for (int il = 0; il < M.n_layers; il++) {
-        r.outputs.push_back(knew[il]);
-        r.outputs.push_back(vnew[il]);
-    }
+    r.k_slices.assign(cK.begin(), cK.end());
+    r.v_slices.assign(cV.begin(), cV.end());
+    // MLIR order, [n_layers, cells, n_head_kv, head_dim]: ggml's ne reversed, with the layer dim
+    // prepended. Must match GraphBuilder::cacheType or the descriptor strides address the wrong cell.
+    r.cache_shape   = { M.n_layers, L, M.n_head_kv, M.head_dim };
+    r.layer_floats  = (size_t) L * M.n_head_kv * M.head_dim;
+    r.cache_bytes   = (size_t) M.n_layers * r.layer_floats * sizeof(float);
 
     tsi::mlir_export::ExportOptions opts;
     opts.runtime_args = r.runtime_args;
     opts.outputs      = r.outputs;
+
+    // One CacheSpec per kind. `read` is the leaf the graph consumes, `append` the value computed for
+    // this step; the exporter substitutes a read of layer il for the former and stores the latter at
+    // `slot`. f32 throughout: the graph computes in f32 and the host seeds these buffers from its own
+    // f32 conversion, so there is nothing to narrow yet. Making the cache f16 to match llama bit for
+    // bit is a size/fidelity change that belongs with the prefill handoff, not here.
+    tsi::mlir_export::CacheSpec ks, vs;
+    ks.name     = "cache_k";
+    ks.n_layers = M.n_layers;
+    ks.cells    = L;
+    ks.read.assign(cK.begin(), cK.end());
+    ks.append.assign(knew.begin(), knew.end());
+    vs.name     = "cache_v";
+    vs.n_layers = M.n_layers;
+    vs.cells    = L;
+    vs.read.assign(cV.begin(), cV.end());
+    vs.append.assign(vnew.begin(), vnew.end());
+    opts.caches = { ks, vs };
+
     // Bytecode: the weights are baked in as constants, and text would hex-print them at twice the size.
     opts.format = tsi::mlir_export::Format::Bytecode;
     r.func_text = tsi::mlir_export::exportGraph(r.gf, opts);
 
-    fprintf(stderr, "[tsi-mlir] decode rebuilt: pos %d, %d cells, %zu args, %zu outputs, "
-                    "%.2f MiB bytecode\n",
+    fprintf(stderr, "[tsi-mlir] decode rebuilt: pos %d, %d cells, %zu args + 2 caches + slot, "
+                    "%zu outputs, %.2f MiB cache each, %.2f MiB bytecode\n",
             pos, L, r.runtime_args.size(), r.outputs.size(),
+            (double) r.cache_bytes / (1024.0 * 1024.0),
             (double) r.func_text.size() / (1024.0 * 1024.0));
 
     r.wc = M.wc;   // freed by the caller, together with r.ctx

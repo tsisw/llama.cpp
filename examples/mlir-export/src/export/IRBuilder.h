@@ -60,9 +60,10 @@ class GraphBuilder {
     mlir::Value bakedConstant(const ggml_tensor * t);
 
     // --- KV cache in DRAM -------------------------------------------------------------------------
-    // The cache is one memref per CacheSpec, shaped [n_layers, ...slice dims..., cells] with the
-    // slice's element type and memory space 1. Space 1 is mandatory: the compiler rejects any other
-    // with "all memrefs should already be in DRAM memory space".
+    // The cache is one memref per CacheSpec, shaped [n_layers, cells, ...rest...] with the slice's
+    // element type and memory space 1. Cells come first so the layout matches llama's own cache;
+    // see cacheType. Space 1 is mandatory: the compiler rejects any other with "all memrefs should
+    // already be in DRAM memory space".
     mlir::MemRefType cacheType(const CacheSpec & spec) const;
 
     // Layer il's whole window, as a tensor the graph can consume.
@@ -76,8 +77,10 @@ class GraphBuilder {
   private:
     // Shared by cacheRead/cacheAppend: the subview of layer il starting at cell `first`, `width`
     // cells wide. `slot` is null for a static offset.
+    // `resultRank` forces the returned view's rank, dropping unit dims to reach it; 0 means the
+    // natural rank. Needed because a 1-cell append's tensor is rank-reduced by ggml_n_dims.
     mlir::Value cacheSlice(mlir::Value cache, const CacheSpec & spec, int64_t il, mlir::Value slot,
-                           int64_t width);
+                           int64_t width, int64_t resultRank = 0);
 
     mlir::OpBuilder &                          b_;
     mlir::Location                             loc_;
