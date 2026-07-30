@@ -80,20 +80,27 @@ def _fpga_config(config_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mlir", help="whole-graph forward.mlir")
+    ap.add_argument("mlir", help="whole-graph forward.mlir or forward.mlirbc")
     ap.add_argument("out_dir")
     ap.add_argument("--target", choices=["posix", "fpga"], default="posix")
     ap.add_argument("--config", default=None, help="fpga txe_compiler_config.json (fpga target)")
     args = ap.parse_args()
 
-    mlir_text = Path(args.mlir).read_text()
+    # Read bytes, not text. Baked weight constants make the module far too big to carry as hex, so it
+    # is emitted as MLIR bytecode instead, where blobs are raw binary. Module.parse accepts either
+    # form, and text decodes cleanly to str for the pretty-print below.
+    mlir_bytes = Path(args.mlir).read_bytes()
+    is_bytecode = mlir_bytes[:4] == b"ML\xefR"
+    model = mlir_bytes if is_bytecode else mlir_bytes.decode()
     out = Path(args.out_dir)
 
     config = _fpga_config(args.config) if args.target == "fpga" else TXECompilerConfig(log_mlir=True)
 
-    print(f"=== compiling whole graph: target={args.target}  in={args.mlir}  out={out} ===")
+    kind = "bytecode" if is_bytecode else "text"
+    print(f"=== compiling whole graph: target={args.target}  in={args.mlir} ({kind}, "
+          f"{len(mlir_bytes) / 1048576:.1f} MiB)  out={out} ===")
     RawGraphBackend(config).compile(
-        model=mlir_text, input_types=[], compilation_type="aot",
+        model=model, input_types=[], compilation_type="aot",
         output_dir=str(out), verbose=True,
     )
 

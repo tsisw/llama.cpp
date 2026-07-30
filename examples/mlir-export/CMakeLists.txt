@@ -163,6 +163,20 @@ if (MLIR_FOUND)
         target_link_directories(decode_run PRIVATE "${TSI_RT_LIB_DIR}")
         target_compile_features(decode_run PRIVATE cxx_std_20)
         set_target_properties(decode_run PROPERTIES BUILD_RPATH "${TSI_RT_LIB_DIR}")
+
+        # --- test-dram-cache-persist: the KV cache design's foundational assumption ----------------
+        # A DRAM memref must keep its contents between calls. Needs only the runtime shim - no ggml,
+        # no llama, no exporter - because it drives a hand-written fixture, not a captured graph.
+        add_executable(test-dram-cache-persist tests/dram-cache/test-dram-cache-persist.cpp)
+        target_include_directories(test-dram-cache-persist PRIVATE
+            "${TSI_RT_INCLUDE_DIR}"
+            "${MLIR_COMPILER_DIR}/third-party/runtime/include"
+            "${MLIR_COMPILER_DIR}/build/_deps/runtime-build/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-tsavorite")   # "include/TestModel.h"
+        target_link_libraries(test-dram-cache-persist PRIVATE "${TSI_RT_SHIM_LIB}")
+        target_link_directories(test-dram-cache-persist PRIVATE "${TSI_RT_LIB_DIR}")
+        target_compile_features(test-dram-cache-persist PRIVATE cxx_std_20)
+        set_target_properties(test-dram-cache-persist PROPERTIES BUILD_RPATH "${TSI_RT_LIB_DIR}")
     else()
         message(STATUS "mlir-export: TSI runtime shim not found under ${TSI_RT_LIB_DIR}; "
                        "llama-cli whole-graph interception disabled (export library still built)")
@@ -238,6 +252,27 @@ if (BUILD_TESTING)
                          --cases-bin "$<TARGET_FILE:test-mlir-export-cases>"
                          --target ffm)
         set_tests_properties(mlir-export-suite PROPERTIES LABELS "mlir-export" TIMEOUT 1800)
+
+        # DRAM cache persistence: two ctest entries, because the fixture has to be compiled before the
+        # test can dlopen it. A ctest fixture chains them, so running the second alone still compiles.
+        if (TARGET test-dram-cache-persist)
+            set(DRAM_CACHE_OUT "${CMAKE_CURRENT_BINARY_DIR}/dram-cache-out")
+            add_test(NAME dram-cache-compile
+                     COMMAND "${TSI_VENV_PYTHON}"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/compile_graph_fpga.py"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/tests/dram-cache/cache_persist.mlir"
+                             "${DRAM_CACHE_OUT}")
+            set_tests_properties(dram-cache-compile PROPERTIES
+                LABELS "mlir-export" TIMEOUT 900 FIXTURES_SETUP DramCache
+                ENVIRONMENT "USER_DRAM_SIZE=16348;TSI_RT_LIB_DIR=${TSI_RT_LIB_DIR}")
+
+            add_test(NAME dram-cache-persist
+                     COMMAND "$<TARGET_FILE:test-dram-cache-persist>"
+                             "${DRAM_CACHE_OUT}/host/host.so")
+            set_tests_properties(dram-cache-persist PROPERTIES
+                LABELS "mlir-export" TIMEOUT 300 FIXTURES_REQUIRED DramCache
+                ENVIRONMENT "USER_DRAM_SIZE=16348;DYLD_LIBRARY_PATH=${TSI_RT_LIB_DIR};LD_LIBRARY_PATH=${TSI_RT_LIB_DIR}")
+        endif()
     else()
         # Never a hard error: a plain host build must not start requiring the compiler repo.
         message(STATUS "mlir-export: ${TSI_VENV_PYTHON} not found; mlir-export tests will skip "
