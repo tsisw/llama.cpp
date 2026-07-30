@@ -1105,6 +1105,12 @@ static std::string blob_prefix(const char *rel) {
     return tsavorite_llama_root() + rel;
 }
 
+#ifdef GGML_TARGET_POSIX
+#define TSAVORITE_BLOB_BUILD_ROOT "/ggml-tsi-kernel/posix-kernel/build-posix"
+#else
+#define TSAVORITE_BLOB_BUILD_ROOT "/ggml-tsi-kernel/fpga-kernel/build-fpga"
+#endif
+
 static inline void tsi_blob_free_tables() {
     // free pointer tables only (does NOT unload blobs)
     if (loadResult_add) {
@@ -1267,11 +1273,20 @@ static void tsi_load_all_blobs() {
 #endif
 
 
+#ifdef GGML_TARGET_POSIX
+        snprintf(name_add,  sizeof(name_add),  "txe_add");
+        snprintf(name_mult, sizeof(name_mult), "txe_mult");
+        snprintf(name_rms,  sizeof(name_rms),  "txe_rms_norm");
+#if TRITON_MAT_MUL
+        snprintf(name_matmul, sizeof(name_matmul), "txe_blob_0");
+#endif
+#else
         snprintf(name_add,  sizeof(name_add),  "txe_add_dev%u",  i);
         snprintf(name_mult, sizeof(name_mult), "txe_mult_dev%u", i);
         snprintf(name_rms,  sizeof(name_rms),  "txe_rms_norm_dev%u", i);
 #if TRITON_MAT_MUL
         snprintf(name_matmul, sizeof(name_matmul), "txe_triton_mat_mul_dev%u", i);
+#endif
 #endif
         failed_txe = i;
 
@@ -1280,7 +1295,7 @@ static void tsi_load_all_blobs() {
             i,
             name_add,
             blob_prefix(
-                "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_add/blobs/txe_add"
+                TSAVORITE_BLOB_BUILD_ROOT "/txe_add/blobs/txe_add"
             ).c_str()
         );
         if (!loadResult_add[i]) {
@@ -1295,7 +1310,7 @@ static void tsi_load_all_blobs() {
             i,
             name_mult,
             blob_prefix(
-                "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_mult/blobs/txe_mult"
+                TSAVORITE_BLOB_BUILD_ROOT "/txe_mult/blobs/txe_mult"
             ).c_str()
         );
         if (!loadResult_mult[i]) {
@@ -1310,7 +1325,7 @@ static void tsi_load_all_blobs() {
             i,
             name_rms,
             blob_prefix(
-                "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_rms_norm/blobs/txe_rms_norm"
+                TSAVORITE_BLOB_BUILD_ROOT "/txe_rms_norm/blobs/txe_rms_norm"
             ).c_str()
         );
         if (!loadResult_rms_norm[i]) {
@@ -1327,7 +1342,7 @@ static void tsi_load_all_blobs() {
             i,
             name_matmul,
             blob_prefix(
-                "/ggml-tsi-kernel/fpga-kernel/build-fpga/txe_triton_mat_mul/blobs/txe_blob_0"
+                TSAVORITE_BLOB_BUILD_ROOT "/txe_triton_mat_mul/blobs/txe_blob_0"
             ).c_str()
         );
 
