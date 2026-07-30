@@ -72,6 +72,12 @@ struct case_result {
     std::vector<const ggml_tensor *>  leafs;          // every leaf tensor in the graph
     std::vector<const ggml_tensor *>  runtime_args;   // subset of `leafs` that become %argN params
     std::string                       func_text;      // the complete MLIR module
+
+    // This graph's K/V for the current tokens, one per layer, [head_dim, n_head_kv, n_tokens].
+    // Not graph outputs: the cache is a memref the graph writes in place, so these are the values
+    // that get copied into it. Empty if the reconstruction did not ask for them.
+    std::vector<ggml_tensor *>        k_new;
+    std::vector<ggml_tensor *>        v_new;
 };
 
 // Reconstruct the cache-free prefill graph. Throws mlir_export_error if the live graph isn't the
@@ -298,6 +304,10 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
                 md[q * N_TOKENS + k] = (k <= q) ? 0.0f : -INFINITY;   // causal
     }
 
+    // Per-layer K/V for these tokens, kept for the cache write (see case_result).
+    r.k_new.assign(N_LAYERS, nullptr);
+    r.v_new.assign(N_LAYERS, nullptr);
+
     struct ggml_tensor * cur = ggml_get_rows(r.ctx, embd_t, ids);
     for (int il = 0; il < N_LAYERS; il++) {
         const std::string p = "blk." + std::to_string(il) + ".";
@@ -311,7 +321,8 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live) {
         lw.gate      = bind_w(p + "ffn_gate.weight",     need(p + "ffn_gate.weight"));
         lw.up        = bind_w(p + "ffn_up.weight",       need(p + "ffn_up.weight"));
         lw.down      = bind_w(p + "ffn_down.weight",     need(p + "ffn_down.weight"));
-        cur = build_layer(r.ctx, cur, lw, pos, mask, HEAD_DIM, N_HEAD, N_HEAD_KV, N_TOKENS);
+        cur = build_layer(r.ctx, cur, lw, pos, mask, HEAD_DIM, N_HEAD, N_HEAD_KV, N_TOKENS,
+                          &r.k_new[il], &r.v_new[il]);
     }
     struct ggml_tensor * normed_final = ggml_mul(r.ctx, ggml_rms_norm(r.ctx, cur, REAL_RMS_EPS), outnorm_t);
     struct ggml_tensor * logits       = ggml_mul_mat(r.ctx, outw_t, normed_final);   // [N_VOCAB, N_TOKENS]

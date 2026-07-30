@@ -37,9 +37,15 @@ static struct ggml_tensor * wg_rope(struct ggml_context * ctx, struct ggml_tenso
                          REAL_ROPE.attn_factor, REAL_ROPE.beta_fast, REAL_ROPE.beta_slow);
 }
 
+// k_out/v_out optionally receive this layer's K/V for the current tokens, shaped
+// [head_dim, n_head_kv, n_tokens]. Prefill needs them to fill the KV cache: without them the graph
+// computes K/V, uses them for attention, and throws them away, leaving no data path to decode.
+// K is post-RoPE and V is not, matching what llama stores. Pass nullptr to ignore.
 static struct ggml_tensor * build_layer(struct ggml_context * ctx, struct ggml_tensor * x, const LayerW & lw,
                                          struct ggml_tensor * pos, struct ggml_tensor * mask, int head_dim,
-                                         int n_head, int n_head_kv, int n_tokens) {
+                                         int n_head, int n_head_kv, int n_tokens,
+                                         struct ggml_tensor ** k_out = nullptr,
+                                         struct ggml_tensor ** v_out = nullptr) {
     int hidden = head_dim * n_head;
 
     struct ggml_tensor * normed1 = ggml_mul(ctx, ggml_rms_norm(ctx, x, REAL_RMS_EPS), lw.attn_norm);
@@ -54,6 +60,10 @@ static struct ggml_tensor * build_layer(struct ggml_context * ctx, struct ggml_t
 
     struct ggml_tensor * q_rope = wg_rope(ctx, q_heads, pos, head_dim);
     struct ggml_tensor * k_rope = wg_rope(ctx, k_heads, pos, head_dim);
+
+    // the cache entries for these tokens: K after rope, V as-is
+    if (k_out) *k_out = k_rope;
+    if (v_out) *v_out = v_heads;
 
     struct ggml_tensor * q_perm = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
     struct ggml_tensor * k_perm = ggml_permute(ctx, k_rope, 0, 2, 1, 3);
