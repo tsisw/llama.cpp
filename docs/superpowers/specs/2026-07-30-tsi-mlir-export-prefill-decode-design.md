@@ -130,10 +130,27 @@ model, and prefer f16 weights for the first attempt.
 
 Still unverified: the op bodies themselves.
 
-Order: f16/bf16 through the dialect and emitters (largest piece, de-risked by existing compiler-side bf16
-tests), then `build_layer` K/V, then cache append and constants-as-bytecode, then the driver and SmolLM2
-verification. An f32-only path through the middle steps reaches a working result sooner, at the cost of
-reworking the cache element type later.
+## Status
+
+| piece | state |
+|---|---|
+| DRAM cache persistence, bytecode input | done, verified |
+| `build_layer` exposes per-layer K/V | done |
+| cache as a DRAM memref, read + append | done, compiles |
+| weights as `dense_resource`, bytecode | done; whole model compiles in 140 s |
+| f16/bf16 | done, via one `promote-ggml-to-f32` pass |
+| `TSI_MLIR_EXPORT=1` driver | done for **prefill**; decode is classified and reported, not executed |
+| decode execution | **not started** |
+
+f16/bf16 turned out smaller than planned, not larger. Promoting the whole graph to f32 between import
+and lowering meant no lowering pattern changed at all, and f32 accumulation came for free rather than
+needing five separate accumulator widenings. The estimate that this was the largest piece was wrong.
+
+What remains is `build_decode_from_live`: reconstruct the decode graph from llama's live one the way
+`build_cachefree_from_live` does for prefill, which needs the `Model` struct in `DecodeModel.h` to be
+constructible from a live graph rather than only from a GGUF, plus reading llama's `cache_k_l`/`cache_v_l`
+(f16, `[n_embd_k_gqa, n_ctx]`) and honoring `attn_v_trans = !flash_attn`. The graph itself already exists
+and is CPU-checked by `decode_cpu_check`; what is missing is the bridge from a live llama step to it.
 
 ## llama-server compatibility
 
