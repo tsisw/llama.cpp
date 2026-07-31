@@ -61,6 +61,152 @@ The prefill reconstruction is **from-scratch only**, and enforces it: it rebuild
 `0..n-1` and attends over the current tokens with no cache, so it checks the live graph's real
 positions and refuses anything else rather than emitting valid-looking MLIR for a different function.
 
+## Architecture
+
+Two views of one `llama-cli` run with `TSI_MLIR_EXPORT=1`. Shaded bands mark where the work happens:
+**blue-grey** is the MLIR compiler and the TXE, **amber** is the KV cache being filled from the
+compiled graph's results, **grey** is llama.cpp allocating that cache in shared DRAM.
+
+### Roles and phases
+
+llama.cpp owns the KV cache and sampling but runs no forward pass. The MLIR compiler lowers the model's
+graph to a TXE program once; the TXE executes it; the KV cache sits in shared DRAM that both sides
+address directly. On a host build the TXE lifeline is the FFM functional model.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant llama as llama.cpp
+    participant comp as MLIR compiler
+    participant txe as TXE
+    participant dram as DRAM, KV cache
+
+    Note over llama,dram: INITIALIZATION, once per process
+    llama->>llama: load GGUF model
+    rect rgb(232, 236, 238)
+        llama->>dram: allocate KV cache, n_ctx cells per layer
+        Note over dram: one KV cache in shared DRAM.<br/>llama.cpp and the TXE both<br/>address the same bytes
+    end
+
+    Note over llama,txe: PREFILL, the prompt
+    llama->>comp: forward graph for all prompt tokens
+    rect rgb(214, 234, 238)
+        comp->>comp: lower graph to a TXE program, once
+        comp-->>txe: compiled program
+        txe-->>llama: logits, plus K and V for every prompt token
+    end
+    rect rgb(248, 230, 201)
+        llama->>dram: write K and V into cells 0 to n-1
+        Note over dram: prompt K and V are computed by<br/>the TXE, not by llama.cpp
+    end
+    llama->>llama: sample first token
+
+    Note over llama,txe: DECODE, one pass per token
+    loop each decode token
+        llama->>txe: token id, position, and the KV cell it belongs in
+        rect rgb(214, 234, 238)
+            txe->>dram: read the KV cache in place, no copy
+            txe-->>llama: logits, plus K and V for this token
+        end
+        rect rgb(248, 230, 201)
+            llama->>dram: write K and V into the assigned cell
+        end
+        llama->>llama: sample next token
+    end
+    Note over llama,dram: llama.cpp runs no forward pass. It allocates and<br/>maintains the KV cache, and does the sampling
+```
+
+### The same run, with call sites
+
+Seven lifelines against the real code. `before_compute` returning true is what makes llama skip its own
+forward pass, and the cache write lands at the cell `k_idxs` names rather than at `pos`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant cli as llama-cli
+    participant ctx as llama_context
+    participant kv as llama_kv_cache
+    participant dram as TSI DRAM
+    participant drv as ExportDriver
+    participant cc as MLIR compiler
+    participant dev as host.so
+
+    Note over cli,dram: INITIALIZATION. One cache, in device DRAM
+    cli->>ctx: llama_model_load(model.gguf)
+    cli->>ctx: llama_init_from_model()
+    rect rgb(232, 236, 238)
+        ctx->>kv: create cache, n_ctx by n_layer
+        kv->>drv: tsi_mlir_kv_buffer_type()
+        drv->>dev: tsi_initialize(1)
+        drv->>dram: tsi_alloc(90 MiB)
+        dram-->>kv: cache_k_l0..29 and cache_v_l0..29
+        Note over kv,dram: is_host true, so llama CPU ops<br/>could write DRAM in place
+    end
+    Note over dram: f16, cells first<br/>192 by 4096 per layer<br/>cell c at c times 192
+
+    Note over cli,dev: PREFILL. The compiled graph authors the prompt cells
+    cli->>ctx: llama_decode(prompt, pos 0 to n-1)
+    ctx->>kv: find_slot()
+    kv-->>ctx: k_idxs, one cell per token
+    ctx->>ctx: sched_alloc_graph(gf)
+    ctx->>drv: before_compute(gf)
+    drv->>drv: build_cachefree_from_live()
+    Note over drv: weights read from the model tensors,<br/>not from a compute-time snapshot
+    rect rgb(214, 234, 238)
+        drv->>cc: exportGraph, then forward.mlirbc
+        cc-->>drv: host.so, hash hit or compile
+        drv->>dev: tsi_forward_argv(argv)
+        dev-->>drv: logits plus k_new and v_new per layer
+    end
+    rect rgb(248, 230, 201)
+        drv->>drv: liveCacheCells(gf)
+        drv->>dram: write cells 0 to n-1, f32 to f16
+        Note over dram,drv: prompt cells authored by the<br/>compiled graph, not by SET_ROWS
+    end
+    drv-->>ctx: true, handled
+    Note over ctx,kv: llama forward pass SKIPPED
+    ctx->>drv: after_compute(gf)
+    drv-->>ctx: logits into output tensor
+    ctx-->>cli: logits
+    cli->>cli: sample first token
+
+    Note over cli,dev: DECODE. Every token compiled
+    loop each generated token, pos = k
+        cli->>ctx: llama_decode(1 token)
+        ctx->>kv: find_slot()
+        kv-->>ctx: k_idxs, the chosen cell
+        ctx->>ctx: sched_alloc_graph(gf)
+        ctx->>drv: before_compute(gf)
+        alt first decode token
+            drv->>drv: build_decode_from_live()
+            rect rgb(214, 234, 238)
+                drv->>dram: 60 read-only memrefs alias llama cache tensors
+                drv->>cc: exportGraph, then forward.mlirbc
+                cc-->>drv: host.so, compiled once per generation
+            end
+        else later tokens
+            drv->>drv: decode_retarget(id, pos)
+            Note over drv: refresh id, pos, mask only. About 1 KiB
+        end
+        rect rgb(214, 234, 238)
+            drv->>dev: tsi_forward_argv(argv)
+            dev->>dram: read n_kv cells in place, no copy
+            dev-->>drv: logits plus k_new and v_new per layer
+        end
+        rect rgb(248, 230, 201)
+            drv->>drv: liveCacheCells(gf)
+            drv->>dram: write one cell, f32 to f16
+        end
+        drv-->>ctx: true, handled
+        Note over ctx,kv: llama forward pass SKIPPED<br/>no scheduler, no SET_ROWS
+        ctx->>drv: after_compute(gf)
+        drv-->>ctx: logits into output tensor
+        ctx-->>cli: logits
+        cli->>cli: sample next token
+    end
+```
+
 ---
 
 ## Build (x86 build box)
