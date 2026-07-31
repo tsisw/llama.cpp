@@ -305,6 +305,39 @@ bool collectCachePtrs(ggml_cgraph * live, const decode_case & r, std::vector<voi
     return true;
 }
 
+// The cell llama's own allocator picked for this token, read off the SET_ROWS that writes the cache.
+//
+// This is NOT the position. llama's slot allocator finds a free cell, and after a removal, a defrag or
+// in a multi-sequence context that cell and the position diverge. `k_idxs` is a graph input filled from
+// slot_info before compute, so it is readable here, and using it is what keeps our write landing where
+// llama expects the token to be. Assuming pos would corrupt llama's cache the first time they differ.
+//
+// Returns -1 when no SET_ROWS over the K cache is present.
+// The SET_ROWS node carries the cache name itself and takes [values, indices, cache], so the index is
+// src[1]. Confirmed against a dumped decode graph rather than assumed from the ggml_set_rows signature:
+//
+//   [12] SET_ROWS f16 [192,4096,1,1] 'cache_k_l0 (view)'
+//          src0: VIEW f32 [192,1,1,1] 'Kcur-0 (view)'
+//          src1: NONE i64 [1,1,1,1]   'leaf_7'          <- the cell index, one for all layers
+//          src2: NONE f16 [192,4096,1,1] 'cache_k_l0'
+int liveCacheCell(ggml_cgraph * live) {
+    for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
+        ggml_tensor * nd = ggml_graph_node(live, i);
+        if (nd->op != GGML_OP_SET_ROWS || !nd->src[1]) {
+            continue;
+        }
+        if (std::string(nd->name).rfind("cache_k_l", 0) != 0) {
+            continue;
+        }
+        ggml_tensor * idx = nd->src[1];
+        if (idx->type != GGML_TYPE_I64 || !idx->data || ggml_nelements(idx) != 1) {
+            continue;
+        }
+        return (int) ((const int64_t *) idx->data)[0];
+    }
+    return -1;
+}
+
 // llama's live attention window (n_kv), read off the 3-d VIEW a decode step takes over cache_k.
 //
 // One compiled binary is built for one window. llama grows n_kv in blocks as the context fills, and
@@ -336,6 +369,7 @@ struct DecodeSession {
     int64_t         nvoc      = 0;
     int             cells     = 0;   // the window this binary was compiled for
     int             steps     = 0;
+    int             last_pos  = -1;  // to catch a context reset or a new sequence
     bool            ok        = false;
 
     ~DecodeSession() {
@@ -413,8 +447,40 @@ DecodeSession * openDecodeSession(ggml_cgraph * live, const Config & cfg) {
     return s;
 }
 
-// Run one token through the compiled decode. Only the per-step inputs move host->device; the cache
-// stays on the device and is advanced there by the graph's own append.
+// Write this step's K/V into llama's cache at the cell llama chose.
+//
+// Needed only because llama's forward pass is skipped, which skips its SET_ROWS along with it. The
+// values come back from the graph as f32 results and llama's cache is f16, so this is also where the
+// narrowing happens - the same rounding llama would have applied.
+bool writeCacheFromResults(DecodeSession & s, int cell) {
+    if (cell < 0 || cell >= s.r.capacity) {
+        fprintf(stderr, "[tsi-mlir] cache cell %d is outside the %d-cell buffer\n", cell,
+                s.r.capacity);
+        return false;
+    }
+
+    const int64_t per_cell   = s.r.cache_shape[2] * s.r.cache_shape[3];
+    const size_t  cell_bytes = (size_t) per_cell * ggml_type_size(s.r.cache_type);
+
+    for (int kind = 0; kind < 2; kind++) {
+        for (int il = 0; il < s.r.n_layers; il++) {
+            // Results are [logits, k_new_0..N-1, v_new_0..N-1]; cache_ptrs is k layers then v layers.
+            const size_t  res = 1 + (size_t) kind * s.r.n_layers + (size_t) il;
+            const float * src = (const float *) s.args.output(res);
+            char *        dst = (char *) s.cache_ptrs[(size_t) kind * s.r.n_layers + (size_t) il] +
+                         (size_t) cell * cell_bytes;
+            if (s.r.cache_type == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) dst, per_cell);
+            } else {
+                memcpy(dst, src, cell_bytes);
+            }
+        }
+    }
+    return true;
+}
+
+// Run one token through the compiled decode. Only the per-step inputs move host->device; the cache is
+// read where it lives and never copied.
 std::vector<float> runDecodeStep(DecodeSession & s, const Config & cfg, int64_t & nvoc_out) {
     nvoc_out = s.nvoc;
 
@@ -448,6 +514,7 @@ std::vector<float> runDecodeStep(DecodeSession & s, const Config & cfg, int64_t 
 
     s.fwd(s.args.argv());
     s.steps++;
+    s.last_pos = s.r.pos;
 
     std::vector<float> compiled((size_t) s.nvoc);
     memcpy(compiled.data(), s.args.output(0), (size_t) s.nvoc * sizeof(float));
@@ -523,10 +590,10 @@ extern "C" bool tsi_mlir_export_eval_cb(struct ggml_tensor * t, bool ask, void *
     return true;
 }
 
-void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
+bool tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
     const Config & cfg = Config::get();
     if (!cfg.enabled) {
-        return;
+        return false;
     }
     // Each graph gets fresh snapshots: ids and positions differ per step, and a stale position would
     // misclassify the phase.
@@ -574,13 +641,28 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
     // device-resident cache, so a token costs one call plus a few KiB of inputs. This used to be
     // guarded by a one-shot flag, which meant token 1 ran on TSI and every later token silently fell
     // back to llama - the compiled decode path was never actually exercised for a generation.
+    bool handled = false;
+
     if (!is_warmup && classify() == Phase::Decode) {
         const int win = liveWindow(cgraph);
+        const int pos = g_pos_cap.empty() ? -1 : g_pos_cap[0];
+
         if (g_decode && win > 0 && g_decode->cells != win) {
             // llama grew its attention window, so the graph shape, the binary and the cache size all
             // change. Rebuild rather than reuse a binary built for a smaller window.
             fprintf(stderr, "[tsi-mlir] llama's window grew %d -> %d cells; rebuilding decode\n",
                     g_decode->cells, win);
+            delete g_decode;
+            g_decode = nullptr;
+        }
+        if (g_decode && pos != g_decode->last_pos + 1) {
+            // Positions are meant to advance by one. Anything else means llama restarted or switched
+            // sequence - a conversation reset, a context shift, a cleared slot - and the graph's mask
+            // and cached geometry no longer describe the state. Rebuilding re-reads everything from the
+            // live graph, which is correct by construction; carrying on would compute against the
+            // previous sequence's keys and report nothing.
+            fprintf(stderr, "[tsi-mlir] position jumped %d -> %d; rebuilding decode\n",
+                    g_decode->last_pos, pos);
             delete g_decode;
             g_decode = nullptr;
         }
@@ -590,7 +672,21 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
         }
         g_decode_logits = g_decode ? runDecodeStep(*g_decode, cfg, g_decode_nvoc)
                                    : std::vector<float>();
+
+        // Take over the step only if the cache was updated too. Under TSI_MLIR_VERIFY llama has to
+        // compute in order to be the reference, so it keeps its own SET_ROWS and we write nothing -
+        // otherwise both would write the same cell and the comparison would be measuring itself.
+        if (!g_decode_logits.empty() && !cfg.verify) {
+            const int cell = liveCacheCell(cgraph);
+            handled        = writeCacheFromResults(*g_decode, cell);
+            if (!handled) {
+                // Leave llama to compute: a half-updated cache is worse than a duplicated pass.
+                fprintf(stderr, "[tsi-mlir] could not update llama's cache; falling back to llama "
+                                "for this token\n");
+            }
+        }
     }
+    return handled;
 }
 
 bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {

@@ -123,10 +123,43 @@ Expected tail:
 
 ## KV-cache decode
 
-The driver covers **prefill only** so far: `LiveGraphBuilder` rebuilds a *cache-free* graph, because
-llama's in-place KV cache cannot be expressed as a pure tensor function. When the driver meets a
-decode graph it says so and leaves llama's own result in place. Wiring the compiled decode into
-`llama-cli` is the next step; the graph itself already exists, below.
+Both phases run compiled, and **every decode token** goes through the compiled graph, not just the
+first. There is exactly **one** KV cache: llama allocates it, llama maintains it, and the compiled
+graph reads it in place.
+
+| concern | owner |
+|---|---|
+| cache storage | llama, allocated from TSI shared DRAM (`tsi_mlir_kv_buffer_type`, swapped in at `llama-kv-cache.cpp`) |
+| slot allocation, context shift, defrag, `seq_rm` | llama, unchanged — it mutates the same bytes we read |
+| the forward pass | the compiled MLIR graph |
+| writing the new K/V | llama's `SET_ROWS` normally; the driver when llama's pass is skipped |
+
+The decode graph takes one **read-only** memref per layer per kind, each aliasing llama's own
+`cache_k_l<il>`/`cache_v_l<il>`, and returns logits plus per-layer `k_new`/`v_new`. So no cache is ever
+copied in either direction — a token moves only id, pos, mask and ~23 KiB of results. The memref spans
+llama's full `n_ctx` while a step reads the live `n_kv` window as a strided prefix (256 of 4096 on
+SmolLM2). One compile serves a whole generation: `pos` and `mask` are runtime arguments, so the same
+binary works at every position.
+
+Because the graph produces both the logits and the cache update, **llama's own forward pass is skipped
+entirely** for decode — `before_compute` returns true and `graph_compute` runs neither the scheduler nor
+an allocation (`process_ubatch` has already allocated, so every tensor has its buffer). Two exceptions,
+both deliberate: prefill always computes, because it captures the weights the reconstruction needs and
+fills the cells decode reads; and under `TSI_MLIR_VERIFY` llama computes throughout, since it cannot be
+the reference otherwise.
+
+When llama's pass is skipped its `SET_ROWS` goes with it, so the driver writes the new K/V itself — at
+the cell **llama's allocator chose**, read from the `k_idxs` graph input, not at `pos`. The two agree
+only in a fresh append-only sequence; after a removal or a defrag they diverge, and using `pos` would
+corrupt llama's cache. The f32 results are narrowed to f16 on the way in, the same rounding llama
+applies.
+
+A decode session is rebuilt from the live graph whenever llama's window grows or the position stops
+advancing by one — a conversation reset, a context shift or a cleared slot all land there, and
+rebuilding re-reads the geometry rather than computing against a previous sequence's keys.
+
+Still refused rather than approximated: a quantized KV cache (a q8_0 block has no memref element type),
+a transposed V cache (`-fa off`), `n_stream > 1`, and multi-token decode batches.
 
 The decode graph is a separate, fixed-length graph — one MLIR func returning logits plus per-layer
 `k_new`/`v_new`, reused for every token with the cache held on the host. Two tools share it, both

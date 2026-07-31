@@ -30,7 +30,11 @@ struct ggml_tensor;
 
 // Before llama computes the graph. Classifies the phase and snapshots what the reconstruction will
 // need while it is still valid. Always lets the caller continue.
-void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph);
+// Returns true when the compiled path has fully handled this graph, so llama can skip its own forward
+// pass. Only decode does: it writes the logits and updates the KV cache itself, leaving nothing for
+// llama's backend to compute. False for prefill and for anything unsupported, and false under
+// TSI_MLIR_VERIFY, where llama has to compute in order to be the reference.
+bool tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph);
 
 // Scheduler eval-callback (install with ggml_backend_sched_set_eval_callback before compute).
 // Snapshots each weight's data while valid during compute; the reconstruction reads it back later.
