@@ -130,7 +130,8 @@ if (MLIR_FOUND)
         add_library(tsi-llama-hook STATIC
             src/driver/ExportDriver.cpp
             src/driver/Artifact.cpp
-            src/driver/Config.cpp)
+            src/driver/Config.cpp
+            src/driver/KvBuffer.cpp)
         add_dependencies(tsi-llama-hook TsiGgmlOpsIncGen)
         target_include_directories(tsi-llama-hook PRIVATE
             "${TSI_MLIR_EXPORT_INCLUDE}"

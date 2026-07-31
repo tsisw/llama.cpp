@@ -12,6 +12,15 @@
 #include <map>
 #include <stdexcept>
 
+#if defined(LLAMA_TSI_MLIR_EXPORT) || defined(GGML_USE_TSAVORITE)
+// Whole-graph MLIR export: the KV cache is allocated from TSI shared DRAM so the compiled graph can
+// read it in place instead of being handed a copy. Defined in
+// examples/mlir-export/src/driver/KvBuffer.cpp; returns nullptr when the export path is off, leaving
+// llama's normal CPU cache untouched.
+#  define LLAMA_HAS_TSI_MLIR_KV_DRAM 1
+extern "C" ggml_backend_buffer_type_t tsi_mlir_kv_buffer_type(void);
+#endif
+
 //
 // llama_kv_cache
 //
@@ -108,6 +117,17 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+#ifdef LLAMA_HAS_TSI_MLIR_KV_DRAM
+        // With the whole-graph MLIR export on, put the cache in TSI shared DRAM instead. It stays
+        // host memory, so everything below and every cache operation (SET_ROWS, shift, defrag,
+        // seq_rm) runs unchanged on the CPU backend; the compiled graph reads the same bytes through
+        // a memref rather than being handed a copy. Returns nullptr when the export path is off.
+        if (ggml_backend_buffer_type_t dram = tsi_mlir_kv_buffer_type()) {
+            buft     = dram;
+            dev_name = "TSI_DRAM";
+        }
+#endif
 
         // Always use CPU for KV cache tensors to avoid issues with operations
         // that are not supported by the offloaded backend (e.g., SET_ROWS)
