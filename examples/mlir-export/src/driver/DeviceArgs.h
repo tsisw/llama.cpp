@@ -90,7 +90,21 @@ class DeviceArgs {
 
     // Copies t->data to the device. Returns false when DRAM is exhausted, which is a report-and-skip
     // condition rather than a crash: raise USER_DRAM_SIZE and retry.
-    bool addInput(const ggml_tensor * t) { return add(t, /*copy=*/true); }
+    bool addInput(const ggml_tensor * t) {
+        if (!add(t, /*copy=*/true)) {
+            return false;
+        }
+        ins_.push_back(bufs_.size() - 1);
+        return true;
+    }
+
+    // Refresh the k'th input's bytes in place, for reusing one argv across many calls.
+    //
+    // A decode step only changes id, pos and mask, so rebuilding the whole argv per token would
+    // re-allocate device memory every time for values that are a few kilobytes.
+    void refreshInput(size_t k, const ggml_tensor * t) {
+        memcpy(bufs_[ins_[k]], t->data, ggml_nbytes(t));
+    }
 
     // Space for a result, uninitialized.
     bool addOutput(const ggml_tensor * t) {
@@ -124,7 +138,16 @@ class DeviceArgs {
     // as void* and forwards a[i] straight into _mlir_ciface_forward(..., i64, ...), so an i64
     // argument reads the slot itself. Passing a pointer here makes the address the slot number,
     // which writes the new cell at a garbage offset instead of failing.
-    void addScalar(int64_t v) { argv_.push_back((void *) (intptr_t) v); }
+    // Returns the argv slot it landed in, so a later call can change it without rebuilding argv.
+    size_t addScalar(int64_t v) {
+        argv_.push_back((void *) (intptr_t) v);
+        return argv_.size() - 1;
+    }
+
+    // Overwrite a scalar added earlier. Same by-value convention as addScalar.
+    void setScalar(size_t argv_index, int64_t v) {
+        argv_[argv_index] = (void *) (intptr_t) v;
+    }
 
     void ** argv() { return argv_.data(); }
 
@@ -154,6 +177,7 @@ class DeviceArgs {
     std::vector<void *> bufs_;
     std::vector<void *> descs_;
     std::vector<void *> argv_;
+    std::vector<size_t> ins_;    // indices into bufs_, in addInput order
     std::vector<size_t> outs_;   // indices into bufs_, in addOutput order
 };
 

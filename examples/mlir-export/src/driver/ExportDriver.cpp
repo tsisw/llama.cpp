@@ -277,128 +277,237 @@ void * g_cache_k     = nullptr;
 void * g_cache_v     = nullptr;
 size_t g_cache_bytes = 0;
 
-// Allocate the device caches if needed, then fill them from llama's live window.
-//
-// Seeding on every step is deliberate and temporary: it makes the compiled decode correct while the
-// compiled prefill still does not write the cache. Once prefill fills it, this copy goes away and the
-// buffers carry the state forward on their own - which is also the only thing that would prove the
-// round trip through DRAM actually works, since right now a broken append would be masked by the
-// fresh copy arriving next step.
-bool seedCaches(const decode_case & r) {
-    if (g_cache_bytes != r.cache_bytes) {
-        // A different window needs a different buffer. That also invalidates the compiled binary, so
-        // there is nothing worth preserving across the change.
+// Allocate the device caches, replacing any previous pair.
+bool allocCaches(size_t bytes) {
+    if (g_cache_k) {
+        tsi_dealloc(g_cache_k);
+    }
+    if (g_cache_v) {
+        tsi_dealloc(g_cache_v);
+    }
+    g_cache_k     = tsi_alloc((int64_t) bytes);
+    g_cache_v     = tsi_alloc((int64_t) bytes);
+    g_cache_bytes = bytes;
+    if (!g_cache_k || !g_cache_v) {
+        fprintf(stderr, "[tsi-mlir] tsi_alloc failed for a %zu-byte KV cache. "
+                        "Raise USER_DRAM_SIZE (MiB).\n", bytes);
         if (g_cache_k) {
             tsi_dealloc(g_cache_k);
         }
         if (g_cache_v) {
             tsi_dealloc(g_cache_v);
         }
-        g_cache_k     = tsi_alloc((int64_t) r.cache_bytes);
-        g_cache_v     = tsi_alloc((int64_t) r.cache_bytes);
-        g_cache_bytes = r.cache_bytes;
-        if (!g_cache_k || !g_cache_v) {
-            fprintf(stderr, "[tsi-mlir] tsi_alloc failed for a %zu-byte KV cache. "
-                            "Raise USER_DRAM_SIZE (MiB).\n", r.cache_bytes);
-            if (g_cache_k) {
-                tsi_dealloc(g_cache_k);
-            }
-            if (g_cache_v) {
-                tsi_dealloc(g_cache_v);
-            }
-            g_cache_k = g_cache_v = nullptr;
-            g_cache_bytes         = 0;
-            return false;
-        }
-    }
-
-    const size_t lbytes = r.layer_floats * sizeof(float);
-    for (size_t il = 0; il < r.k_slices.size(); il++) {
-        // A shape disagreement here would copy a wrong-sized window into the right-sized buffer and
-        // corrupt every layer after it, with plausible-looking logits as the only symptom.
-        if ((size_t) ggml_nelements(r.k_slices[il]) != r.layer_floats ||
-            (size_t) ggml_nelements(r.v_slices[il]) != r.layer_floats) {
-            fprintf(stderr, "[tsi-mlir] layer %zu cache slice is %lld elements, expected %zu\n", il,
-                    (long long) ggml_nelements(r.k_slices[il]), r.layer_floats);
-            return false;
-        }
-        memcpy((char *) g_cache_k + il * lbytes, r.k_slices[il]->data, lbytes);
-        memcpy((char *) g_cache_v + il * lbytes, r.v_slices[il]->data, lbytes);
+        g_cache_k = g_cache_v = nullptr;
+        g_cache_bytes         = 0;
+        return false;
     }
     return true;
 }
 
-// Rebuild, compile and run one decode step. Returns its logits, or empty on any failure, in which
-// case llama's own result stands.
-std::vector<float> runDecode(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
-    decode_case r;
+// Copy llama's KV cache into the device buffers, ONCE, when a decode session starts.
+//
+// This is a straight memcpy of llama's own bytes: the device cache is stored in llama's cache type and
+// cells-first, which is exactly llama's layout (cell c of a layer at c * head_dim * n_head_kv), so no
+// conversion and no reshuffle. The first `cells` cells of llama's [per_cell, n_ctx] buffer are
+// contiguous, which is what makes one memcpy per layer correct.
+//
+// After this the cache is carried by the graph's own in-place appends. Re-seeding per token would
+// overwrite the device's correct result with a host copy, cost O(cells) transfer per token instead of
+// zero, and hide a broken append behind a fresh copy.
+bool seedCachesOnce(ggml_cgraph * live, const decode_case & r) {
+    const size_t per_cell_bytes = r.layer_bytes / (size_t) r.cells;
+
+    for (int64_t il = 0; il < r.cache_shape[0]; il++) {
+        ggml_tensor * kl = live_cache_leaf(live, "k", (int) il);
+        ggml_tensor * vl = live_cache_leaf(live, "v", (int) il);
+        if (!kl || !vl) {
+            fprintf(stderr, "[tsi-mlir] layer %lld has no llama cache buffer to seed from\n",
+                    (long long) il);
+            return false;
+        }
+        // llama's own buffer must be at least the window we attend over, and one cell must be the
+        // size we computed from the geometry. Either mismatch would seed plausible-looking garbage.
+        if (kl->type != r.cache_type || (size_t) kl->nb[1] != per_cell_bytes ||
+            kl->ne[1] < r.cells) {
+            fprintf(stderr, "[tsi-mlir] cache_k_l%lld: type %s, cell stride %zu, %lld cells; "
+                            "expected %s, %zu, >= %d\n",
+                    (long long) il, ggml_type_name(kl->type), (size_t) kl->nb[1],
+                    (long long) kl->ne[1], ggml_type_name(r.cache_type), per_cell_bytes, r.cells);
+            return false;
+        }
+        memcpy((char *) g_cache_k + (size_t) il * r.layer_bytes, kl->data, r.layer_bytes);
+        memcpy((char *) g_cache_v + (size_t) il * r.layer_bytes, vl->data, r.layer_bytes);
+    }
+    return true;
+}
+
+// llama's live attention window (n_kv), read off the 3-d VIEW a decode step takes over cache_k.
+//
+// One compiled binary is built for one window. llama grows n_kv in blocks as the context fills, and
+// when it does the graph shape, the binary and the cache size all change together.
+int liveWindow(ggml_cgraph * live) {
+    for (int i = 0; i < ggml_graph_n_nodes(live); i++) {
+        ggml_tensor * nd = ggml_graph_node(live, i);
+        if (nd->op == GGML_OP_VIEW && nd->src[0] && ggml_n_dims(nd) == 3 &&
+            wg_core_name(nd->src[0]->name).rfind("cache_k_l", 0) == 0) {
+            return (int) nd->ne[2];
+        }
+    }
+    return 0;
+}
+
+// One compiled decode, reused for every token of a generation.
+//
+// Built once and kept: the rebuilt ggml graph, the compiled binary, and the argv - including the two
+// cache descriptors, which point at buffers that outlive every call. Per token only id, pos, mask and
+// slot change, and all four are runtime arguments, so a single binary serves every position. Rebuilding
+// and re-exporting per token would otherwise dominate: it re-reads every weight and re-hashes the
+// module for a graph that is structurally identical.
+struct DecodeSession {
+    decode_case     r;
+    forward_argv_fn fwd       = nullptr;
+    DeviceArgs      args;
+    size_t          slot_argv = 0;
+    int64_t         nvoc      = 0;
+    int             cells     = 0;   // the window this binary was compiled for
+    int             steps     = 0;
+    bool            ok        = false;
+
+    ~DecodeSession() {
+        if (r.ctx) {
+            ggml_free(r.ctx);
+        }
+        if (r.wc) {
+            ggml_free(r.wc);
+        }
+    }
+};
+
+// Deliberately a raw pointer that is never freed at exit. Its destructor would tsi_dealloc device
+// buffers, and static destruction can run after the atexit tsi_finalize in Runtime.h, which would be a
+// use-after-teardown. Deleted explicitly when the window changes, which happens while the runtime is
+// still up.
+DecodeSession * g_decode = nullptr;
+
+// Build, compile, seed. Returns nullptr on any failure, in which case llama's own decode stands.
+DecodeSession * openDecodeSession(ggml_cgraph * live, const Config & cfg) {
+    auto * s = new DecodeSession();
     try {
-        r = build_decode_from_live(live, cfg.weight_args);
+        s->r = build_decode_from_live(live, cfg.weight_args);
     } catch (const std::exception & e) {
         fprintf(stderr, "[tsi-mlir] decode SKIPPED: %s\n", e.what());
-        return {};
+        delete s;
+        return nullptr;
     }
-
-    auto cleanup = [&] {
-        if (r.ctx) ggml_free(r.ctx);
-        if (r.wc)  ggml_free(r.wc);
-    };
 
     // A separate artifact from prefill: different arity, so a separate RTLD_LOCAL handle too.
-    forward_argv_fn fwd = buildForward(r.func_text, "decode", cfg);
-    if (!fwd) {
-        cleanup();
-        return {};
+    s->fwd = buildForward(s->r.func_text, "decode", cfg);
+    if (!s->fwd) {
+        delete s;
+        return nullptr;
     }
+    // The module is compiled; on a weights-baked run it is hundreds of MiB of bytecode with nothing
+    // left to read it.
+    s->r.func_text.clear();
+    s->r.func_text.shrink_to_fit();
 
-    ggml_tensor * out  = const_cast<ggml_tensor *>(r.outputs[0]);   // logits [n_vocab, 1]
-    const int64_t nvoc = out->ne[0];
-    nvoc_out           = nvoc;
-
-    std::vector<float> reconcpu;
-    if (cfg.cpu_ref) {
-        reconcpu.resize((size_t) nvoc);
-        ggml_graph_compute_with_ctx(r.ctx, r.gf, 4);
-        memcpy(reconcpu.data(), out->data, (size_t) nvoc * sizeof(float));
-    }
+    s->nvoc  = s->r.outputs[0]->ne[0];
+    s->cells = s->r.cells;
 
     runtimeUp();
-
-    if (!seedCaches(r)) {
-        cleanup();
-        return {};
+    if (!allocCaches(s->r.cache_bytes) || !seedCachesOnce(live, s->r)) {
+        delete s;
+        return nullptr;
     }
 
     // argv order is the ciface order the exporter documents:
     // [runtime_args..., cache_k, cache_v, slot, outputs...].
-    DeviceArgs args;
-    bool       ok = true;
-    for (const ggml_tensor * t : r.runtime_args) {
-        ok = ok && args.addInput(t);
+    bool ok = true;
+    for (const ggml_tensor * t : s->r.runtime_args) {
+        ok = ok && s->args.addInput(t);
     }
-    ok = ok && args.addCache(g_cache_k, r.cache_shape);
-    ok = ok && args.addCache(g_cache_v, r.cache_shape);
-    args.addScalar(r.pos);   // the cell this step appends at
-    for (const ggml_tensor * t : r.outputs) {
-        ok = ok && args.addOutput(t);
+    ok = ok && s->args.addCache(g_cache_k, s->r.cache_shape);
+    ok = ok && s->args.addCache(g_cache_v, s->r.cache_shape);
+    s->slot_argv = s->args.addScalar(s->r.pos);
+    for (const ggml_tensor * t : s->r.outputs) {
+        ok = ok && s->args.addOutput(t);
     }
     if (!ok) {
-        cleanup();
+        delete s;
+        return nullptr;
+    }
+
+    fprintf(stderr, "[tsi-mlir] decode session ready: %zu args + 2 caches + slot, %d-cell window, "
+                    "%.2f MiB %s cache each, seeded from llama once\n",
+            s->r.runtime_args.size(), s->cells,
+            (double) s->r.cache_bytes / (1024.0 * 1024.0), ggml_type_name(s->r.cache_type));
+    s->ok = true;
+    return s;
+}
+
+// Run one token through the compiled decode. Only the per-step inputs move host->device; the cache
+// stays on the device and is advanced there by the graph's own append.
+std::vector<float> runDecodeStep(DecodeSession & s, const Config & cfg, int64_t & nvoc_out) {
+    nvoc_out = s.nvoc;
+
+    if (g_ids_cap.size() != 1 || g_pos_cap.size() != 1) {
         return {};
     }
-
-    fprintf(stderr, "[tsi-mlir] running compiled decode: %zu args + 2 caches + slot %d, "
-                    "%zu outputs, logits [%lld]\n",
-            r.runtime_args.size(), r.pos, r.outputs.size(), (long long) nvoc);
-    fwd(args.argv());
-
-    std::vector<float> compiled((size_t) nvoc);
-    memcpy(compiled.data(), args.output(0), (size_t) nvoc * sizeof(float));
-
-    if (cfg.cpu_ref) {
-        compare("decode recon-CPU vs compiled:", reconcpu.data(), compiled.data(), nvoc);
+    if (!decode_retarget(s.r, g_ids_cap[0], g_pos_cap[0])) {
+        fprintf(stderr, "[tsi-mlir] position %d is past the %d-cell window; decode SKIPPED\n",
+                g_pos_cap[0], s.cells);
+        return {};
     }
-    cleanup();
+    // id, pos and mask, in the order build_decode_from_live declared them. A few KiB per token, versus
+    // the whole cache before.
+    for (size_t k = 0; k < 3; k++) {
+        s.args.refreshInput(k, s.r.runtime_args[k]);
+    }
+    s.args.setScalar(s.slot_argv, s.r.pos);
+
+    // The CPU reference reads the f32 cache snapshot taken when the session opened, and nothing
+    // updates it: the live cache now advances on the device. So it is only meaningful on the first
+    // step, and running it later would compare against a stale state and look like a regression.
+    std::vector<float> reconcpu;
+    const bool         want_cpu_ref = cfg.cpu_ref && s.steps == 0;
+    if (want_cpu_ref) {
+        reconcpu.resize((size_t) s.nvoc);
+        ggml_graph_compute_with_ctx(s.r.ctx, s.r.gf, 4);
+        memcpy(reconcpu.data(), s.r.outputs[0]->data, (size_t) s.nvoc * sizeof(float));
+    } else if (cfg.cpu_ref && s.steps == 1) {
+        fprintf(stderr, "[tsi-mlir] decode CPU reference is first-step only; the cache it would need "
+                        "now lives on the device\n");
+    }
+
+    s.fwd(s.args.argv());
+    s.steps++;
+
+    std::vector<float> compiled((size_t) s.nvoc);
+    memcpy(compiled.data(), s.args.output(0), (size_t) s.nvoc * sizeof(float));
+
+    // TSI_MLIR_CACHE_SUM=1: fingerprint the device cache and the logits after every step.
+    //
+    // Diagnostic for divergence that only appears after several tokens: comparing two runs step by
+    // step says whether the cache or the logits moved first, and at which token. The cache is the only
+    // state carried between calls, so if it matches and the logits do not, the compiled body is at
+    // fault rather than the cache handling.
+    if (getenv("TSI_MLIR_CACHE_SUM")) {
+        auto fnv = [](const void * p, size_t n) {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < n; i++) {
+                h = (h ^ ((const unsigned char *) p)[i]) * 1099511628211ull;
+            }
+            return h;
+        };
+        fprintf(stderr, "[tsi-mlir] step %2d pos %3d  k=%016llx v=%016llx logits=%016llx\n",
+                s.steps - 1, s.r.pos, (unsigned long long) fnv(g_cache_k, g_cache_bytes),
+                (unsigned long long) fnv(g_cache_v, g_cache_bytes),
+                (unsigned long long) fnv(compiled.data(), compiled.size() * sizeof(float)));
+    }
+
+    if (want_cpu_ref) {
+        compare("decode recon-CPU vs compiled:", reconcpu.data(), compiled.data(), s.nvoc);
+    }
     return compiled;
 }
 
@@ -486,16 +595,32 @@ void tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
         }
     }
 
-    static int  seen      = 0;
-    static bool did_decode = false;
-    const bool  is_warmup = seen++ < cfg.skip;
+    static int seen      = 0;
+    const bool is_warmup = seen++ < cfg.skip;
 
     // Decode is handled HERE, not after compute. The graph reads cells 0..pos-1, and after compute
     // llama has written cell pos, so a graph built then would consume its own answer.
-    if (!is_warmup && !did_decode && classify() == Phase::Decode) {
-        did_decode = true;
-        reportDecodeCache(cgraph);
-        g_decode_logits = runDecode(cgraph, cfg, g_decode_nvoc);
+    //
+    // EVERY decode token runs compiled, not just the first. The session holds one binary and one
+    // device-resident cache, so a token costs one call plus a few KiB of inputs. This used to be
+    // guarded by a one-shot flag, which meant token 1 ran on TSI and every later token silently fell
+    // back to llama - the compiled decode path was never actually exercised for a generation.
+    if (!is_warmup && classify() == Phase::Decode) {
+        const int win = liveWindow(cgraph);
+        if (g_decode && win > 0 && g_decode->cells != win) {
+            // llama grew its attention window, so the graph shape, the binary and the cache size all
+            // change. Rebuild rather than reuse a binary built for a smaller window.
+            fprintf(stderr, "[tsi-mlir] llama's window grew %d -> %d cells; rebuilding decode\n",
+                    g_decode->cells, win);
+            delete g_decode;
+            g_decode = nullptr;
+        }
+        if (!g_decode) {
+            reportDecodeCache(cgraph);
+            g_decode = openDecodeSession(cgraph, cfg);
+        }
+        g_decode_logits = g_decode ? runDecodeStep(*g_decode, cfg, g_decode_nvoc)
+                                   : std::vector<float>();
     }
 }
 
@@ -517,10 +642,9 @@ bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
         dumpGraph(live, cfg.dir + "/graph-" + phaseName(phase) + ".txt");
     }
 
-    // One shot per phase. Prefill happens once; decode repeats per token, and running the compiled
-    // decode on every one of them is Step 5b's business, once the graph exists.
+    // Prefill happens once. Decode repeats per token and every one of them is run compiled, in
+    // before_compute; this only writes the result back.
     static bool did_prefill = false;
-    static bool did_decode  = false;
 
     if (phase == Phase::Prefill) {
         if (did_prefill) {
@@ -555,6 +679,5 @@ bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
         memcpy(live_out->data, g_decode_logits.data(), (size_t) n * sizeof(float));
         g_decode_logits.clear();
     }
-    (void) did_decode;
     return false;
 }

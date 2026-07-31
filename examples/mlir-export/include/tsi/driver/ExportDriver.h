@@ -18,6 +18,7 @@
 // | TSI_MLIR_SCRIPT   | compile_graph_fpga.py, if not next to this source tree. |
 // | TSI_MLIR_DUMP_GRAPH | 1 writes each intercepted graph's nodes to <dir>/graph-<phase>.txt. |
 // | TSI_MLIR_WEIGHT_ARGS | 1 passes weights as arguments instead of baking them in as constants. |
+// | TSI_MLIR_CACHE_SUM | 1 fingerprints the device KV cache and the logits after every decode step. |
 //
 // Comparison is layered because each level costs more than the last. TSI_MLIR_EXPORT alone runs the
 // compiled forward and uses its result, comparing against nothing: the point is to run the model

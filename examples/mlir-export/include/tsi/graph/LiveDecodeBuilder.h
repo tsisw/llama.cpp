@@ -44,17 +44,36 @@ struct decode_case {
 
     // The two DRAM caches, in argument order after runtime_args: cache_k then cache_v, then `slot`.
     //
-    // `k_slices`/`v_slices` are the host-side f32 windows read out of llama, one per layer, which the
-    // driver copies into the device buffers. They live in `ctx`, so they are valid until it is freed.
-    std::vector<const ggml_tensor *> k_slices, v_slices;
-    std::vector<int64_t>             cache_shape;    // MLIR order: [n_layers, cells, n_head_kv, head_dim]
-    size_t                           cache_bytes = 0;   // one cache, all layers
-    size_t                           layer_floats = 0;  // floats per layer, for seeding
+    // Stored in llama's own cache type, so the device buffer is byte-compatible with llama's and can be
+    // seeded by a plain memcpy. The graph still computes in f32; the exporter widens on read and
+    // narrows on append.
+    ggml_type            cache_type  = GGML_TYPE_F16;
+    std::vector<int64_t> cache_shape;        // MLIR order: [n_layers, cells, n_head_kv, head_dim]
+    size_t               cache_bytes = 0;    // one cache, all layers
+    size_t               layer_bytes = 0;    // one layer's window, for seeding layer by layer
 
     std::string func_text;
     int         pos   = 0;   // position of the token being decoded; also the cache slot to append at
     int         cells = 0;   // cache window this graph was built for
 };
+
+// Fill one step's inputs: which token, which position, and the mask that gates the cache.
+//
+// The mask rule is the subtle part, so it lives here alone and both the initial build and every
+// subsequent token go through it. Cells 0..pos-1 hold real keys; cells from pos on have not been
+// written yet and must be masked off, or uninitialized cells read as context. The final slot is the new
+// token attending to itself.
+static inline void ldb_fill_step(ggml_tensor * id_t, ggml_tensor * pos_t, ggml_tensor * mask_t,
+                                 int cells, int32_t token, int pos) {
+    ((int32_t *) id_t->data)[0]  = token;
+    ((int32_t *) pos_t->data)[0] = pos;
+
+    float * m = (float *) mask_t->data;
+    for (int j = 0; j < cells; j++) {
+        m[j] = j < pos ? 0.0f : -INFINITY;
+    }
+    m[cells] = 0.0f;
+}
 
 // Read one i32/f32 op_param slot, the way ggml stores them.
 static inline int32_t ldb_pi32(const ggml_tensor * t, int slot) {
@@ -240,23 +259,15 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
         throw mlir_export_error("decode expects exactly one token id, got " +
                                 std::to_string(g_ids_cap.size()));
     }
-    ((int32_t *) id->data)[0] = g_ids_cap[0];
 
     ggml_tensor * pt = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, 1);
     ggml_set_name(pt, "pos");
-    ((int32_t *) pt->data)[0] = pos;
 
-    // mask[0..L-1] gates the cache cells, mask[L] is the new token attending to itself. Cells at or
-    // past `pos` have not been written, so they are masked off.
+    // mask[0..L-1] gates the cache cells, mask[L] is the new token attending to itself.
     ggml_tensor * mask = ggml_new_tensor_2d(r.ctx, GGML_TYPE_F32, L + 1, 1);
     ggml_set_name(mask, "mask");
-    {
-        float * m = (float *) mask->data;
-        for (int j = 0; j < L; j++) {
-            m[j] = j < pos ? 0.0f : -INFINITY;
-        }
-        m[L] = 0.0f;
-    }
+
+    ldb_fill_step(id, pt, mask, L, g_ids_cap[0], pos);
 
     std::vector<ggml_tensor *> cK(M.n_layers), cV(M.n_layers);
     for (int il = 0; il < M.n_layers; il++) {
@@ -299,13 +310,20 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
         }
     }
 
-    r.k_slices.assign(cK.begin(), cK.end());
-    r.v_slices.assign(cV.begin(), cV.end());
+    // Store the cache in whatever type llama stores its own in, so seeding is a memcpy and a value we
+    // append rounds to the pattern llama would have written. Falls back to f32 if llama's cache is f32.
+    ggml_tensor * k_leaf = live_cache_leaf(live, "k", 0);
+    r.cache_type         = k_leaf ? k_leaf->type : GGML_TYPE_F16;
+    if (r.cache_type != GGML_TYPE_F16 && r.cache_type != GGML_TYPE_F32) {
+        throw mlir_export_error(std::string("llama's KV cache is ") +
+                                ggml_type_name(r.cache_type) + ", which has no memref element type");
+    }
+
     // MLIR order, [n_layers, cells, n_head_kv, head_dim]: ggml's ne reversed, with the layer dim
     // prepended. Must match GraphBuilder::cacheType or the descriptor strides address the wrong cell.
-    r.cache_shape   = { M.n_layers, L, M.n_head_kv, M.head_dim };
-    r.layer_floats  = (size_t) L * M.n_head_kv * M.head_dim;
-    r.cache_bytes   = (size_t) M.n_layers * r.layer_floats * sizeof(float);
+    r.cache_shape = { M.n_layers, L, M.n_head_kv, M.head_dim };
+    r.layer_bytes = (size_t) L * M.n_head_kv * M.head_dim * ggml_type_size(r.cache_type);
+    r.cache_bytes = (size_t) M.n_layers * r.layer_bytes;
 
     tsi::mlir_export::ExportOptions opts;
     opts.runtime_args = r.runtime_args;
@@ -317,14 +335,16 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
     // f32 conversion, so there is nothing to narrow yet. Making the cache f16 to match llama bit for
     // bit is a size/fidelity change that belongs with the prefill handoff, not here.
     tsi::mlir_export::CacheSpec ks, vs;
-    ks.name     = "cache_k";
-    ks.n_layers = M.n_layers;
-    ks.cells    = L;
+    ks.name      = "cache_k";
+    ks.n_layers  = M.n_layers;
+    ks.cells     = L;
+    ks.elem_type = r.cache_type;
     ks.read.assign(cK.begin(), cK.end());
     ks.append.assign(knew.begin(), knew.end());
-    vs.name     = "cache_v";
-    vs.n_layers = M.n_layers;
-    vs.cells    = L;
+    vs.name      = "cache_v";
+    vs.n_layers  = M.n_layers;
+    vs.cells     = L;
+    vs.elem_type = r.cache_type;
     vs.read.assign(cV.begin(), cV.end());
     vs.append.assign(vnew.begin(), vnew.end());
     opts.caches = { ks, vs };
@@ -341,4 +361,26 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
 
     r.wc = M.wc;   // freed by the caller, together with r.ctx
     return r;
+}
+
+// Retarget an already-built decode_case at the next token, so one compiled binary serves a whole
+// generation.
+//
+// id, pos and mask are runtime arguments and the graph is structurally identical from one token to the
+// next, so only their data moves. This is what makes per-token compiled decode cheap: no rebuild, no
+// re-export, no recompile, and the KV cache stays on the device.
+//
+// `runtime_args` is [id, pos, mask] by construction above, and the driver's argv depends on that order.
+//
+// Returns false when the position has run past the window this graph was built for. That needs a new
+// graph, not a new mask, so it is the caller's cue to rebuild rather than something to paper over.
+static inline bool decode_retarget(decode_case & r, int32_t token, int pos) {
+    if (pos < 0 || pos >= r.cells || r.runtime_args.size() < 3) {
+        return false;
+    }
+    ldb_fill_step(const_cast<ggml_tensor *>(r.runtime_args[0]),
+                  const_cast<ggml_tensor *>(r.runtime_args[1]),
+                  const_cast<ggml_tensor *>(r.runtime_args[2]), r.cells, token, pos);
+    r.pos = pos;
+    return true;
 }

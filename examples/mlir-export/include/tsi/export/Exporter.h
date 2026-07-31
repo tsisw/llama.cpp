@@ -45,6 +45,14 @@ struct CacheSpec {
     int64_t     n_layers = 0;
     int64_t     cells    = 0;                    // capacity L
 
+    // Storage type of the memref, independent of what the graph computes in.
+    //
+    // llama holds its own KV cache as f16, so f16 here makes the buffer bit-compatible with it: it can
+    // be seeded by a straight memcpy, and a value we write rounds to the same pattern llama would have
+    // written unless it sits within half an f16 ULP of a boundary. The exporter widens on read and
+    // narrows on append, so the graph and its CPU reference stay f32 either way.
+    ggml_type elem_type = GGML_TYPE_F32;
+
     // Per layer, both sized n_layers. `read` entries are graph leafs standing for that layer's
     // slice; a null `append` entry skips the write for that layer.
     std::vector<const ggml_tensor *> read;

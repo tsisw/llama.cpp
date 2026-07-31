@@ -27,6 +27,16 @@ TSI compiler, runs it, and hands the logits back to llama, which samples from th
 | `TSI_MLIR_SCRIPT` | `compile_graph_fpga.py`, if not next to this source tree |
 | `TSI_MLIR_DUMP_GRAPH` | `1` writes each intercepted graph's nodes to `<dir>/graph-<phase>.txt` |
 | `TSI_MLIR_WEIGHT_ARGS` | `1` passes weights as arguments instead of baking them in as constants (see below) |
+| `TSI_MLIR_CACHE_SUM` | `1` fingerprints the device KV cache and the logits after every decode step |
+
+**Do not read a rising per-token decode error as a regression.** Past the first few tokens the *reference*
+moves, not the compiled result: llama's CPU backend reduces in multi-threaded order, and its own KV cache
+accumulates that variation, so llama's logits differ run to run for identical inputs. Measured on
+SmolLM2-135M, the same command with a fixed `--seed` gives `rel_sq_err` of `3e-07` on some runs and `1e-02`
+on others, while the compiled side is bit-identical throughout. `TSI_MLIR_CACHE_SUM=1` is how to tell the
+two apart: it prints a fingerprint of the cache and the logits per step, and those are stable across runs
+even when the diff against llama is not. Compare fingerprints run to run to check the compiled path;
+compare against llama only for the first token, or on argmax agreement.
 | `TSI_MLIR_CTX_MB` | override the reconstruction context size (default: sized from weights seen) |
 | `TSI_DUMP_GGML_IR` | also dump the ggml dialect before lowering to linalg |
 | `USER_DRAM_SIZE` | simulated device DRAM budget; a 1.1B f32 model needs `16348` |

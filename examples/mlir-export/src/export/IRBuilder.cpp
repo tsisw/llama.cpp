@@ -43,8 +43,8 @@ Value GraphBuilder::valueOf(const ggml_tensor * t) const {
 
 // --- type mapping ---------------------------------------------------------------------------
 
-Type GraphBuilder::elementType(const ggml_tensor * t) const {
-    switch (t->type) {
+Type GraphBuilder::elementType(ggml_type t) const {
+    switch (t) {
         case GGML_TYPE_F32:  return b_.getF32Type();
         case GGML_TYPE_F16:  return b_.getF16Type();
         case GGML_TYPE_BF16: return b_.getBF16Type();
@@ -53,8 +53,12 @@ Type GraphBuilder::elementType(const ggml_tensor * t) const {
             // Quantized types are the notable absence. They are not element types at all: a q8_0
             // block interleaves scales with quants, so a tensor of them has no MLIR equivalent and
             // would need dequantization in the graph.
-            unsupported("unsupported tensor type: %s", ggml_type_name(t->type));
+            unsupported("unsupported tensor type: %s", ggml_type_name(t));
     }
+}
+
+Type GraphBuilder::elementType(const ggml_tensor * t) const {
+    return elementType(t->type);
 }
 
 llvm::SmallVector<int64_t> GraphBuilder::dims(const ggml_tensor * t) const {
@@ -190,7 +194,7 @@ MemRefType GraphBuilder::cacheType(const CacheSpec & spec) const {
                     (long long) (shape.size() > 1 ? shape[1] : 0), (long long) spec.cells);
     }
     // Memory space 1 is DRAM and is not optional: any other space is rejected downstream.
-    return MemRefType::get(shape, elementType(slice), MemRefLayoutAttrInterface{},
+    return MemRefType::get(shape, elementType(spec.elem_type), MemRefLayoutAttrInterface{},
                            b_.getI64IntegerAttr(1));
 }
 
@@ -242,8 +246,17 @@ Value GraphBuilder::cacheRead(Value cache, const CacheSpec & spec, int64_t il) {
     auto  mt  = cast<MemRefType>(sub.getType());
     auto  tt  = RankedTensorType::get(mt.getShape(), mt.getElementType());
     // restrict: nothing else aliases this view. Not writable: reads only, the append writes.
-    return bufferization::ToTensorOp::create(b_, loc_, tt, sub, /*restrict=*/true,
-                                             /*writable=*/false);
+    Value read = bufferization::ToTensorOp::create(b_, loc_, tt, sub, /*restrict=*/true,
+                                                   /*writable=*/false);
+
+    // The cache is stored in whatever type llama uses (f16), while the graph computes in f32, so widen
+    // here. cacheAppend narrows symmetrically. Keeping the conversion at the cache boundary is what
+    // lets the storage type change without touching the reconstruction or its CPU reference.
+    Type want = elementType(spec.read[il]);
+    if (mt.getElementType() != want) {
+        read = ps::castElements(b_, loc_, read, want);
+    }
+    return read;
 }
 
 void GraphBuilder::cacheAppend(Value cache, const CacheSpec & spec, int64_t il, Value slot,

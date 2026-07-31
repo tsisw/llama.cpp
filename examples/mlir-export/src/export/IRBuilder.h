@@ -41,6 +41,7 @@ class GraphBuilder {
     // MLIR shape is ggml's ne reversed over ggml_n_dims: ggml ne[0] is the innermost/fastest dim,
     // and MLIR's last dim is. This is the single place that reversal happens.
     mlir::Type                 elementType(const ggml_tensor * t) const;
+    mlir::Type                 elementType(ggml_type t) const;
     llvm::SmallVector<int64_t> dims(const ggml_tensor * t) const;
     llvm::SmallVector<int64_t> dimsRanked(const ggml_tensor * t, int rank) const;
     mlir::RankedTensorType     tensorType(const ggml_tensor * t) const;
