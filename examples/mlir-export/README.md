@@ -61,6 +61,9 @@ The prefill reconstruction is **from-scratch only**, and enforces it: it rebuild
 `0..n-1` and attends over the current tokens with no cache, so it checks the live graph's real
 positions and refuses anything else rather than emitting valid-looking MLIR for a different function.
 
+See [VERIFYING.md](VERIFYING.md) for how to check the compiled path against native llama.cpp: the three
+runs, what each one actually proves, and why the per-token decode error is not the thing to assert on.
+
 ## Architecture
 
 Two views of one `llama-cli` run with `TSI_MLIR_EXPORT=1`. Shaded bands mark where the work happens:
