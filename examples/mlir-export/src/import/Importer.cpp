@@ -110,7 +110,22 @@ OwningOpRef<ModuleOp> importGraph(MLIRContext & ctx, ggml_cgraph * gf, const Exp
     // exists only when there is a cache to append to.
     const size_t n_args   = opts.runtime_args.size();
     const size_t n_caches = opts.caches.size();
-    const bool   want_slot = n_caches > 0;
+
+    // `slot` exists only if something is actually appended. A read-only cache - llama owning the write
+    // while the graph returns the new K/V as results - needs no cell index, and emitting an unused
+    // index argument would put a dead parameter in the ABI every caller has to pass.
+    bool want_slot = false;
+    for (const CacheSpec & c : opts.caches) {
+        for (const ggml_tensor * a : c.append) {
+            if (a) {
+                want_slot = true;
+                break;
+            }
+        }
+        if (want_slot) {
+            break;
+        }
+    }
 
     SmallVector<Type> argTys;
     for (const ggml_tensor * t : opts.runtime_args) {

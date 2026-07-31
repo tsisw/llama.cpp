@@ -268,75 +268,39 @@ std::vector<float> g_decode_logits;
 int64_t            g_decode_nvoc = 0;
 
 // ---------------------------------------------------------------------------------------------
-// the KV cache in DRAM
+// llama's KV cache, aliased in place
 // ---------------------------------------------------------------------------------------------
 
-// Allocated once and reused by every decode step, never freed: surviving between calls is the entire
-// point, and a per-call DeviceArgs must not own them (see DeviceArgs::addCache).
-void * g_cache_k     = nullptr;
-void * g_cache_v     = nullptr;
-size_t g_cache_bytes = 0;
-
-// Allocate the device caches, replacing any previous pair.
-bool allocCaches(size_t bytes) {
-    if (g_cache_k) {
-        tsi_dealloc(g_cache_k);
-    }
-    if (g_cache_v) {
-        tsi_dealloc(g_cache_v);
-    }
-    g_cache_k     = tsi_alloc((int64_t) bytes);
-    g_cache_v     = tsi_alloc((int64_t) bytes);
-    g_cache_bytes = bytes;
-    if (!g_cache_k || !g_cache_v) {
-        fprintf(stderr, "[tsi-mlir] tsi_alloc failed for a %zu-byte KV cache. "
-                        "Raise USER_DRAM_SIZE (MiB).\n", bytes);
-        if (g_cache_k) {
-            tsi_dealloc(g_cache_k);
-        }
-        if (g_cache_v) {
-            tsi_dealloc(g_cache_v);
-        }
-        g_cache_k = g_cache_v = nullptr;
-        g_cache_bytes         = 0;
-        return false;
-    }
-    return true;
-}
-
-// Copy llama's KV cache into the device buffers, ONCE, when a decode session starts.
+// Collect llama's own per-layer cache buffers, in the order the exporter declared them:
+// cache_k_0..N-1 then cache_v_0..N-1.
 //
-// This is a straight memcpy of llama's own bytes: the device cache is stored in llama's cache type and
-// cells-first, which is exactly llama's layout (cell c of a layer at c * head_dim * n_head_kv), so no
-// conversion and no reshuffle. The first `cells` cells of llama's [per_cell, n_ctx] buffer are
-// contiguous, which is what makes one memcpy per layer correct.
-//
-// After this the cache is carried by the graph's own in-place appends. Re-seeding per token would
-// overwrite the device's correct result with a host copy, cost O(cells) transfer per token instead of
-// zero, and hide a broken append behind a fresh copy.
-bool seedCachesOnce(ggml_cgraph * live, const decode_case & r) {
-    const size_t per_cell_bytes = r.layer_bytes / (size_t) r.cells;
+// Nothing is allocated and nothing is copied. These are llama's tensors, which live in TSI DRAM
+// because of the buffer type in KvBuffer.cpp, and the compiled graph reads them where they are. That
+// is the whole point of the design: one cache, llama writes it, we read it, so every cache operation
+// llama performs keeps working because nothing else mutates it.
+bool collectCachePtrs(ggml_cgraph * live, const decode_case & r, std::vector<void *> & out) {
+    out.clear();
+    const size_t want = (size_t) r.cache_shape[1] * r.cache_shape[2] * r.cache_shape[3] *
+                        ggml_type_size(r.cache_type);
 
-    for (int64_t il = 0; il < r.cache_shape[0]; il++) {
-        ggml_tensor * kl = live_cache_leaf(live, "k", (int) il);
-        ggml_tensor * vl = live_cache_leaf(live, "v", (int) il);
-        if (!kl || !vl) {
-            fprintf(stderr, "[tsi-mlir] layer %lld has no llama cache buffer to seed from\n",
-                    (long long) il);
-            return false;
+    for (int kind = 0; kind < 2; kind++) {
+        const char * k = kind == 0 ? "k" : "v";
+        for (int il = 0; il < r.n_layers; il++) {
+            ggml_tensor * t = live_cache_leaf(live, k, il);
+            if (!t || !t->data) {
+                fprintf(stderr, "[tsi-mlir] cache_%s_l%d missing; cannot alias llama's cache\n", k, il);
+                return false;
+            }
+            // A size or type disagreement means the memref would address the wrong bytes of a real
+            // buffer, which is worse than reading a stale copy: it would corrupt llama's cache.
+            if (t->type != r.cache_type || (size_t) ggml_nbytes(t) != want) {
+                fprintf(stderr, "[tsi-mlir] cache_%s_l%d is %s %zu bytes, expected %s %zu\n", k, il,
+                        ggml_type_name(t->type), (size_t) ggml_nbytes(t),
+                        ggml_type_name(r.cache_type), want);
+                return false;
+            }
+            out.push_back(t->data);
         }
-        // llama's own buffer must be at least the window we attend over, and one cell must be the
-        // size we computed from the geometry. Either mismatch would seed plausible-looking garbage.
-        if (kl->type != r.cache_type || (size_t) kl->nb[1] != per_cell_bytes ||
-            kl->ne[1] < r.cells) {
-            fprintf(stderr, "[tsi-mlir] cache_k_l%lld: type %s, cell stride %zu, %lld cells; "
-                            "expected %s, %zu, >= %d\n",
-                    (long long) il, ggml_type_name(kl->type), (size_t) kl->nb[1],
-                    (long long) kl->ne[1], ggml_type_name(r.cache_type), per_cell_bytes, r.cells);
-            return false;
-        }
-        memcpy((char *) g_cache_k + (size_t) il * r.layer_bytes, kl->data, r.layer_bytes);
-        memcpy((char *) g_cache_v + (size_t) il * r.layer_bytes, vl->data, r.layer_bytes);
     }
     return true;
 }
@@ -366,8 +330,9 @@ int liveWindow(ggml_cgraph * live) {
 struct DecodeSession {
     decode_case     r;
     forward_argv_fn fwd       = nullptr;
-    DeviceArgs      args;
-    size_t          slot_argv = 0;
+    DeviceArgs          args;
+    std::vector<void *> cache_ptrs;    // llama's buffers, k layers then v layers
+    size_t              layer_bytes = 0;
     int64_t         nvoc      = 0;
     int             cells     = 0;   // the window this binary was compiled for
     int             steps     = 0;
@@ -415,20 +380,23 @@ DecodeSession * openDecodeSession(ggml_cgraph * live, const Config & cfg) {
     s->cells = s->r.cells;
 
     runtimeUp();
-    if (!allocCaches(s->r.cache_bytes) || !seedCachesOnce(live, s->r)) {
+    if (!collectCachePtrs(live, s->r, s->cache_ptrs)) {
         delete s;
         return nullptr;
     }
+    s->layer_bytes = (size_t) s->r.cache_shape[1] * s->r.cache_shape[2] * s->r.cache_shape[3] *
+                     ggml_type_size(s->r.cache_type);
 
     // argv order is the ciface order the exporter documents:
-    // [runtime_args..., cache_k, cache_v, slot, outputs...].
+    // [runtime_args..., cache memrefs..., outputs...]. No `slot`: nothing is appended, so the exporter
+    // emits no cell index at all.
     bool ok = true;
     for (const ggml_tensor * t : s->r.runtime_args) {
         ok = ok && s->args.addInput(t);
     }
-    ok = ok && s->args.addCache(g_cache_k, s->r.cache_shape);
-    ok = ok && s->args.addCache(g_cache_v, s->r.cache_shape);
-    s->slot_argv = s->args.addScalar(s->r.pos);
+    for (void * p : s->cache_ptrs) {
+        ok = ok && s->args.addCache(p, s->r.cache_shape);
+    }
     for (const ggml_tensor * t : s->r.outputs) {
         ok = ok && s->args.addOutput(t);
     }
@@ -437,10 +405,10 @@ DecodeSession * openDecodeSession(ggml_cgraph * live, const Config & cfg) {
         return nullptr;
     }
 
-    fprintf(stderr, "[tsi-mlir] decode session ready: %zu args + 2 caches + slot, %d-cell window, "
-                    "%.2f MiB %s cache each, seeded from llama once\n",
-            s->r.runtime_args.size(), s->cells,
-            (double) s->r.cache_bytes / (1024.0 * 1024.0), ggml_type_name(s->r.cache_type));
+    fprintf(stderr, "[tsi-mlir] decode session ready: %zu args + %zu cache memrefs, %d of %d cells, "
+                    "%s cache aliased in place (llama owns the write), %zu results\n",
+            s->r.runtime_args.size(), s->cache_ptrs.size(), s->cells, s->r.capacity,
+            ggml_type_name(s->r.cache_type), s->r.outputs.size());
     s->ok = true;
     return s;
 }
@@ -463,7 +431,6 @@ std::vector<float> runDecodeStep(DecodeSession & s, const Config & cfg, int64_t 
     for (size_t k = 0; k < 3; k++) {
         s.args.refreshInput(k, s.r.runtime_args[k]);
     }
-    s.args.setScalar(s.slot_argv, s.r.pos);
 
     // The CPU reference reads the f32 cache snapshot taken when the session opened, and nothing
     // updates it: the live cache now advances on the device. So it is only meaningful on the first
@@ -499,9 +466,11 @@ std::vector<float> runDecodeStep(DecodeSession & s, const Config & cfg, int64_t 
             }
             return h;
         };
-        fprintf(stderr, "[tsi-mlir] step %2d pos %3d  k=%016llx v=%016llx logits=%016llx\n",
-                s.steps - 1, s.r.pos, (unsigned long long) fnv(g_cache_k, g_cache_bytes),
-                (unsigned long long) fnv(g_cache_v, g_cache_bytes),
+        // Layer 0 only, so a step does not hash 90 MiB. Enough to catch a cache that moved.
+        fprintf(stderr, "[tsi-mlir] step %2d pos %3d  k0=%016llx v0=%016llx logits=%016llx\n",
+                s.steps - 1, s.r.pos,
+                (unsigned long long) fnv(s.cache_ptrs.front(), s.layer_bytes),
+                (unsigned long long) fnv(s.cache_ptrs[(size_t) s.r.n_layers], s.layer_bytes),
                 (unsigned long long) fnv(compiled.data(), compiled.size() * sizeof(float)));
     }
 

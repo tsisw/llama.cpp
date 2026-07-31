@@ -43,7 +43,12 @@ struct mlir_export_error : std::runtime_error {
 struct CacheSpec {
     std::string name;                            // becomes txe.name, e.g. "cache_k"
     int64_t     n_layers = 0;
-    int64_t     cells    = 0;                    // capacity L
+    int64_t     cells    = 0;                    // cells a step reads (llama's live n_kv window)
+
+    // Cell count of the memref itself. Defaults to `cells`; set larger when the buffer being aliased
+    // is bigger than the window a step attends over - llama's cache is allocated for the full n_ctx
+    // while a decode step only reads n_kv of it. The read is then a strided prefix of each layer.
+    int64_t     capacity = 0;
 
     // Storage type of the memref, independent of what the graph computes in.
     //

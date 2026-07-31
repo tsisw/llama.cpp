@@ -180,18 +180,27 @@ MemRefType GraphBuilder::cacheType(const CacheSpec & spec) const {
     }
     const ggml_tensor * slice = spec.read[0];
 
-    // [n_layers, cells, ...rest...]. Cells is the FIRST slice dim, not the last, because that is
+    // [n_layers, capacity, ...rest...]. Cells is the FIRST slice dim, not the last, because that is
     // llama's own layout: cell c of a layer starts at c * head_dim * n_head_kv, so one cell's values
     // are contiguous and cells are strided. A cells-last memref would be the transpose of llama's
     // cache, so it could never alias it and every read would need a shuffle.
+    const int64_t cap = spec.capacity > 0 ? spec.capacity : spec.cells;
+    if (spec.cells > cap) {
+        unsupported("cache '%s': reads %lld cells from a %lld-cell buffer", spec.name.c_str(),
+                    (long long) spec.cells, (long long) cap);
+    }
+
+    SmallVector<int64_t> sd = dims(slice);
+    if (sd.empty() || sd[0] != spec.cells) {
+        unsupported("cache '%s': slice's first dim %lld != cells %lld", spec.name.c_str(),
+                    (long long) (sd.empty() ? 0 : sd[0]), (long long) spec.cells);
+    }
+
     SmallVector<int64_t> shape;
     shape.push_back(spec.n_layers);
-    for (int64_t d : dims(slice)) {
-        shape.push_back(d);
-    }
-    if (shape.size() < 2 || shape[1] != spec.cells) {
-        unsupported("cache '%s': slice's first dim %lld != cells %lld", spec.name.c_str(),
-                    (long long) (shape.size() > 1 ? shape[1] : 0), (long long) spec.cells);
+    shape.push_back(cap);                   // the buffer's cell count, not the window's
+    for (size_t i = 1; i < sd.size(); i++) {
+        shape.push_back(sd[i]);
     }
     // Memory space 1 is DRAM and is not optional: any other space is rejected downstream.
     return MemRefType::get(shape, elementType(spec.elem_type), MemRefLayoutAttrInterface{},

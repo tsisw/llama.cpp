@@ -36,21 +36,25 @@ struct decode_case {
     // leave the graph with dangling weights, which only bites whoever computes it on CPU later.
     struct ggml_context * wc  = nullptr;
 
-    // [id, pos, mask]. The caches and the slot follow in the ciface argument order, but they are not
-    // ggml tensors, so they are described below instead.
+    // [id, pos, mask]. The cache memrefs follow in the ciface argument order, but they are not ggml
+    // tensors, so they are described below instead.
     std::vector<const ggml_tensor *> runtime_args;
-    // [logits]. K/V are no longer results: the graph appends them into the cache memrefs in place.
+    // [logits, k_new_0..N-1, v_new_0..N-1]. The new K/V come back as results and llama writes them
+    // into its own cache, so the graph never mutates the cache and llama stays its only writer.
     std::vector<const ggml_tensor *> outputs;
 
-    // The two DRAM caches, in argument order after runtime_args: cache_k then cache_v, then `slot`.
+    // One read-only memref per layer per kind, in argument order after runtime_args:
+    // cache_k_0..N-1 then cache_v_0..N-1. Each aliases llama's own cache_k_l<il>/cache_v_l<il>
+    // tensor, so there is a single cache and no per-token transfer of it in either direction.
     //
-    // Stored in llama's own cache type, so the device buffer is byte-compatible with llama's and can be
-    // seeded by a plain memcpy. The graph still computes in f32; the exporter widens on read and
-    // narrows on append.
+    // `cache_shape` is the shape of ONE of them, all being identical: [1, capacity, n_head_kv,
+    // head_dim] in MLIR order, matching llama's [n_embd_k_gqa, n_ctx, 1] reversed with the packed
+    // n_embd_k_gqa split back into heads. `capacity` is llama's full n_ctx while `cells` is the window
+    // a step reads, so the read is a strided prefix.
     ggml_type            cache_type  = GGML_TYPE_F16;
-    std::vector<int64_t> cache_shape;        // MLIR order: [n_layers, cells, n_head_kv, head_dim]
-    size_t               cache_bytes = 0;    // one cache, all layers
-    size_t               layer_bytes = 0;    // one layer's window, for seeding layer by layer
+    std::vector<int64_t> cache_shape;
+    int                  capacity    = 0;   // llama's n_ctx
+    int                  n_layers    = 0;
 
     std::string func_text;
     int         pos   = 0;   // position of the token being decoded; also the cache slot to append at
@@ -291,10 +295,18 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
         ggml_build_forward_expand(r.gf, vnew[il]);
     }
 
-    // Only the per-step inputs are arguments. The cache leafs become reads of the memref, and
-    // knew/vnew become appends into it, so neither appears in the signature.
+    // Only the per-step inputs are arguments; the cache leafs become reads of llama's own buffers. The
+    // new K/V are results, not appends: llama writes them into its cache with the same SET_ROWS it
+    // always used, which keeps it the single writer and leaves slot allocation, context shift, defrag
+    // and seq_rm working untouched.
     r.runtime_args = { id, pt, mask };
     r.outputs      = { logits };
+    for (int il = 0; il < M.n_layers; il++) {
+        r.outputs.push_back(knew[il]);
+    }
+    for (int il = 0; il < M.n_layers; il++) {
+        r.outputs.push_back(vnew[il]);
+    }
 
     // Weights as arguments instead of baked constants, when the constant pool would be too big to
     // land in one object file. See Config::weight_args. The cache leafs stay out of this: they are
@@ -310,54 +322,62 @@ static inline decode_case build_decode_from_live(struct ggml_cgraph * live,
         }
     }
 
-    // Store the cache in whatever type llama stores its own in, so seeding is a memcpy and a value we
-    // append rounds to the pattern llama would have written. Falls back to f32 if llama's cache is f32.
+    // The memrefs alias llama's own tensors, so they carry llama's element type. f32 is accepted too;
+    // anything else (a quantized cache) has no memref element type and cannot be read at all.
     ggml_tensor * k_leaf = live_cache_leaf(live, "k", 0);
-    r.cache_type         = k_leaf ? k_leaf->type : GGML_TYPE_F16;
+    if (!k_leaf) {
+        throw mlir_export_error("no cache_k_l0 buffer to alias");
+    }
+    r.cache_type = k_leaf->type;
     if (r.cache_type != GGML_TYPE_F16 && r.cache_type != GGML_TYPE_F32) {
         throw mlir_export_error(std::string("llama's KV cache is ") +
                                 ggml_type_name(r.cache_type) + ", which has no memref element type");
     }
 
-    // MLIR order, [n_layers, cells, n_head_kv, head_dim]: ggml's ne reversed, with the layer dim
-    // prepended. Must match GraphBuilder::cacheType or the descriptor strides address the wrong cell.
-    r.cache_shape = { M.n_layers, L, M.n_head_kv, M.head_dim };
-    r.layer_bytes = (size_t) L * M.n_head_kv * M.head_dim * ggml_type_size(r.cache_type);
-    r.cache_bytes = (size_t) M.n_layers * r.layer_bytes;
+    // One memref per layer per kind, each shaped like llama's own buffer rather than like the window:
+    // [1, n_ctx, n_head_kv, head_dim] in MLIR order. llama's tensor is [n_embd_k_gqa, n_ctx, n_stream],
+    // and reversing it gives [n_stream, n_ctx, n_embd_k_gqa] - the same bytes as this, since
+    // n_embd_k_gqa packs head_dim fastest then head. Must match GraphBuilder::cacheType or the
+    // descriptor strides address the wrong cell.
+    r.capacity = (int) k_leaf->ne[1];
+    r.n_layers = M.n_layers;
+    if (k_leaf->ne[2] != 1) {
+        throw mlir_export_error("llama's cache has n_stream " + std::to_string(k_leaf->ne[2]) +
+                                "; only a single stream is handled");
+    }
+    r.cache_shape = { 1, r.capacity, M.n_head_kv, M.head_dim };
 
     tsi::mlir_export::ExportOptions opts;
     opts.runtime_args = r.runtime_args;
     opts.outputs      = r.outputs;
 
-    // One CacheSpec per kind. `read` is the leaf the graph consumes, `append` the value computed for
-    // this step; the exporter substitutes a read of layer il for the former and stores the latter at
-    // `slot`. f32 throughout: the graph computes in f32 and the host seeds these buffers from its own
-    // f32 conversion, so there is nothing to narrow yet. Making the cache f16 to match llama bit for
-    // bit is a size/fidelity change that belongs with the prefill handoff, not here.
-    tsi::mlir_export::CacheSpec ks, vs;
-    ks.name      = "cache_k";
-    ks.n_layers  = M.n_layers;
-    ks.cells     = L;
-    ks.elem_type = r.cache_type;
-    ks.read.assign(cK.begin(), cK.end());
-    ks.append.assign(knew.begin(), knew.end());
-    vs.name      = "cache_v";
-    vs.n_layers  = M.n_layers;
-    vs.cells     = L;
-    vs.elem_type = r.cache_type;
-    vs.read.assign(cV.begin(), cV.end());
-    vs.append.assign(vnew.begin(), vnew.end());
-    opts.caches = { ks, vs };
+    // A CacheSpec per layer per kind, each read-only: `read` is the leaf the graph consumes and
+    // `append` stays empty, which is what keeps the graph a pure function and drops `slot` from the
+    // ABI. `capacity` is llama's whole buffer while `cells` is the window this step attends over, so
+    // the read is a strided prefix of the layer.
+    for (int kind = 0; kind < 2; kind++) {
+        const bool                         is_k = (kind == 0);
+        const std::vector<ggml_tensor *> & src  = is_k ? cK : cV;
+        for (int il = 0; il < M.n_layers; il++) {
+            tsi::mlir_export::CacheSpec c;
+            c.name      = std::string("cache_") + (is_k ? "k_" : "v_") + std::to_string(il);
+            c.n_layers  = 1;
+            c.cells     = L;
+            c.capacity  = r.capacity;
+            c.elem_type = r.cache_type;
+            c.read      = { src[il] };
+            opts.caches.push_back(c);
+        }
+    }
 
     // Bytecode: the weights are baked in as constants, and text would hex-print them at twice the size.
     opts.format = tsi::mlir_export::Format::Bytecode;
     r.func_text = tsi::mlir_export::exportGraph(r.gf, opts);
 
-    fprintf(stderr, "[tsi-mlir] decode rebuilt: pos %d, %d cells, %zu args + 2 caches + slot, "
-                    "%zu outputs, %.2f MiB cache each, %.2f MiB bytecode\n",
-            pos, L, r.runtime_args.size(), r.outputs.size(),
-            (double) r.cache_bytes / (1024.0 * 1024.0),
-            (double) r.func_text.size() / (1024.0 * 1024.0));
+    fprintf(stderr, "[tsi-mlir] decode rebuilt: pos %d, %d of %d cells, %zu args + %zu cache memrefs, "
+                    "%zu outputs, %s cache aliased in place, %.2f MiB bytecode\n",
+            pos, L, r.capacity, r.runtime_args.size(), opts.caches.size(), r.outputs.size(),
+            ggml_type_name(r.cache_type), (double) r.func_text.size() / (1024.0 * 1024.0));
 
     r.wc = M.wc;   // freed by the caller, together with r.ctx
     return r;
