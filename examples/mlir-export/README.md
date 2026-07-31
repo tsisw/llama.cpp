@@ -149,11 +149,17 @@ binary works at every position.
 
 Because the graph produces both the logits and the cache update, **llama's own forward pass is skipped
 entirely** for decode — `before_compute` returns true and `graph_compute` runs neither the scheduler nor
-an allocation (`process_ubatch` has already allocated, so every tensor has its buffer). Two exceptions,
-both deliberate: **prefill always computes**, because the weight snapshot is taken by the eval callback
-*during* that pass and without it there are no weights to build any graph from — decode included; and
-under `TSI_MLIR_VERIFY` llama computes throughout and the driver writes no cache cells at all, since
-llama cannot be an independent reference while reading values we produced.
+an allocation (`process_ubatch` has already allocated, so every tensor has its buffer). **Both phases
+are handled this way**, so with `TSI_MLIR_EXPORT=1` llama computes no forward pass at all: it allocates
+and maintains the cache, and the compiled graph produces every value in it.
+
+That required prefill to move into `before_compute` — its result has to exist before the skip decision
+is made — and the weights to come from the model's own persistent tensors rather than the eval
+callback's snapshot, which only exists if llama computes. If a weight has no readable data before
+compute the reconstruction throws, the hook returns false, and llama computes exactly as it used to.
+
+The one exception is `TSI_MLIR_VERIFY`, where llama computes throughout and the driver writes no cache
+cells, since llama cannot be an independent reference while reading values we produced.
 
 When llama's pass is skipped its `SET_ROWS` goes with it, so the driver writes the new K/V itself — at
 the cell **llama's allocator chose**, read from the `k_idxs` graph input, not at `pos`. The two agree

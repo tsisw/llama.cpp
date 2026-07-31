@@ -210,7 +210,9 @@ bool writeCacheCells(ggml_cgraph * live, DeviceArgs & args, int n_layers,
 
 // Rebuild, compile, run. Returns the compiled next-token logits, or empty on any failure, in which
 // case the caller leaves llama's own result in place.
-std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out) {
+std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & nvoc_out,
+                              bool & wrote_cache) {
+    wrote_cache = false;
     case_result r;
     try {
         r = build_cachefree_from_live(live, cfg.weight_args);
@@ -276,6 +278,7 @@ std::vector<float> runPrefill(ggml_cgraph * live, const Config & cfg, int64_t & 
             fprintf(stderr, "[tsi-mlir] prefill: got %zu cache cells for %lld tokens; leaving llama's "
                             "own cache values in place\n", cells.size(), (long long) ntok);
         } else if (writeCacheCells(live, args, (int) r.k_new.size(), cells)) {
+            wrote_cache = true;
             fprintf(stderr, "[tsi-mlir] prefill wrote %zu cells x %zu layers into llama's cache\n",
                     cells.size(), r.k_new.size());
         }
@@ -372,6 +375,11 @@ void reportDecodeCache(ggml_cgraph * live) {
 // overwrite them.
 std::vector<float> g_decode_logits;
 int64_t            g_decode_nvoc = 0;
+
+// Prefill's, produced in before_compute for the same reason decode's is: if llama's forward pass is to
+// be skipped, its result has to exist before the skip decision is made.
+std::vector<float> g_prefill_logits;
+int64_t            g_prefill_nvoc  = 0;
 
 // ---------------------------------------------------------------------------------------------
 // llama's KV cache, aliased in place
@@ -697,6 +705,19 @@ bool tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
     // back to llama - the compiled decode path was never actually exercised for a generation.
     bool handled = false;
 
+    // Prefill is built and run HERE, not after compute, so that llama's forward pass can be skipped
+    // like decode's. The weights come from the model's own persistent tensors rather than the eval
+    // callback's snapshot - the snapshot only exists if llama computes, which is precisely what is
+    // being removed. If a weight has no readable data before compute, the reconstruction throws, we
+    // return false, and llama computes exactly as it used to.
+    static bool did_prefill = false;
+    if (!is_warmup && !did_prefill && classify() == Phase::Prefill) {
+        did_prefill = true;
+        bool wrote  = false;
+        g_prefill_logits = runPrefill(cgraph, cfg, g_prefill_nvoc, wrote);
+        handled          = !g_prefill_logits.empty() && wrote && !cfg.verify;
+    }
+
     if (!is_warmup && classify() == Phase::Decode) {
         const int win = liveWindow(cgraph);
         const int pos = g_pos_cap.empty() ? -1 : g_pos_cap[0];
@@ -741,6 +762,16 @@ bool tsi_mlir_export_before_compute(struct ggml_cgraph * cgraph) {
             }
         }
     }
+    if (handled) {
+        // Worth stating once: from here on llama allocates and maintains the cache but computes no
+        // forward pass, and every K/V value in that cache came from the compiled graph.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[tsi-mlir] llama's forward pass is skipped from here; the compiled graph "
+                            "drives generation and authors the cache\n");
+        }
+    }
     return handled;
 }
 
@@ -762,29 +793,17 @@ bool tsi_mlir_export_after_compute(struct ggml_cgraph * live) {
         dumpGraph(live, cfg.dir + "/graph-" + phaseName(phase) + ".txt");
     }
 
-    // Prefill happens once. Decode repeats per token and every one of them is run compiled, in
-    // before_compute; this only writes the result back.
-    static bool did_prefill = false;
-
-    if (phase == Phase::Prefill) {
-        if (did_prefill) {
-            return false;
-        }
-        did_prefill = true;
-
-        int64_t            nvoc     = 0;
-        std::vector<float> compiled = runPrefill(live, cfg, nvoc);
-        if (compiled.empty()) {
-            return false;
-        }
-
+    // Both phases are computed in before_compute; this only writes the result back and, under
+    // TSI_MLIR_VERIFY, diffs it against llama's own.
+    if (phase == Phase::Prefill && !g_prefill_logits.empty()) {
         ggml_tensor * live_out = ggml_graph_node(live, -1);
-        const int64_t n        = ggml_nelements(live_out) < nvoc ? ggml_nelements(live_out) : nvoc;
+        const int64_t n        = ggml_nelements(live_out) < g_prefill_nvoc ? ggml_nelements(live_out)
+                                                                          : g_prefill_nvoc;
         if (cfg.verify) {
-            compare("compiled vs llama:", compiled.data(), (const float *) live_out->data, n);
+            compare("compiled vs llama:", g_prefill_logits.data(), (const float *) live_out->data, n);
         }
-        // The compiled logits are the result. llama samples from these and continues.
-        memcpy(live_out->data, compiled.data(), (size_t) n * sizeof(float));
+        memcpy(live_out->data, g_prefill_logits.data(), (size_t) n * sizeof(float));
+        g_prefill_logits.clear();
         return false;
     }
 
