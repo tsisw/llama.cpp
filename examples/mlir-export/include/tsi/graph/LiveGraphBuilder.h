@@ -73,9 +73,12 @@ struct case_result {
     std::vector<const ggml_tensor *>  runtime_args;   // subset of `leafs` that become %argN params
     std::string                       func_text;      // the complete MLIR module
 
-    // This graph's K/V for the current tokens, one per layer, [head_dim, n_head_kv, n_tokens].
-    // Not graph outputs: the cache is a memref the graph writes in place, so these are the values
-    // that get copied into it. Empty if the reconstruction did not ask for them.
+    // [logits, k_new_0..N-1, v_new_0..N-1], in the ciface result order.
+    std::vector<const ggml_tensor *>  outputs;
+
+    // This graph's K/V for the prompt, one per layer, [head_dim, n_head_kv, n_tokens]. Returned as
+    // results so the prompt's cells are authored by the compiled graph rather than by llama: the
+    // driver writes them into llama's cache at llama's own cell indices, exactly as decode does.
     std::vector<ggml_tensor *>        k_new;
     std::vector<ggml_tensor *>        v_new;
 };
@@ -348,13 +351,32 @@ static case_result build_cachefree_from_live(struct ggml_cgraph * live, bool wei
         }
     }
 
+    // Return the prompt's K/V alongside the logits, so the compiled graph - not llama - is what
+    // authors the cache for cells 0..n_tokens-1. Without this the prompt's cells came from llama's own
+    // f16 FLASH_ATTN pass while every decode cell came from the reconstruction, leaving one buffer with
+    // two different authors.
+    //
+    // Prefill reads nothing from the cache: it starts at position 0, so there is no prior context and
+    // no cache argument is needed. It only writes.
+    r.outputs = { logits };
+    for (int il = 0; il < N_LAYERS; il++) {
+        ggml_build_forward_expand(r.gf, r.k_new[il]);
+        r.outputs.push_back(r.k_new[il]);
+    }
+    for (int il = 0; il < N_LAYERS; il++) {
+        ggml_build_forward_expand(r.gf, r.v_new[il]);
+        r.outputs.push_back(r.v_new[il]);
+    }
+
     tsi::mlir_export::ExportOptions opts;
     opts.runtime_args = r.runtime_args;
+    opts.outputs      = r.outputs;
     // Bytecode: the constants are the model, and text prints them as hex at twice the size.
     opts.format = tsi::mlir_export::Format::Bytecode;
     r.func_text = tsi::mlir_export::exportGraph(r.gf, opts);
-    fprintf(stderr, "[tsi-mlir] %zu leafs -> %zu args + %zu baked constants, %.2f MiB bytecode\n",
+    fprintf(stderr, "[tsi-mlir] %zu leafs -> %zu args + %zu baked constants, %zu results, "
+                    "%.2f MiB bytecode\n",
             r.leafs.size(), r.runtime_args.size(), r.leafs.size() - r.runtime_args.size(),
-            (double) r.func_text.size() / (1024.0 * 1024.0));
+            r.outputs.size(), (double) r.func_text.size() / (1024.0 * 1024.0));
     return r;
 }

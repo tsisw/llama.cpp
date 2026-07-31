@@ -132,7 +132,13 @@ graph reads it in place.
 | cache storage | llama, allocated from TSI shared DRAM (`tsi_mlir_kv_buffer_type`, swapped in at `llama-kv-cache.cpp`) |
 | slot allocation, context shift, defrag, `seq_rm` | llama, unchanged — it mutates the same bytes we read |
 | the forward pass | the compiled MLIR graph |
-| writing the new K/V | llama's `SET_ROWS` normally; the driver when llama's pass is skipped |
+| the K/V *values*, prompt and tokens alike | the compiled MLIR graph, written by the driver at llama's cell indices |
+
+Both phases produce their own K/V. Prefill returns logits plus per-layer `k_new`/`v_new` for the whole
+prompt and the driver writes cells `0..n_tokens-1`; decode does the same for one cell per token. So the
+cache has a single author — the compiled graph — rather than llama's f16 FLASH_ATTN pass owning the
+prompt and the reconstruction owning everything after it. Prefill reads nothing from the cache (it
+starts at position 0, so there is no prior context); it only writes.
 
 The decode graph takes one **read-only** memref per layer per kind, each aliasing llama's own
 `cache_k_l<il>`/`cache_v_l<il>`, and returns logits plus per-layer `k_new`/`v_new`. So no cache is ever
@@ -144,9 +150,10 @@ binary works at every position.
 Because the graph produces both the logits and the cache update, **llama's own forward pass is skipped
 entirely** for decode — `before_compute` returns true and `graph_compute` runs neither the scheduler nor
 an allocation (`process_ubatch` has already allocated, so every tensor has its buffer). Two exceptions,
-both deliberate: prefill always computes, because it captures the weights the reconstruction needs and
-fills the cells decode reads; and under `TSI_MLIR_VERIFY` llama computes throughout, since it cannot be
-the reference otherwise.
+both deliberate: **prefill always computes**, because the weight snapshot is taken by the eval callback
+*during* that pass and without it there are no weights to build any graph from — decode included; and
+under `TSI_MLIR_VERIFY` llama computes throughout and the driver writes no cache cells at all, since
+llama cannot be an independent reference while reading values we produced.
 
 When llama's pass is skipped its `SET_ROWS` goes with it, so the driver writes the new K/V itself — at
 the cell **llama's allocator chose**, read from the `k_idxs` graph input, not at `pos`. The two agree
