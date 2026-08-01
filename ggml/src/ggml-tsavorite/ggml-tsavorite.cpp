@@ -6072,7 +6072,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         memset(scalar_grid2, 0, sizeof(MemRefDescriptor<Rank>));
                         memset(scalar_grid3, 0, sizeof(MemRefDescriptor<Rank>));
 
-                        //scalar_loop->shape[0] = 1;
                         scalar_loop->shape[0] = (int32_t)srcP0->shape[0] +1;
                         scalar_loop->data = scalar_loop->base = (void *)(scalar_loop+1);
                         scalar_loop->offset = 0;
