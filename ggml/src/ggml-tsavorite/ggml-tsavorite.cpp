@@ -106,6 +106,9 @@ struct TsavoriteRuntimeState {
     BlobDescriptor **blobDescriptor_add = nullptr;
     BlobDescriptor **blobDescriptor_mult = nullptr;
     BlobDescriptor **blobDescriptor_rms_norm = nullptr;
+#if TRITON_ADD
+    BlobDescriptor **blobDescriptor_triton_add = nullptr;
+#endif
 #if TRITON_MAT_MUL
     BlobDescriptor **blobDescriptor_matmul = nullptr;
 #endif
@@ -114,6 +117,9 @@ struct TsavoriteRuntimeState {
     void **loadResult_add = nullptr;
     void **loadResult_mult = nullptr;
     void **loadResult_rms_norm = nullptr;
+#if TRITON_ADD
+    void **loadResult_triton_add = nullptr;
+#endif
 #if TRITON_MAT_MUL
     void **loadResult_matmul = nullptr;
     bool advanced_matmul_shape_offload = false;
@@ -157,6 +163,9 @@ auto &device_cv = g_rt.device_cv;
 auto &blobDescriptor_add      = g_rt.blobDescriptor_add;
 auto &blobDescriptor_mult     = g_rt.blobDescriptor_mult;
 auto &blobDescriptor_rms_norm = g_rt.blobDescriptor_rms_norm;
+#if TRITON_ADD
+auto &blobDescriptor_triton_add = g_rt.blobDescriptor_triton_add;
+#endif
 #if TRITON_MAT_MUL
 auto &blobDescriptor_matmul   = g_rt.blobDescriptor_matmul;
 #endif
@@ -165,6 +174,9 @@ auto &blobDescriptor_matmul   = g_rt.blobDescriptor_matmul;
 auto &loadResult_add          = g_rt.loadResult_add;
 auto &loadResult_mult         = g_rt.loadResult_mult;
 auto &loadResult_rms_norm     = g_rt.loadResult_rms_norm;
+#if TRITON_ADD
+auto &loadResult_triton_add = g_rt.loadResult_triton_add;
+#endif
 #if TRITON_MAT_MUL
 auto &loadResult_matmul       = g_rt.loadResult_matmul;
 auto &advanced_matmul_shape_offload = g_rt.advanced_matmul_shape_offload;
@@ -1165,6 +1177,17 @@ static inline void tsi_blob_unload_only() {
             }
         }
     }
+#if TRITON_ADD
+    if (blobDescriptor_triton_add) {
+        for (uint32_t i = 0; i < TSI_RUN_TIME_INSTANCE; ++i) {
+            if (blobDescriptor_triton_add[i]) {
+                tsi_unload_blob(blobDescriptor_triton_add[i]);
+                blobDescriptor_triton_add[i] = nullptr;
+            }
+        }
+    }
+#endif
+
     if (blobDescriptor_mult) {
         for (uint32_t i = 0; i < TSI_RUN_TIME_INSTANCE; ++i) {
             if (blobDescriptor_mult[i]) {
@@ -1181,6 +1204,11 @@ static inline void tsi_blob_unload_only() {
             }
         }
     }
+#if TRITON_ADD
+    if (loadResult_triton_add) {
+        memset(loadResult_triton_add, 0, TSI_RUN_TIME_INSTANCE * sizeof(void *));
+    }
+#endif
 #if TRITON_MAT_MUL
     if (blobDescriptor_matmul) {
         for (uint32_t i = 0; i < TSI_RUN_TIME_INSTANCE; ++i) {
@@ -1219,6 +1247,9 @@ static inline void tsi_blob_ensure_tables_allocated() {
     loadResult_add      = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
     loadResult_mult     = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
     loadResult_rms_norm = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
+#if TRITON_ADD
+    loadResult_triton_add = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
+#endif
 #if TRITON_MAT_MUL
     loadResult_matmul   = (void **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(void *));
 #endif
@@ -1226,6 +1257,14 @@ static inline void tsi_blob_ensure_tables_allocated() {
     blobDescriptor_add      = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
     blobDescriptor_mult     = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
     blobDescriptor_rms_norm = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
+#if TRITON_ADD
+    blobDescriptor_triton_add = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
+    if (!loadResult_triton_add || !blobDescriptor_triton_add) {
+        tsi_blob_free_tables();
+        fprintf(stderr, "Failed to allocate Triton ADD blob tables\n");
+        abort();
+    }
+#endif
 #if TRITON_MAT_MUL
     blobDescriptor_matmul   = (BlobDescriptor **)calloc(TSI_RUN_TIME_INSTANCE, sizeof(BlobDescriptor *));
 #endif
@@ -1271,6 +1310,9 @@ static void tsi_load_all_blobs() {
 #if TRITON_MAT_MUL
         char name_matmul[64];
 #endif
+#if TRITON_ADD
+        char name_triton_add[64];
+#endif
 
 
 #ifdef GGML_TARGET_POSIX
@@ -1280,12 +1322,18 @@ static void tsi_load_all_blobs() {
 #if TRITON_MAT_MUL
         snprintf(name_matmul, sizeof(name_matmul), "txe_blob_0");
 #endif
+#if TRITON_ADD
+        snprintf(name_triton_add, sizeof(name_triton_add), "txe_blob_0");
+#endif
 #else
         snprintf(name_add,  sizeof(name_add),  "txe_add_dev%u",  i);
         snprintf(name_mult, sizeof(name_mult), "txe_mult_dev%u", i);
         snprintf(name_rms,  sizeof(name_rms),  "txe_rms_norm_dev%u", i);
 #if TRITON_MAT_MUL
         snprintf(name_matmul, sizeof(name_matmul), "txe_triton_mat_mul_dev%u", i);
+#endif
+#if TRITON_ADD
+        snprintf(name_triton_add, sizeof(name_triton_add), "txe_blob_0");
 #endif
 #endif
         failed_txe = i;
@@ -1353,6 +1401,24 @@ static void tsi_load_all_blobs() {
 
         blobDescriptor_matmul[i] =
             static_cast<BlobDescriptor *>(loadResult_matmul[i]);
+    #endif
+#if TRITON_ADD
+        // Triton ADD
+        loadResult_triton_add[i] = tsi_load_blob(
+            i,
+            name_triton_add,
+            blob_prefix(
+                TSAVORITE_BLOB_BUILD_ROOT "/txe_triton_add/blobs/txe_blob_0"
+            ).c_str()
+        );
+
+        if (!loadResult_triton_add[i]) {
+            strcpy(blob_name, name_triton_add);
+            goto error;
+        }
+
+        blobDescriptor_triton_add[i] =
+            static_cast<BlobDescriptor *>(loadResult_triton_add[i]);
     #endif
     }
 
@@ -3549,6 +3615,42 @@ extern "C" void _mlir_ciface_matmul_kernel_device_wrapper(
 // -----------------------------------------------------------------------------
 
 
+
+// Triton ADD direct blob pack helper.
+// Direct blob ABI packs only kernel args plus program_id.
+// Generated-wrapper grid args are not packed here.
+static inline void tsi_pack_triton_add_arg(
+    int64_t *p,
+    int &idx,
+    MemRefDescriptor<Rank_Triton> *d,
+    const char *name) {
+    if (!p || !d || !d->data) {
+        fprintf(stderr,
+                "ERROR: Triton ADD arg %s NULL p/desc/data p=%p desc=%p data=%p\n",
+                name,
+                (void *)p,
+                (void *)d,
+                d ? d->data : nullptr);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    p[idx++] = tsi_shmem_handle_from_ptr(d->data);
+    p[idx++] = (int64_t)d->shape[0];
+
+#if TRITON_DEBUG
+    fprintf(stderr,
+            "TRITON_ADD_PACK_ARG: %s data=%p handle=%ld shape0=%ld offset=%ld stride0=%ld\n",
+            name,
+            d->data,
+            (long)p[idx - 2],
+            (long)d->shape[0],
+            (long)d->offset,
+            (long)d->strides[0]);
+#endif
+}
+
 static inline void tsi_pack_triton_matmul_arg(
     int64_t *p,
     int &idx,
@@ -3591,6 +3693,215 @@ static inline void tsi_pack_triton_matmul_arg(
 // Note:
 //   Current implementation supports F32 only. BF16/F16 and mixed-precision
 //   are not supported in ggml-tsavorite.cpp.
+
+
+// Triton ADD manual direct-blob path.
+//
+// Host-wrapper path uses:
+//   A, B, C, n_elements, grid_x, grid_y, grid_z, max_txes
+//
+// Direct blob path packs only:
+//   A, B, C, n_elements, program_id
+//
+// Each packed arg is:
+//   handle, shape0
+//
+// Total:
+//   5 args * 2 int64 = 10 int64 = 80 bytes
+static void *_mlir_ciface_add_kernel_device_wrapper_triton_manual_internal(
+    void *A_desc_v,
+    void *B_desc_v,
+    void *C_desc_v,
+    void *n_elements_desc_v,
+    void *program_id_desc_v,
+    int32_t program_id,
+    TSI_DeviceIdType deviceId) {
+
+    constexpr int64_t kPackedArgsI64   = 10;
+    constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * (int64_t)sizeof(int64_t);
+
+    std::lock_guard<std::mutex> lock(tsi_pack_mutex);
+
+    if ((uint32_t)deviceId >= num_of_txes) {
+        fprintf(stderr,
+                "ERROR: Triton ADD deviceId=%d out of range num_of_txes=%u\n",
+                (int)deviceId,
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    if (packed_args.size() != num_of_txes || !packed_args[deviceId]) {
+        fprintf(stderr,
+                "ERROR: Triton ADD packed_args not initialized deviceId=%d size=%zu num_of_txes=%u\n",
+                (int)deviceId,
+                packed_args.size(),
+                (unsigned)num_of_txes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    auto *A_desc = (MemRefDescriptor<Rank_Triton> *)A_desc_v;
+    auto *B_desc = (MemRefDescriptor<Rank_Triton> *)B_desc_v;
+    auto *C_desc = (MemRefDescriptor<Rank_Triton> *)C_desc_v;
+    auto *n_elements_desc = (MemRefDescriptor<Rank_Triton> *)n_elements_desc_v;
+    auto *program_id_desc = (MemRefDescriptor<Rank_Triton> *)program_id_desc_v;
+
+    if (!program_id_desc || !program_id_desc->data) {
+        fprintf(stderr, "ERROR: Triton ADD program_id descriptor/data is NULL\n");
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    int64_t *p = static_cast<int64_t *>(packed_args[deviceId]);
+    memset(p, 0, (size_t)kPackedArgsBytes);
+
+    A_desc->offset = 0;
+    B_desc->offset = 0;
+    C_desc->offset = 0;
+    n_elements_desc->offset = 0;
+    program_id_desc->offset = 0;
+    program_id_desc->shape[0] = (int64_t)program_id + 1;
+    program_id_desc->strides[0] = 1;
+    *((int32_t *)program_id_desc->data) = program_id;
+
+    int idx = 0;
+
+    tsi_pack_triton_add_arg(p, idx, A_desc, "A");
+    tsi_pack_triton_add_arg(p, idx, B_desc, "B");
+    tsi_pack_triton_add_arg(p, idx, C_desc, "C");
+    tsi_pack_triton_add_arg(p, idx, n_elements_desc, "n_elements");
+    tsi_pack_triton_add_arg(p, idx, program_id_desc, "program_id");
+
+    if (idx != kPackedArgsI64) {
+        fprintf(stderr,
+                "ERROR: Triton ADD packed idx=%d expected=%ld\n",
+                idx,
+                (long)kPackedArgsI64);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    void *commandList = tsi_create_command_list(deviceId);
+    if (!commandList) {
+        fprintf(stderr,
+                "ERROR: tsi_create_command_list failed for Triton ADD device=%d\n",
+                (int)deviceId);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    const int64_t packedHandle =
+        tsi_shmem_handle_from_ptr(packed_args[deviceId]);
+
+    if (!blobDescriptor_triton_add || !blobDescriptor_triton_add[0]) {
+        fprintf(stderr, "ERROR: Triton ADD blob descriptor is not loaded\n");
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    void *blobExecuteCmd = tsi_launch_blob(
+        blobDescriptor_triton_add[0],
+        packedHandle,
+        kPackedArgsBytes);
+
+    if (!blobExecuteCmd) {
+        fprintf(stderr,
+                "ERROR: tsi_launch_blob failed for Triton ADD device=%d blob_desc=%p packedHandle=%ld bytes=%ld\n",
+                (int)deviceId,
+                (void *)blobDescriptor_triton_add[0],
+                (long)packedHandle,
+                (long)kPackedArgsBytes);
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    tsi_add_command_to_list(commandList, blobExecuteCmd);
+    return commandList;
+}
+
+
+static void _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(
+    void *A_desc_v,
+    void *B_desc_v,
+    void *C_desc_v,
+    void *n_elements_desc_v,
+    void *grid1_desc_v,
+    void *grid2_desc_v,
+    void *grid3_desc_v,
+    void *max_txes_desc_v) {
+
+    tsi_init_per_txe_state_once();
+
+    if (!multi_thread_enable) {
+        _mlir_ciface_add_kernel_device_wrapper(
+            A_desc_v,
+            B_desc_v,
+            C_desc_v,
+            n_elements_desc_v,
+            grid1_desc_v,
+            grid2_desc_v,
+            grid3_desc_v,
+            max_txes_desc_v);
+        return;
+    }
+
+    static MemRefDescriptor<Rank_Triton> *triton_add_program_id_desc = nullptr;
+    static int32_t *triton_add_program_id_payload = nullptr;
+
+    if (!triton_add_program_id_desc || !triton_add_program_id_payload) {
+        triton_add_program_id_desc = (MemRefDescriptor<Rank_Triton> *)tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        triton_add_program_id_payload = (int32_t *)tsi_alloc(TRITON_MATMUL_ALIGNMENT_BYTES);
+        TSAVORITE_GGML_ASSERT(triton_add_program_id_desc);
+        TSAVORITE_GGML_ASSERT(triton_add_program_id_payload);
+    }
+
+    memset(triton_add_program_id_desc, 0, sizeof(MemRefDescriptor<Rank_Triton>));
+    triton_add_program_id_desc->base = triton_add_program_id_payload;
+    triton_add_program_id_desc->data = triton_add_program_id_payload;
+    triton_add_program_id_desc->offset = 0;
+    triton_add_program_id_desc->shape[0] = 1;
+    triton_add_program_id_desc->strides[0] = 1;
+    *triton_add_program_id_payload = 0;
+
+    int deviceId = acquire_device_blocking();
+
+    void *commandList =
+        _mlir_ciface_add_kernel_device_wrapper_triton_manual_internal(
+            A_desc_v,
+            B_desc_v,
+            C_desc_v,
+            n_elements_desc_v,
+            triton_add_program_id_desc,
+            0,
+            deviceId);
+
+    if (!commandList) {
+        fprintf(stderr,
+                "Command List Empty for Triton ADD on device %d\n",
+                deviceId);
+        fflush(stderr);
+        release_device(deviceId);
+        tsi_cleanup();
+        abort();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex);
+        workers.emplace_back([=]() {
+            tsi_blob_execution_internal(commandList);
+            release_device(deviceId);
+        });
+    }
+}
+
 
 static void *_mlir_ciface_matmul_kernel_device_wrapper_triton_manual_internal(
     void *A_desc_v,
@@ -5750,7 +6061,8 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         memset(scalar_grid2, 0, sizeof(MemRefDescriptor<Rank>));
                         memset(scalar_grid3, 0, sizeof(MemRefDescriptor<Rank>));
 
-                        scalar_loop->shape[0] = 1;
+                        //scalar_loop->shape[0] = 1;
+                        scalar_loop->shape[0] = (int32_t)srcP0->shape[0] +1;
                         scalar_loop->data = scalar_loop->base = (void *)(scalar_loop+1);
                         scalar_loop->offset = 0;
 
@@ -5791,8 +6103,8 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
                         init_scalar_i32_memref_aligned(scalar_max_txes, scalar_max_txes_payload, (int32_t)num_of_txes);
 
-                        _mlir_ciface_add_kernel_device_wrapper(srcP0, srcP1, nodeP,
-                                        scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
+                        _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(srcP0, srcP1, nodeP,
+                                scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
                     } else {
 #endif /* TRITON_ADD */
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
