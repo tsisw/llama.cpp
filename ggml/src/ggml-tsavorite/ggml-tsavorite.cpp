@@ -1163,6 +1163,17 @@ static inline void tsi_blob_free_tables() {
     }
 #endif
 
+#if TRITON_ADD
+    if (loadResult_triton_add) {
+        free(loadResult_triton_add);
+        loadResult_triton_add = nullptr;
+    }
+    if (blobDescriptor_triton_add) {
+        free(blobDescriptor_triton_add);
+        blobDescriptor_triton_add = nullptr;
+    }
+#endif
+
     g_rt.blob_tables_txes = 0;
     g_rt.blob_state = TsavoriteRuntimeState::BLOB_UNINITIALIZED;
 }
