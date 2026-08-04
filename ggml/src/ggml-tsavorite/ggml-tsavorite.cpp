@@ -4758,8 +4758,6 @@ static inline triton_matmul_dispatch_profile_t call_triton_matmul_full_packed_on
 
     TSAVORITE_GGML_ASSERT(deviceId >= 0);
     TSAVORITE_GGML_ASSERT((uint32_t)deviceId < num_of_txes);
-    TSAVORITE_GGML_ASSERT((M_pad % TRITON_MATMUL_1X8_M_DIM) == 0);
-    TSAVORITE_GGML_ASSERT((N_pad % TRITON_MATMUL_1X8_N_DIM) == 0);
     TSAVORITE_GGML_ASSERT((K % TRITON_MATMUL_F32_K_DIM) == 0);
 
     triton_matmul_desc_set_t *s = ensure_triton_desc_for_device(deviceId);
@@ -4956,8 +4954,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     //   future 2x4 path, then call the same transpose heuristic with that shape.
     // ============================================================
     if (!multi_thread_enable || num_of_txes <= 1) {
+        const triton_matmul_txe_shape_t &transpose_decision_shape =
+            triton_matmul_select_shape(M, N);
         const bool use_small_n_transpose =
-            triton_matmul_should_use_small_n_transpose(TRITON_MATMUL_SHAPE_1X8, M, N, K);
+            triton_matmul_should_use_small_n_transpose(transpose_decision_shape, M, N, K);
 
         const int64_t M_work = use_small_n_transpose ? N : M;
         const int64_t N_work = use_small_n_transpose ? M : N;
