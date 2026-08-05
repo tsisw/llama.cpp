@@ -1196,7 +1196,8 @@ tsi_kernels=(
 
 triton_kernels=(
   "triton_add"
-  "triton_mat_mul"
+  "triton_mat_mul_1x8"
+  "triton_mat_mul_2x4"
 )
 
 for kernel in "${tsi_kernels[@]}"; do
