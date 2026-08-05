@@ -3083,8 +3083,6 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
      * Current 1x8 Triton shape padding.
      */
     const int64_t M_pad = ((M + 7)  / 8)  * 8;
-    const int64_t N_pad_legacy_unused = ((N + 63) / 64) * 64;
-    (void)N_pad_legacy_unused;
 
     const int64_t elems_A = M_pad * K;
     const int64_t N_pad = ((N + 63) / 64) * 64;
@@ -4903,8 +4901,6 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
     const int64_t D2 = node->ne[2];
     const int64_t D3 = node->ne[3];
-    const int64_t N_pad_legacy_unused = ((N + 63) / 64) * 64;
-    (void)N_pad_legacy_unused;
 
 #if TRITON_DEBUG
     triton_matmul_log_offloaded_shape_once(A, B, node);
