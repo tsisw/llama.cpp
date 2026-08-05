@@ -7400,25 +7400,36 @@ void ggml_perf_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct 
 
         if (op >= GGML_OP_COUNT) continue;
 
+        const int64_t node_perf_time_us = node->perf_time_us;
+        const int64_t node_perf_runs = node->perf_runs;
+        const int64_t node_tsi_kernel_runs = node->tsi_kernel_runs;
+
+        if (node_perf_runs == 0 && node_perf_time_us == 0 && node_tsi_kernel_runs == 0) {
+            continue;
+        }
+
         totals[op].op_name = ggml_op_name(op);
-        totals[op].total_us += node->perf_time_us;
-        totals[op].runs     += node->perf_runs;
+        totals[op].total_us += node_perf_time_us;
+        totals[op].runs     += node_perf_runs;
         totals[op].op_count++;
 
 	// Count backend runs
         enum ggml_compute_backend_type be = node->ggml_compute_backend;
         if (be >= GGML_COMPUTE_BACKEND_CPU && be < GGML_COMPUTE_BACKEND_COUNT) {
-            totals[op].backend_subtotals[be].total_us += node->perf_time_us;
-	    totals[op].backend_subtotals[be].runs     += node->perf_runs;
-	    totals[op].backend_subtotals[be].tsi_kernel_count   += node->tsi_kernel_runs;
+            totals[op].backend_subtotals[be].total_us += node_perf_time_us;
+	    totals[op].backend_subtotals[be].runs     += node_perf_runs;
+	    totals[op].backend_subtotals[be].tsi_kernel_count   += node_tsi_kernel_runs;
         }
 
         if (op == GGML_OP_UNARY) {
             enum ggml_unary_op subop = ggml_get_unary_op(node);
-            totals[op].unary_subtotals[subop].total_us += node->perf_time_us;
-            totals[op].unary_subtotals[subop].runs     += node->perf_runs;
-            totals[op].unary_subtotals[subop].tsi_kernel_count   += node->tsi_kernel_runs;
+            totals[op].unary_subtotals[subop].total_us += node_perf_time_us;
+            totals[op].unary_subtotals[subop].runs     += node_perf_runs;
+            totals[op].unary_subtotals[subop].tsi_kernel_count   += node_tsi_kernel_runs;
         }
+        node->perf_time_us = 0;
+        node->perf_runs = 0;
+        node->tsi_kernel_runs = 0;
     }
 }
 #endif /* GML_PERF-related flags */
@@ -7437,7 +7448,6 @@ FILE * ggml_perf_log_open(const char *filename) {
 
     return fp;
 }
-
 
 void ggml_perf_write_detailed_csv(struct ggml_cgraph * cgraph, FILE *fp) {
     if (!fp || !cgraph) return;
@@ -7738,8 +7748,5 @@ void ggml_perf_write_detailed_csv(struct ggml_cgraph * cgraph, FILE *fp) {
 
     free(aggs);
 }
-
-
-
 
 #endif /* GGML_PERF_DETAIL */
