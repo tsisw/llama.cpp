@@ -2925,6 +2925,209 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
   return true;
 }
 
+/*
+ * Return true if a tensor type can be converted to F32 during MAT_MUL packing.
+ *
+ * F32/F16/BF16 have explicit fast paths. Quantized / packed GGML types
+ * such as Q8_0, Q5_0, Q4_0, etc. are supported only when GGML provides
+ * a type-traits to_float() converter for that type. The Triton MAT_MUL
+ * kernel still consumes packed F32 buffers.
+ * GGML maintains a type-traits table for each ggml_type. For quantized types
+ * such as Q8_0, Q5_0, Q4_0, and others, that table may provide a to_float() function.
+ * This function knows how to dequantize the compressed block format into standard F32 values.
+ * As a result, our code does not need separate conversion logic for every quantized format.
+ * Instead, it queries GGML for the appropriate converter and uses it when available.
+ */
+static inline bool tsavorite_tensor_type_can_pack_to_f32(enum ggml_type type) {
+    if (type == GGML_TYPE_F32 ||
+        type == GGML_TYPE_F16 ||
+        type == GGML_TYPE_BF16) {
+        return true;
+    }
+
+    const struct ggml_type_traits *traits = ggml_get_type_traits(type);
+    return traits && traits->to_float;
+}
+
+static inline int64_t tsavorite_tensor_nb0_or_type_size(const struct ggml_tensor *t) {
+    if (!t) {
+        return 0;
+    }
+
+    if (t->nb[0] != 0) {
+        return (int64_t)t->nb[0];
+    }
+
+    return (int64_t)ggml_type_size(t->type);
+}
+
+static inline bool tsavorite_tensor_type_can_pack_to_f32_k(
+    enum ggml_type type,
+    int64_t K,
+    int64_t nb0) {
+    if (K <= 0 || nb0 <= 0) {
+        return false;
+    }
+
+    if (type == GGML_TYPE_F32 ||
+        type == GGML_TYPE_F16 ||
+        type == GGML_TYPE_BF16) {
+        return true;
+    }
+
+    const struct ggml_type_traits *traits = ggml_get_type_traits(type);
+    if (!traits || !traits->to_float) {
+        return false;
+    }
+
+    const int64_t bs = (int64_t)ggml_blck_size(type);
+    if (bs <= 0 || (K % bs) != 0) {
+        return false;
+    }
+
+    const int64_t expected_nb0 = (int64_t)ggml_type_size(type);
+    return nb0 == expected_nb0;
+}
+
+static inline void tsavorite_tensor_copy_k_to_f32(
+    const struct ggml_tensor *t,
+    const char *base,
+    float *dst,
+    int64_t K,
+    int64_t nb0) {
+    if (!t || !base || !dst || K <= 0) {
+        fprintf(stderr, "ERROR: invalid args in tsavorite_tensor_copy_k_to_f32\n");
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    if (t->type == GGML_TYPE_F32) {
+        if (nb0 == (int64_t)sizeof(float)) {
+            memcpy(dst, base, (size_t)K * sizeof(float));
+        } else {
+            for (int64_t k = 0; k < K; ++k) {
+                dst[k] = *(const float *)(base + k * nb0);
+            }
+        }
+        return;
+    }
+
+    if (t->type == GGML_TYPE_F16) {
+        for (int64_t k = 0; k < K; ++k) {
+            dst[k] = GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(base + k * nb0));
+        }
+        return;
+    }
+
+    if (t->type == GGML_TYPE_BF16) {
+        for (int64_t k = 0; k < K; ++k) {
+            dst[k] = GGML_BF16_TO_FP32(*(const ggml_bf16_t *)(base + k * nb0));
+        }
+        return;
+    }
+
+    const struct ggml_type_traits *traits = ggml_get_type_traits(t->type);
+    if (traits && traits->to_float) {
+        const int64_t bs = (int64_t)ggml_blck_size(t->type);
+        if (bs <= 0 || (K % bs) != 0) {
+            fprintf(stderr,
+                    "ERROR: unsupported quantized K block alignment type=%d K=%ld block_size=%ld\n",
+                    (int)t->type,
+                    (long)K,
+                    (long)bs);
+            fflush(stderr);
+            tsi_cleanup();
+            abort();
+        }
+
+        const int64_t expected_nb0 = (int64_t)ggml_type_size(t->type);
+        if (nb0 != expected_nb0) {
+            fprintf(stderr,
+                    "ERROR: unsupported non-contiguous quantized K stride type=%d nb0=%ld expected=%ld\n",
+                    (int)t->type,
+                    (long)nb0,
+                    (long)expected_nb0);
+            fflush(stderr);
+            tsi_cleanup();
+            abort();
+        }
+
+        traits->to_float(base, dst, K);
+        return;
+    }
+
+    fprintf(stderr,
+            "ERROR: ggml type %d cannot be converted to F32 for Triton MAT_MUL packing\n",
+            (int)t->type);
+    fflush(stderr);
+    tsi_cleanup();
+    abort();
+}
+
+/*
+ * Convert one logical K-row from the source tensor into F32 and scatter it
+ * into a strided destination layout.
+ *
+ * F32, F16, and BF16 are converted directly. Quantized or packed GGML types
+ * are first converted to a temporary contiguous F32 row through
+ * tsavorite_tensor_copy_k_to_f32(), then scattered into Triton's physical
+ * B layout [K x N_pad].
+ */
+static inline void tsavorite_tensor_scatter_k_to_f32_strided(
+    const struct ggml_tensor *t,
+    const char *base,
+    float *dst,
+    int64_t dst_stride,
+    int64_t K,
+    int64_t nb0,
+    std::vector<float> &scratch) {
+    if (!t || !base || !dst || dst_stride <= 0 || K <= 0) {
+        fprintf(stderr, "ERROR: invalid args in tsavorite_tensor_scatter_k_to_f32_strided\n");
+        fflush(stderr);
+        tsi_cleanup();
+        abort();
+    }
+
+    switch (t->type) {
+    case GGML_TYPE_F32:
+        for (int64_t k = 0; k < K; ++k) {
+            dst[k * dst_stride] = *(const float *)(base + k * nb0);
+        }
+        return;
+
+    case GGML_TYPE_F16:
+        for (int64_t k = 0; k < K; ++k) {
+            dst[k * dst_stride] = GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(base + k * nb0));
+        }
+        return;
+
+    case GGML_TYPE_BF16:
+        for (int64_t k = 0; k < K; ++k) {
+            dst[k * dst_stride] = GGML_BF16_TO_FP32(*(const ggml_bf16_t *)(base + k * nb0));
+        }
+        return;
+
+    default:
+        break;
+    }
+
+    if (scratch.size() < (size_t)K) {
+        scratch.resize((size_t)K);
+    }
+
+    /*
+     * Quantized / packed GGML types are handled through the generic
+     * traits->to_float() path in tsavorite_tensor_copy_k_to_f32().
+     * That conversion produces a contiguous temporary F32 K-row in scratch.
+     * The loop below scatters that F32 row into the Triton B layout:
+     * physical B is [K x N_pad], so each K element is written with dst_stride.
+     */
+    tsavorite_tensor_copy_k_to_f32(t, base, scratch.data(), K, nb0);
+    for (int64_t k = 0; k < K; ++k) {
+        dst[k * dst_stride] = scratch[(size_t)k];
+    }
+}
 
 #if TRITON_MAT_MUL
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
@@ -2936,11 +3139,20 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     if (!a || !b) return false;
 
     /*
-     * Triton MAT_MUL supports F32-only for now.
+     * Triton MAT_MUL kernel consumes packed F32 buffers.
+     * Allow GGML source types that can be converted to F32 during host packing.
+     * Quantized types must have block-aligned K and contiguous K stride.
+     * Result remains F32 for this first mixed-precision path.
      */
-    if (a->type != GGML_TYPE_F32 ||
-        b->type != GGML_TYPE_F32 ||
-        op->type != GGML_TYPE_F32) {
+    const int64_t K_dtype = a->ne[0];
+    const int64_t a_nb0_dtype = tsavorite_tensor_nb0_or_type_size(a);
+    const int64_t b_nb0_dtype = tsavorite_tensor_nb0_or_type_size(b);
+
+    const bool a_dtype_ok = tsavorite_tensor_type_can_pack_to_f32_k(a->type, K_dtype, a_nb0_dtype);
+    const bool b_dtype_ok = tsavorite_tensor_type_can_pack_to_f32_k(b->type, K_dtype, b_nb0_dtype);
+    const bool op_dtype_ok = (op->type == GGML_TYPE_F32);
+
+    if (!a_dtype_ok || !b_dtype_ok || !op_dtype_ok) {
 #if TRITON_DEBUG
         fprintf(stderr,
                 "MUL_MAT_REJECT_DTYPE: a_type=%d b_type=%d op_type=%d "
@@ -2952,6 +3164,8 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 #endif
         return false;
     }
+
+    /* mul_mat_dtype_supported_generic_inputs_f32_result */
 
     /*
      * GGML MUL_MAT layout:
@@ -3206,13 +3420,14 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
 
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
-#if 0
-  static bool op_type[GGML_OP_COUNT] = {0};
-  if (op_type[op->op] == false){
-    printf("op->op %d %s\n", op->op, ggml_op_name(op->op));
-    op_type[op->op] = true;
+
+  if (op->op == GGML_OP_NONE && tsavorite_tensor_type_can_pack_to_f32(op->type)) {
+    tsavorite_op_shape_dtype_catalog_record(
+        op,
+        "SUPPORTED",
+        "none_tensor_dtype_supported");
+    return true;
   }
-#endif
 
   if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
     tsavorite_op_shape_dtype_catalog_record(
@@ -3229,21 +3444,6 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
     case GGML_OP_GET_ROWS:
           tsavorite_op_shape_dtype_catalog_record(op, "SUPPORTED", "special_get_rows");
           return true;
-#ifdef GGML_MUL_MAT_CPU_OPS
-    case GGML_OP_MUL_MAT:
-          if (!is_op_dtype_consistent_with_src(op)) {
-             tsavorite_op_shape_dtype_catalog_record(
-                 op,
-                 "REJECTED",
-                 "mixed_dtype_rejected_before_cpu_mul_mat");
-             return false;
-          }
-          tsavorite_op_shape_dtype_catalog_record(
-              op,
-              "SUPPORTED",
-              "mul_mat_cpu_ops_enabled");
-          return true;
-#endif
     case GGML_OP_FLASH_ATTN_EXT:
           tsavorite_op_shape_dtype_catalog_record(op, "REJECTED", "flash_attn_ext_not_supported");
 	  return false;
@@ -3281,6 +3481,24 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
 	  break;
   }
 
+#ifdef TMU_SUPPORTED
+  if (op->op == GGML_OP_MUL_MAT) {
+    if (!mul_mat_supported_size(op)) {
+      tsavorite_op_shape_dtype_catalog_record(
+          op,
+          "REJECTED",
+          "mul_mat_shape_or_dtype_not_supported");
+      return false;
+    }
+
+    tsavorite_op_shape_dtype_catalog_record(
+        op,
+        "SUPPORTED",
+        "mul_mat_shape_dtype_supported");
+    return true;
+  }
+#endif
+
   if (!is_op_dtype_consistent_with_src(op)) {
     tsavorite_op_shape_dtype_catalog_record(
         op,
@@ -3292,22 +3510,6 @@ static bool ggml_tsavorite_internal_supports_op(const struct ggml_tensor *op) {
   switch (op->op) {
   case GGML_OP_NONE:
 	  break;
-#ifdef TMU_SUPPORTED
-  case GGML_OP_MUL_MAT:
-	  if (!mul_mat_supported_size(op)) {
-		  tsavorite_op_shape_dtype_catalog_record(
-		      op,
-		      "REJECTED",
-		      "mul_mat_shape_not_supported");
-		  return false;
-	  }
-	  tsavorite_op_shape_dtype_catalog_record(
-	      op,
-	      "SUPPORTED",
-	      "mul_mat_shape_supported");
-    break;
-#endif /* TMU_SUPPORTED */
-
 #ifdef TVU_SUPPORTED
   case GGML_OP_ADD:
   case GGML_OP_SUB:
@@ -4985,22 +5187,14 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         const char *row = B_ptr + r * b_nb1;
                         float *dst = g_triton_A_full + r * K;
 
-                        for (int64_t k = 0; k < K; ++k) {
-                            dst[k] = *(const float *)(row + k * b_nb0);
-                        }
+                        tsavorite_tensor_copy_k_to_f32(B, row, dst, K, b_nb0);
                     }
                 } else {
                     for (int64_t r = 0; r < M; ++r) {
                         const char *row = A_ptr + r * a_nb1;
                         float *dst = g_triton_A_full + r * K;
 
-                        if (a_nb0 == sizeof(float)) {
-                            memcpy(dst, row, (size_t)K * sizeof(float));
-                        } else {
-                            for (int64_t k = 0; k < K; ++k) {
-                                dst[k] = *(const float *)(row + k * a_nb0);
-                            }
-                        }
+                        tsavorite_tensor_copy_k_to_f32(A, row, dst, K, a_nb0);
                     }
                 }
                 profile.pack_a_us += tsavorite_elapsed_us(t0);
@@ -5011,22 +5205,32 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                 t0 = tsavorite_now_us();
                 if (use_small_n_transpose) {
+                    std::vector<float> tmp_k;
+
                     for (int64_t c = 0; c < M; ++c) {
                         const char *col = A_ptr + c * a_nb1;
-
-                        for (int64_t k = 0; k < K; ++k) {
-                            g_triton_B_full[k * N_work_pad + c] =
-                                *(const float *)(col + k * a_nb0);
-                        }
+                        tsavorite_tensor_scatter_k_to_f32_strided(
+                            A,
+                            col,
+                            g_triton_B_full + c,
+                            N_work_pad,
+                            K,
+                            a_nb0,
+                            tmp_k);
                     }
                 } else {
+                    std::vector<float> tmp_k;
+
                     for (int64_t c = 0; c < N; ++c) {
                         const char *col = B_ptr + c * b_nb1;
-
-                        for (int64_t k = 0; k < K; ++k) {
-                            g_triton_B_full[k * N_work_pad + c] =
-                                *(const float *)(col + k * b_nb0);
-                        }
+                        tsavorite_tensor_scatter_k_to_f32_strided(
+                            B,
+                            col,
+                            g_triton_B_full + c,
+                            N_work_pad,
+                            K,
+                            b_nb0,
+                            tmp_k);
                     }
                 }
                 profile.pack_b_us += tsavorite_elapsed_us(t0);
@@ -5193,13 +5397,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
             const char *row = A_ptr + src_r * a_nb1;
             float *dst = A_tile + r * K;
 
-            if (a_nb0 == sizeof(float)) {
-                memcpy(dst, row, (size_t)K * sizeof(float));
-            } else {
-                for (int64_t k = 0; k < K; ++k) {
-                    dst[k] = *(const float *)(row + k * a_nb0);
-                }
-            }
+            tsavorite_tensor_copy_k_to_f32(A, row, dst, K, a_nb0);
         }
 
         local_pack_a_us += tsavorite_elapsed_us(t0);
@@ -5211,13 +5409,18 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
         t0 = tsavorite_now_us();
 
+        std::vector<float> tmp_k;
+
         for (int64_t c = 0; c < N; ++c) {
             const char *col = B_ptr + c * b_nb1;
-
-            for (int64_t k = 0; k < K; ++k) {
-                B_tile[k * N_pad + c] =
-                    *(const float *)(col + k * b_nb0);
-            }
+            tsavorite_tensor_scatter_k_to_f32_strided(
+                B,
+                col,
+                B_tile + c,
+                N_pad,
+                K,
+                b_nb0,
+                tmp_k);
         }
 
         local_pack_b_us += tsavorite_elapsed_us(t0);
