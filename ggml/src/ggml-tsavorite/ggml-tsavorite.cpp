@@ -2925,7 +2925,19 @@ static bool is_op_dtype_consistent_with_src(const struct ggml_tensor *op) {
   return true;
 }
 
-
+/*
+ * Return true if a tensor type can be converted to F32 during MAT_MUL packing.
+ *
+ * F32/F16/BF16 have explicit fast paths. Quantized / packed GGML types
+ * such as Q8_0, Q5_0, Q4_0, etc. are supported only when GGML provides
+ * a type-traits to_float() converter for that type. The Triton MAT_MUL
+ * kernel still consumes packed F32 buffers.
+ * GGML maintains a type-traits table for each ggml_type. For quantized types
+ * such as Q8_0, Q5_0, Q4_0, and others, that table may provide a to_float() function.
+ * This function knows how to dequantize the compressed block format into standard F32 values.
+ * As a result, our code does not need separate conversion logic for every quantized format.
+ * Instead, it queries GGML for the appropriate converter and uses it when available.
+ */
 static inline bool tsavorite_tensor_type_can_pack_to_f32(enum ggml_type type) {
     if (type == GGML_TYPE_F32 ||
         type == GGML_TYPE_F16 ||
@@ -3053,6 +3065,15 @@ static inline void tsavorite_tensor_copy_k_to_f32(
     abort();
 }
 
+/*
+ * Convert one logical K-row from the source tensor into F32 and scatter it
+ * into a strided destination layout.
+ *
+ * F32, F16, and BF16 are converted directly. Quantized or packed GGML types
+ * are first converted to a temporary contiguous F32 row through
+ * tsavorite_tensor_copy_k_to_f32(), then scattered into Triton's physical
+ * B layout [K x N_pad].
+ */
 static inline void tsavorite_tensor_scatter_k_to_f32_strided(
     const struct ggml_tensor *t,
     const char *base,
@@ -3094,6 +3115,13 @@ static inline void tsavorite_tensor_scatter_k_to_f32_strided(
     }
 
     tsavorite_tensor_copy_k_to_f32(t, base, scratch.data(), K, nb0);
+    /*
+     * Quantized / packed GGML types are handled through the generic
+     * traits->to_float() path in tsavorite_tensor_copy_k_to_f32().
+     * That conversion produces a contiguous temporary F32 K-row in scratch.
+     * The loop below scatters that F32 row into the Triton B layout:
+     * physical B is [K x N_pad], so each K element is written with dst_stride.
+     */
     for (int64_t k = 0; k < K; ++k) {
         dst[k * dst_stride] = scratch[(size_t)k];
     }
