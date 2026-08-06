@@ -3089,32 +3089,33 @@ static inline void tsavorite_tensor_scatter_k_to_f32_strided(
         abort();
     }
 
-    if (t->type == GGML_TYPE_F32) {
+    switch (t->type) {
+    case GGML_TYPE_F32:
         for (int64_t k = 0; k < K; ++k) {
             dst[k * dst_stride] = *(const float *)(base + k * nb0);
         }
         return;
-    }
 
-    if (t->type == GGML_TYPE_F16) {
+    case GGML_TYPE_F16:
         for (int64_t k = 0; k < K; ++k) {
             dst[k * dst_stride] = GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(base + k * nb0));
         }
         return;
-    }
 
-    if (t->type == GGML_TYPE_BF16) {
+    case GGML_TYPE_BF16:
         for (int64_t k = 0; k < K; ++k) {
             dst[k * dst_stride] = GGML_BF16_TO_FP32(*(const ggml_bf16_t *)(base + k * nb0));
         }
         return;
+
+    default:
+        break;
     }
 
     if (scratch.size() < (size_t)K) {
         scratch.resize((size_t)K);
     }
 
-    tsavorite_tensor_copy_k_to_f32(t, base, scratch.data(), K, nb0);
     /*
      * Quantized / packed GGML types are handled through the generic
      * traits->to_float() path in tsavorite_tensor_copy_k_to_f32().
@@ -3122,6 +3123,7 @@ static inline void tsavorite_tensor_scatter_k_to_f32_strided(
      * The loop below scatters that F32 row into the Triton B layout:
      * physical B is [K x N_pad], so each K element is written with dst_stride.
      */
+    tsavorite_tensor_copy_k_to_f32(t, base, scratch.data(), K, nb0);
     for (int64_t k = 0; k < K; ++k) {
         dst[k * dst_stride] = scratch[(size_t)k];
     }
