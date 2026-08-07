@@ -3130,8 +3130,32 @@ static inline void tsavorite_tensor_scatter_k_to_f32_strided(
 }
 
 #if TRITON_MAT_MUL
+static inline bool tsavorite_triton_matmul_dims_within_caps(
+    int64_t K,
+    int64_t M,
+    int64_t N);
+
+static inline bool tsavorite_mul_mat_advanced_shape_ok(
+    const struct ggml_tensor * op);
+
 static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     if (!op) return false;
+
+    if (advanced_matmul_shape_offload && tsavorite_mul_mat_advanced_shape_ok(op)) {
+#if TRITON_DEBUG
+        const struct ggml_tensor * a_dbg = op->src[0];
+        const struct ggml_tensor * b_dbg = op->src[1];
+        fprintf(stderr,
+                "MUL_MAT_ADVANCED_SHAPE_ENABLE: a_type=%d b_type=%d op_type=%d "
+                "a=[%ld,%ld,%ld,%ld] b=[%ld,%ld,%ld,%ld] op=[%ld,%ld,%ld,%ld]\n",
+                (int)a_dbg->type, (int)b_dbg->type, (int)op->type,
+                (long)a_dbg->ne[0], (long)a_dbg->ne[1], (long)a_dbg->ne[2], (long)a_dbg->ne[3],
+                (long)b_dbg->ne[0], (long)b_dbg->ne[1], (long)b_dbg->ne[2], (long)b_dbg->ne[3],
+                (long)op->ne[0], (long)op->ne[1], (long)op->ne[2], (long)op->ne[3]);
+#endif
+        return true;
+    }
+
 
     const struct ggml_tensor *a = op->src[0];
     const struct ggml_tensor *b = op->src[1];
@@ -3177,7 +3201,7 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     const int64_t M = a->ne[1];
     const int64_t N = b->ne[1];
 
-    if (K <= 0 || M <= 0 || N <= 0) {
+    if (!tsavorite_triton_matmul_dims_within_caps(K, M, N)) {
         return false;
     }
 
@@ -3309,13 +3333,6 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
 
     const int64_t total_bytes =
         (elems_A + elems_B + elems_C) * (int64_t)sizeof(float);
-
-    /*
-     * Broad sanity caps only.
-     */
-    if (K > 8192)  return false;
-    if (M > 32768) return false;
-    if (N > 4096)  return false;
 
 #if TRITON_DEBUG
     fprintf(stderr,
@@ -3860,9 +3877,89 @@ static inline const triton_matmul_txe_shape_t &triton_matmul_select_shape(
 
 // Data type specific
 #define TRITON_MATMUL_F32_K_DIM      32
+#define TSAV_TRITON_MATMUL_MAX_K 8192
+#define TSAV_TRITON_MATMUL_MAX_M 32768
+#define TSAV_TRITON_MATMUL_MAX_N 4096
+
+static inline bool tsavorite_triton_matmul_dims_within_caps(
+    int64_t K,
+    int64_t M,
+    int64_t N) {
+    return K > 0 && M > 0 && N > 0 &&
+           K <= TSAV_TRITON_MATMUL_MAX_K &&
+           M <= TSAV_TRITON_MATMUL_MAX_M &&
+           N <= TSAV_TRITON_MATMUL_MAX_N;
+}
 
 #define TRITON_MATMUL_ALIGNMENT_BYTES      128
 #define TRITON_MATMUL_ALIGNMENT_MASK      (TRITON_MATMUL_ALIGNMENT_BYTES - 1)
+
+static inline bool tsavorite_mul_mat_advanced_shape_ok(const struct ggml_tensor * op) {
+    if (!op || !op->src[0] || !op->src[1]) {
+        return false;
+    }
+
+    const struct ggml_tensor * a = op->src[0];
+    const struct ggml_tensor * b = op->src[1];
+
+    if (op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t K  = a->ne[0];
+    const int64_t M  = a->ne[1];
+    const int64_t N  = b->ne[1];
+
+    if (!tsavorite_triton_matmul_dims_within_caps(K, M, N)) {
+        return false;
+    }
+
+    const int64_t a_nb0 = tsavorite_tensor_nb0_or_type_size(a);
+    const int64_t b_nb0 = tsavorite_tensor_nb0_or_type_size(b);
+
+    if (!tsavorite_tensor_type_can_pack_to_f32_k(a->type, K, a_nb0) ||
+        !tsavorite_tensor_type_can_pack_to_f32_k(b->type, K, b_nb0)) {
+        return false;
+    }
+    const int64_t A2 = a->ne[2];
+    const int64_t A3 = a->ne[3];
+    const int64_t B2 = b->ne[2];
+    const int64_t B3 = b->ne[3];
+    const int64_t D2 = op->ne[2];
+    const int64_t D3 = op->ne[3];
+
+    if (b->ne[0] != K || op->ne[0] != M || op->ne[1] != N) {
+        return false;
+    }
+
+    if ((K % TRITON_MATMUL_F32_K_DIM) != 0) {
+        return false;
+    }
+
+    if (D2 != ((A2 > B2) ? A2 : B2) || D3 != ((A3 > B3) ? A3 : B3)) {
+        return false;
+    }
+
+    if (!(A2 == D2 || A2 == 1) || !(B2 == D2 || B2 == 1)) {
+        return false;
+    }
+
+    if (!(A3 == D3 || A3 == 1) || !(B3 == D3 || B3 == 1)) {
+        return false;
+    }
+
+    const triton_matmul_txe_shape_t & shape = triton_matmul_select_shape(M, N);
+    const int64_t M_pad = ((M + shape.m_dim - 1) / shape.m_dim) * shape.m_dim;
+    const int64_t N_pad = ((N + shape.n_dim - 1) / shape.n_dim) * shape.n_dim;
+    const int64_t total_bytes = (M_pad * K + K * N_pad + M_pad * N_pad) * (int64_t)sizeof(float);
+
+    if (M_pad <= 0 || N_pad <= 0 || total_bytes <= 0) {
+        return false;
+    }
+
+    return true;
+}
+
 
 static int32_t g_triton_cur_M_tile = TMU_M_TILE_MAX;
 static int32_t g_triton_cur_N_tile = TMU_N_BLOCK;
