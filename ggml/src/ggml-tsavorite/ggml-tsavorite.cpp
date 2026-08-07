@@ -3334,13 +3334,6 @@ static bool mul_mat_supported_size(const struct ggml_tensor *op) {
     const int64_t total_bytes =
         (elems_A + elems_B + elems_C) * (int64_t)sizeof(float);
 
-    /*
-     * Broad sanity caps only.
-     */
-    if (!tsavorite_triton_matmul_dims_within_caps(K, M, N)) {
-        return false;
-    }
-
 #if TRITON_DEBUG
     fprintf(stderr,
             "MUL_MAT_TRITON_ENABLE: K=%ld M=%ld N=%ld D2=%ld D3=%ld "
