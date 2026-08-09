@@ -3722,6 +3722,15 @@ static inline int64_t map_repeat_i64(int64_t out_idx, int64_t in_dim) {
     return (r < 0) ? (r + in_dim) : r;
 }
 
+/*
+ * Map an output D2/D3 batch index to the corresponding input batch index for
+ * grouped broadcast MAT_MUL layouts.
+ *
+ * This is intentionally not generic GGML_OP_REPEAT modulo mapping. For grouped
+ * head layouts such as A2=4, D2=32, output heads 0..7 map to input head 0,
+ * 8..15 map to input head 1, etc. This matches the grouped-head MAT_MUL
+ * packing requirement used by the Triton offload path.
+ */
 static inline int64_t map_repeat_dim_i64(int64_t out_idx, int64_t out_dim, int64_t in_dim) {
     if (in_dim <= 1) return 0;
     if (out_dim <= 0) return 0;
@@ -3964,8 +3973,14 @@ static inline bool tsavorite_mul_mat_advanced_shape_ok(const struct ggml_tensor 
     const int64_t D2 = op->ne[2];
     const int64_t D3 = op->ne[3];
 
+    /*
+     * Only require the broadcast flag for actual broadcast layouts where an
+     * input batch dimension differs from the output batch dimension. Batched
+     * non-broadcast layouts such as A2=B2=D2=2 should remain controlled by
+     * advanced_matmul_shape_offload and must not require the broadcast flag.
+     */
     const bool has_broadcast_dims =
-        (A2 != 1 || A3 != 1 || B2 != 1 || B3 != 1 || D2 != 1 || D3 != 1);
+        (A2 != D2 || B2 != D2 || A3 != D3 || B3 != D3);
 
     if (has_broadcast_dims && !advanced_matmul_broadcast_offload) {
         return false;
