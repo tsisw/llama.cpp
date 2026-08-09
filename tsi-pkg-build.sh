@@ -1070,6 +1070,7 @@ local user_dram_size_gb="8"
 
   if [ -f "${deployment_yaml_path}" ]; then
     local existing_advanced
+    local existing_broadcast
     local existing_small_n_opt
 local existing_user_dram_size_gb
 
