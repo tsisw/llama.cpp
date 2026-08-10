@@ -17,7 +17,7 @@ multi_thread_enable: true
 ##   user_dram_size_gb: 8
 ##   user_dram_size_gb: 12
 ##   user_dram_size_gb: 24
-user_dram_size_gb: 16
+user_dram_size_gb: 8
 
 # Enable additional Triton MAT_MUL shapes beyond stable baseline.
 # false = old behavior
