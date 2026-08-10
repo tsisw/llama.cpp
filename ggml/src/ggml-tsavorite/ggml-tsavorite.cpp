@@ -125,6 +125,7 @@ struct TsavoriteRuntimeState {
     void **loadResult_matmul_1x8 = nullptr;
     void **loadResult_matmul_2x4 = nullptr;
     bool advanced_matmul_shape_offload = false;
+    bool advanced_matmul_broadcast_offload = false;
     bool triton_matmul_small_n_transpose_opt = false;
 #endif
 
@@ -184,6 +185,7 @@ auto &loadResult_triton_add = g_rt.loadResult_triton_add;
 auto &loadResult_matmul_1x8     = g_rt.loadResult_matmul_1x8;
 auto &loadResult_matmul_2x4     = g_rt.loadResult_matmul_2x4;
 auto &advanced_matmul_shape_offload = g_rt.advanced_matmul_shape_offload;
+auto &advanced_matmul_broadcast_offload = g_rt.advanced_matmul_broadcast_offload;
 auto &triton_matmul_small_n_transpose_opt = g_rt.triton_matmul_small_n_transpose_opt;
 #endif
 } // anonymous namespace
@@ -282,6 +284,8 @@ struct tsi_deploy_cfg_t {
 #if TRITON_MAT_MUL
     bool advanced_matmul_shape_offload = false;
     bool has_advanced_matmul_shape_offload = false;
+    bool advanced_matmul_broadcast_offload = false;
+    bool has_advanced_matmul_broadcast_offload = false;
     bool triton_matmul_small_n_transpose_opt = false;
     bool has_triton_matmul_small_n_transpose_opt = false;
 #endif
@@ -359,6 +363,15 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
                 cfg.has_advanced_matmul_shape_offload = true;
             }
         }
+        if (t.find("advanced_matmul_broadcast_offload") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            bool b = false;
+            if (tsi_parse_bool_after_colon(t, &b)) {
+                cfg.advanced_matmul_broadcast_offload = b;
+                cfg.has_advanced_matmul_broadcast_offload = true;
+            }
+        }
+
         if (t.find("triton_matmul_small_n_transpose_opt") != std::string::npos &&
             t.find(':') != std::string::npos) {
             bool b = false;
@@ -1648,6 +1661,11 @@ static void ensure_tsi_runtime_initialized() {
         cfg.has_advanced_matmul_shape_offload ?
         cfg.advanced_matmul_shape_offload :
         false;
+
+    advanced_matmul_broadcast_offload =
+        cfg.has_advanced_matmul_broadcast_offload ?
+        cfg.advanced_matmul_broadcast_offload :
+        false;
     triton_matmul_small_n_transpose_opt =
         cfg.has_triton_matmul_small_n_transpose_opt ?
         cfg.triton_matmul_small_n_transpose_opt :
@@ -1680,6 +1698,8 @@ static void ensure_tsi_runtime_initialized() {
 #if TRITON_MAT_MUL
     printf(" advanced_matmul_shape_offload=%d",
            (int)advanced_matmul_shape_offload);
+    printf(" advanced_matmul_broadcast_offload=%d",
+           (int)advanced_matmul_broadcast_offload);
     printf(" triton_matmul_small_n_transpose_opt=%d",
            (int)triton_matmul_small_n_transpose_opt);
 #endif
@@ -3702,6 +3722,31 @@ static inline int64_t map_repeat_i64(int64_t out_idx, int64_t in_dim) {
     return (r < 0) ? (r + in_dim) : r;
 }
 
+/*
+ * Map an output D2/D3 batch index to the corresponding input batch index for
+ * grouped broadcast MAT_MUL layouts.
+ *
+ * This is intentionally not generic GGML_OP_REPEAT modulo mapping. For grouped
+ * head layouts such as A2=4, D2=32, output heads 0..7 map to input head 0,
+ * 8..15 map to input head 1, etc. This matches the grouped-head MAT_MUL
+ * packing requirement used by the Triton offload path.
+ */
+static inline int64_t map_repeat_dim_i64(int64_t out_idx, int64_t out_dim, int64_t in_dim) {
+    if (in_dim <= 1) return 0;
+    if (out_dim <= 0) return 0;
+    if (in_dim == out_dim) return out_idx;
+
+    if ((out_dim % in_dim) == 0) {
+        const int64_t group = out_dim / in_dim;
+        int64_t r = out_idx / group;
+        if (r < 0) r = 0;
+        if (r >= in_dim) r = in_dim - 1;
+        return r;
+    }
+
+    return map_repeat_i64(out_idx, in_dim);
+}
+
 
 // ============================================================================
 // ABI WRAPPERS: raw pointers -> MemRefDescriptor<4> -> call MLIR ciface
@@ -3877,7 +3922,7 @@ static inline const triton_matmul_txe_shape_t &triton_matmul_select_shape(
 
 // Data type specific
 #define TRITON_MATMUL_F32_K_DIM      32
-#define TSAV_TRITON_MATMUL_MAX_K 8192
+#define TSAV_TRITON_MATMUL_MAX_K 12288
 #define TSAV_TRITON_MATMUL_MAX_M 32768
 #define TSAV_TRITON_MATMUL_MAX_N 4096
 
@@ -3928,6 +3973,19 @@ static inline bool tsavorite_mul_mat_advanced_shape_ok(const struct ggml_tensor 
     const int64_t D2 = op->ne[2];
     const int64_t D3 = op->ne[3];
 
+    /*
+     * Only require the broadcast flag for actual broadcast layouts where an
+     * input batch dimension differs from the output batch dimension. Batched
+     * non-broadcast layouts such as A2=B2=D2=2 should remain controlled by
+     * advanced_matmul_shape_offload and must not require the broadcast flag.
+     */
+    const bool has_broadcast_dims =
+        (A2 != D2 || B2 != D2 || A3 != D3 || B3 != D3);
+
+    if (has_broadcast_dims && !advanced_matmul_broadcast_offload) {
+        return false;
+    }
+
     if (b->ne[0] != K || op->ne[0] != M || op->ne[1] != N) {
         return false;
     }
@@ -3936,15 +3994,24 @@ static inline bool tsavorite_mul_mat_advanced_shape_ok(const struct ggml_tensor 
         return false;
     }
 
+    if (A2 <= 0 || A3 <= 0 || B2 <= 0 || B3 <= 0 || D2 <= 0 || D3 <= 0) {
+        return false;
+    }
+
     if (D2 != ((A2 > B2) ? A2 : B2) || D3 != ((A3 > B3) ? A3 : B3)) {
         return false;
     }
 
-    if (!(A2 == D2 || A2 == 1) || !(B2 == D2 || B2 == 1)) {
+    /*
+     * Allow GGML repeat/broadcast layouts where an input batch dimension divides
+     * the output batch dimension. Runtime packing uses map_repeat_dim_i64(), so
+     * shapes such as A2=4, B2=32, D2=32 are valid.
+     */
+    if ((D2 % A2) != 0 || (D2 % B2) != 0) {
         return false;
     }
 
-    if (!(A3 == D3 || A3 == 1) || !(B3 == D3 || B3 == 1)) {
+    if ((D3 % A3) != 0 || (D3 % B3) != 0) {
         return false;
     }
 
@@ -5265,10 +5332,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
         for (int64_t d3 = 0; d3 < D3; ++d3) {
             for (int64_t d2 = 0; d2 < D2; ++d2) {
-                const int64_t a_d2 = map_repeat_i64(d2, A2);
-                const int64_t a_d3 = map_repeat_i64(d3, A3);
-                const int64_t b_d2 = map_repeat_i64(d2, B2);
-                const int64_t b_d3 = map_repeat_i64(d3, B3);
+                const int64_t a_d2 = map_repeat_dim_i64(d2, D2, A2);
+                const int64_t a_d3 = map_repeat_dim_i64(d3, D3, A3);
+                const int64_t b_d2 = map_repeat_dim_i64(d2, D2, B2);
+                const int64_t b_d3 = map_repeat_dim_i64(d3, D3, B3);
 
                 char *A_ptr = A_base + a_d2 * a_nb2 + a_d3 * a_nb3;
                 char *B_ptr = B_base + b_d2 * b_nb2 + b_d3 * b_nb3;
@@ -5406,10 +5473,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
     for (int64_t d3 = 0; d3 < D3; ++d3) {
         for (int64_t d2 = 0; d2 < D2; ++d2) {
-            const int64_t a_d2 = map_repeat_i64(d2, A2);
-            const int64_t a_d3 = map_repeat_i64(d3, A3);
-            const int64_t b_d2 = map_repeat_i64(d2, B2);
-            const int64_t b_d3 = map_repeat_i64(d3, B3);
+            const int64_t a_d2 = map_repeat_dim_i64(d2, D2, A2);
+            const int64_t a_d3 = map_repeat_dim_i64(d3, D3, A3);
+            const int64_t b_d2 = map_repeat_dim_i64(d2, D2, B2);
+            const int64_t b_d3 = map_repeat_dim_i64(d3, D3, B3);
 
             char *A_ptr = A_base + a_d2 * a_nb2 + a_d3 * a_nb3;
             char *B_ptr = B_base + b_d2 * b_nb2 + b_d3 * b_nb3;

@@ -28,3 +28,9 @@ advanced_matmul_shape_offload: false
 # false = old behavior
 # true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
 triton_matmul_small_n_transpose_opt: false
+
+## Enable Triton MAT_MUL broadcast/batched D2/D3 offload.
+## false = keep broadcast MAT_MUL on fallback path
+## true  = allow advanced MAT_MUL helper to offload supported broadcast shapes
+
+advanced_matmul_broadcast_offload: false
