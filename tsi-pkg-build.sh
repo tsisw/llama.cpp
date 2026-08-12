@@ -664,17 +664,15 @@ resolve_paths() {
 
     if [ -z "${TOOLBOX_DIR_IN}" ]; then
         MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
-        # Toolbox is consumed from the toolbox submodule (built+installed locally
-        # under <repo-root>/toolbox/build/install-<target>), not from the SDK's
-        # bundled copy -- the SDK vendors its own toolbox version which can lag
-        # well behind the one the rest of the tsisw stack (runtime, apc-manager)
-        # builds against. Default follows the requested build target; explicit
-        # positional/env TOOLBOX_DIR still overrides this.
+        # Toolbox comes from the SDK (${MLIR_SDK_VERSION}/toolbox/build/install-<target>),
+        # matching llama.cpp's single SDK_VERSION-driven build. Default now follows the
+        # requested build target -- previously this always fell back to install-fpga,
+        # even for posix-only builds. Explicit positional/env TOOLBOX_DIR still overrides.
         if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
           && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
-            TOOLBOX_DIR_IN="${__TSI_SCRIPT_DIR}/toolbox/build/install-fpga"
+            TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
         else
-            TOOLBOX_DIR_IN="${__TSI_SCRIPT_DIR}/toolbox/build/install-posix"
+            TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-posix"
         fi
     fi
 
