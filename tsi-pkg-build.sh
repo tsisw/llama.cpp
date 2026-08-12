@@ -664,7 +664,18 @@ resolve_paths() {
 
     if [ -z "${TOOLBOX_DIR_IN}" ]; then
         MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
-        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
+        # Toolbox is consumed from the toolbox submodule (built+installed locally
+        # under <repo-root>/toolbox/build/install-<target>), not from the SDK's
+        # bundled copy -- the SDK vendors its own toolbox version which can lag
+        # well behind the one the rest of the tsisw stack (runtime, apc-manager)
+        # builds against. Default follows the requested build target; explicit
+        # positional/env TOOLBOX_DIR still overrides this.
+        if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
+          && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
+            TOOLBOX_DIR_IN="${__TSI_SCRIPT_DIR}/toolbox/build/install-fpga"
+        else
+            TOOLBOX_DIR_IN="${__TSI_SCRIPT_DIR}/toolbox/build/install-posix"
+        fi
     fi
 
     MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
@@ -785,7 +796,8 @@ setup_python() {
   # Export runtime/library paths needed by create-all-kernels.sh
   # based on your manual env setup
   # ---------------------------------------------------------------------------
-  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/toolbox/build/install-posix/lib:${LD_LIBRARY_PATH:-}"
+  # TOOLBOX_DIR is already resolved (submodule build, see resolve_paths) at this point.
+  export LD_LIBRARY_PATH="${TOOLBOX_DIR}/lib:${LD_LIBRARY_PATH:-}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/lib:${LD_LIBRARY_PATH}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-wrapper/lib:${LD_LIBRARY_PATH}"
 
