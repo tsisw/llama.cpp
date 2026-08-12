@@ -77,7 +77,7 @@ if (GGML_TSAVORITE)
     include_directories(${TSAVORITE_INCLUDE_DIR})
     include_directories(${MLIR_COMPILER_DIR}/include/tsi-rt/shim)
     include_directories(${RUNTIME_DIR}/include)
-    include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-fpga/include)
+    include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/include)
     message("tsavorite backend is enabled")
 endif()
 

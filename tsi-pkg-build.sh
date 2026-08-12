@@ -794,8 +794,10 @@ setup_python() {
   # Export runtime/library paths needed by create-all-kernels.sh
   # based on your manual env setup
   # ---------------------------------------------------------------------------
-  # TOOLBOX_DIR is already resolved (submodule build, see resolve_paths) at this point.
-  export LD_LIBRARY_PATH="${TOOLBOX_DIR}/lib:${LD_LIBRARY_PATH:-}"
+  # This venv/python toolchain always runs natively on the host (x86_64), regardless
+  # of build target, so it needs the native posix toolbox libs here specifically --
+  # not the possibly-fpga-flavored TOOLBOX_DIR resolved above.
+  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/toolbox/build/install-posix/lib:${LD_LIBRARY_PATH:-}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/lib:${LD_LIBRARY_PATH}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-wrapper/lib:${LD_LIBRARY_PATH}"
 
@@ -974,6 +976,15 @@ build_fpga_impl() {
 
   local ARM_TOOLCHAIN_FILE="${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
 
+  # This link step always needs the FPGA/ARM-flavored toolbox libs, regardless of
+  # what TOOLBOX_DIR resolved to above (which follows the requested build target
+  # and would be install-posix for a combined posix+fpga invocation) -- so it's
+  # derived here from MLIR_SDK_VERSION directly rather than reused from TOOLBOX_DIR.
+  # This also drops the previous hardcoded absolute SDK root + literal SDK_VERSION
+  # + literal "aarch64" segment (install-fpga under the resolved host-arch tree
+  # carries the same ARM-compiled libs).
+  local FPGA_TOOLBOX_LIB_DIR="${MLIR_SDK_VERSION}/toolbox/build/install-fpga/lib"
+
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
   [ "${want_tvu}" -eq 1 ] && supported="${supported} -DTVU_SUPPORTED"
@@ -985,8 +996,8 @@ build_fpga_impl() {
     -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DLLAMA_CURL=OFF \
     -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
     -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
--DCMAKE_EXE_LINKER_FLAGS="-L/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath-link,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -lomp" \
--DCMAKE_SHARED_LINKER_FLAGS="-L/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath-link,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -Wl,-rpath,/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/aarch64/toolbox/build/install-fpga/lib -lomp" \
+-DCMAKE_EXE_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -lomp" \
+-DCMAKE_SHARED_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -lomp" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
