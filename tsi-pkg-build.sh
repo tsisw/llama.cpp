@@ -389,10 +389,6 @@ parse_args() {
   # across runs when switching SDK versions.
   unset MLIR_COMPILER_DIR
   unset TOOLBOX_DIR
-  unset TOOLBOX_DIR_EXPLICIT
-  unset TOOLBOX_TARGET
-  unset FPGA_TOOLBOX_DIR
-  unset TSICommon_DIR
   unset MLIR_SDK_VERSION
   unset COMPILER_INSTALL_DIR
   unset FAU_LOOKUP_TABLE_PATH
@@ -657,22 +653,17 @@ parse_args() {
   return 0
 }
 
-# Returns "fpga" or "posix" on stdout: the toolbox install flavor implied by
-# which build(s) were requested. Mirrors GGML_TSAVORITE_TARGET's own
-# fpga-else-posix default (see CMakeLists.txt) -- "fpga" only when FPGA was
-# requested without posix also being requested; "posix" in every other case,
-# including the default combined `build-posix build-fpga` invocation (which
-# needs FPGA_TOOLBOX_DIR, resolved separately below, for its own FPGA-specific
-# steps -- see resolve_fpga_toolbox_dir()).
-_toolbox_target_for_general_resolution() {
-    if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
-      && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
-        echo fpga
-    else
-        echo posix
-    fi
-}
-
+# Resolves MLIR_COMPILER_DIR/MLIR_SDK_VERSION only -- the SDK's compiler
+# install is the same directory regardless of build target (posix vs fpga),
+# so there is nothing target-dependent to resolve here. Toolbox paths are
+# NOT resolved here: unlike the compiler dir, which build(s) are needed for
+# depends on which build target is being processed, and a single invocation
+# of this script can build posix and fpga sequentially (the default). Each
+# build step resolves its own toolbox directory right before it needs it,
+# via resolve_toolbox_dir_for_target() below, passing its own already-known
+# target ("posix" or "fpga") -- the same pattern compute_perf_and_debug_defs()
+# and CMake's GGML_TSAVORITE_TARGET already use. This avoids guessing a
+# single "default" target up front for an invocation that may need both.
 resolve_paths() {
     local arch="$1"
 
@@ -681,85 +672,79 @@ resolve_paths() {
         MLIR_COMPILER_DIR_IN="${MLIR_SDK_VERSION}/compiler"
     fi
 
-    TOOLBOX_DIR_EXPLICIT=1
-    if [ -z "${TOOLBOX_DIR_IN}" ]; then
-        TOOLBOX_DIR_EXPLICIT=0
-        MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
-        # Toolbox comes from the SDK (${MLIR_SDK_VERSION}/toolbox/build/install-<target>),
-        # matching llama.cpp's single SDK_VERSION-driven build. Default now follows the
-        # requested build target -- previously this always fell back to install-fpga,
-        # even for posix-only builds. The documented trailing positional TOOLBOX_DIR
-        # argument still overrides (TOOLBOX_DIR_EXPLICIT=1 above), including for the
-        # FPGA-specific steps resolved by resolve_fpga_toolbox_dir() below. Note a bare
-        # `TOOLBOX_DIR=...` environment variable does NOT: it's unset unconditionally
-        # above (and TOOLBOX_DIR_IN is always reset to "") to avoid a stale exported
-        # value leaking into a later run with a different SDK_VERSION in the same shell.
-        TOOLBOX_TARGET="$(_toolbox_target_for_general_resolution)"
-        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-${TOOLBOX_TARGET}"
-    fi
-
     MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
     [ -n "${MLIR_COMPILER_DIR}" ] || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
 
-    TOOLBOX_DIR="$(absdir "${TOOLBOX_DIR_IN}")"
-    [ -n "${TOOLBOX_DIR}" ] || die "TOOLBOX_DIR not found: ${TOOLBOX_DIR_IN}"
-
-    TSICommon_DIR="${TOOLBOX_DIR}/lib/cmake/TSICommon"
-    [ -d "${TSICommon_DIR}" ] || die "TSICommon_DIR not found: ${TSICommon_DIR}"
-
-    export TSICommon_DIR
     export MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR}")}"
     export MLIR_COMPILER_DIR
     export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
-    export TOOLBOX_DIR
-    export TOOLBOX_DIR_EXPLICIT
-    # Unset (empty) when TOOLBOX_DIR_EXPLICIT=1 -- an explicit override has no
-    # single "fpga" or "posix" target to name, see resolve_fpga_toolbox_dir().
-    export TOOLBOX_TARGET="${TOOLBOX_TARGET:-}"
     export FAU_LOOKUP_TABLE_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/third-party/FAU/include/"
 
     log_info "SDK_VERSION:        ${SDK_VERSION}"
     log_info "MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
-    log_info "TOOLBOX_DIR:       ${TOOLBOX_DIR}"
-    log_info "TOOLBOX_TARGET:    ${TOOLBOX_TARGET:-<explicit override, no single target>}"
-    log_info "TSICommon_DIR:     ${TSICommon_DIR}"
 }
 
-# Resolves the toolbox path that FPGA-specific build steps (blob cross-compile
-# toolchain resolution, ARM linker flags) must use. Independent of whichever
-# target the general TOOLBOX_DIR above resolved to -- which is install-posix
-# in a combined `build-posix build-fpga` invocation (the default) -- so FPGA
-# steps don't end up consuming host-native posix toolbox content instead of
-# the ARM/Xtensa-flavored install-fpga content they actually need. Honors an
-# explicit TOOLBOX_DIR override (the documented trailing positional argument --
-# a bare TOOLBOX_DIR environment variable is not captured, see resolve_paths())
-# rather than silently replacing it with the SDK's install-fpga.
-resolve_fpga_toolbox_dir() {
-    if [ "${TOOLBOX_DIR_EXPLICIT:-0}" -eq 1 ]; then
-        # An explicit override is a single directory the caller asserts is correct
-        # for everything they're building -- same contract the (pre-target-aware)
-        # TOOLBOX_DIR override always had. We can't reliably auto-detect "is this
-        # install-fpga vs install-posix" without hardcoding SDK-version-specific
-        # file names (the toolchain cmake files themselves are byte-identical
-        # between the two installs on every SDK release checked so far), which is
-        # exactly the kind of hardcode this PR removes elsewhere. So: a cheap
-        # sanity check that it's a toolbox install at all, plus a visible NOTE
-        # instead of silently trusting it for FPGA-specific steps too.
-        [ -f "${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake" ] || { die "Explicit TOOLBOX_DIR doesn't look like a toolbox install (missing lib/cmake/toolchains/arm.cmake): ${TOOLBOX_DIR}"; return 1; }
-        FPGA_TOOLBOX_DIR="${TOOLBOX_DIR}"
-        log_info "NOTE: explicit TOOLBOX_DIR is also being used for FPGA-specific steps (ARM toolchain file + FPGA link libs) -- caller is responsible for it being FPGA-appropriate if building for FPGA."
+# Resolves TOOLBOX_DIR for a single, explicitly-named build target ("posix"
+# or "fpga") -- called separately by each build step (build_posix_impl for
+# "posix"; build_fpga_blobs/build_fpga_impl for "fpga"; setup_python() for
+# "posix" too, since its venv always needs the host-native build regardless
+# of which target(s) are ultimately built). Each caller already knows its own
+# target unambiguously, so there is no "which target is this for" guesswork
+# here -- unlike an earlier version of this script, which tried to compute
+# one ambiguous "default" TOOLBOX_DIR before any build step had run, and
+# needed a second FPGA-only variable alongside it because a single combined
+# `build-posix build-fpga` invocation has no single default. Resolving fresh
+# per build step, right before it's needed, removes that problem entirely --
+# one variable, reused sequentially, correct at the moment each step reads it.
+#
+# Honors the documented trailing positional TOOLBOX_DIR override for any
+# target (a bare `TOOLBOX_DIR=...` environment variable is not captured --
+# see the reset block in parse_args()): the caller asserts that single
+# directory is correct for everything being built, same contract the
+# override always had before target-aware resolution existed. We can't
+# reliably auto-detect "is this install-fpga vs install-posix" from content
+# alone (the toolchain cmake files are byte-identical between the two
+# installs on every SDK release checked so far), so an override is trusted
+# with a visible NOTE rather than silently overridden.
+resolve_toolbox_dir_for_target() {
+    local target="$1" # posix|fpga
+    local dir
+
+    case "${target}" in
+        posix|fpga) ;;
+        *) die "resolve_toolbox_dir_for_target: invalid target '${target}' (expected posix or fpga)"; return 1 ;;
+    esac
+
+    if [ -n "${TOOLBOX_DIR_IN}" ]; then
+        dir="${TOOLBOX_DIR_IN}"
+        log_info "NOTE: explicit TOOLBOX_DIR override in use for the ${target} build step -- caller is responsible for it being ${target}-appropriate."
     else
-        FPGA_TOOLBOX_DIR="$(absdir "${MLIR_SDK_VERSION}/toolbox/build/install-fpga")"
-        [ -n "${FPGA_TOOLBOX_DIR}" ] || { die "FPGA_TOOLBOX_DIR not found: ${MLIR_SDK_VERSION}/toolbox/build/install-fpga"; return 1; }
+        dir="${MLIR_SDK_VERSION}/toolbox/build/install-${target}"
     fi
-    export FPGA_TOOLBOX_DIR
-    log_info "FPGA_TOOLBOX_DIR:  ${FPGA_TOOLBOX_DIR}"
+
+    dir="$(absdir "${dir}")"
+    [ -n "${dir}" ] || { die "TOOLBOX_DIR (${target}) not found: ${dir}"; return 1; }
+    [ -d "${dir}/lib/cmake/TSICommon" ] || { die "TOOLBOX_DIR (${target}) doesn't look like a toolbox install (missing lib/cmake/TSICommon): ${dir}"; return 1; }
+
+    if [ "${target}" = "fpga" ]; then
+        [ -f "${dir}/lib/cmake/toolchains/arm.cmake" ] || { die "TOOLBOX_DIR (fpga) is missing lib/cmake/toolchains/arm.cmake: ${dir}"; return 1; }
+    fi
+
+    TOOLBOX_DIR="${dir}"
+    export TOOLBOX_DIR
+    log_info "TOOLBOX_DIR (${target}):  ${TOOLBOX_DIR}"
 }
 
 setup_toolchain() {
-  export CC="/proj/local/gcc-13.3.0/bin/gcc"
-  export CXX="/proj/local/gcc-13.3.0/bin/g++"
-  export LD_LIBRARY_PATH="/proj/local/gcc-13.3.0/lib64:${LD_LIBRARY_PATH:-}"
+  # Host toolchain for POSIX (native) builds and the Python/Triton blob-creation
+  # venv. Not SDK/toolbox-derived -- this is the build host's own local GCC
+  # install, so it's kept in one place and overridable via env var rather than
+  # repeated as a literal at each of its use sites (build_posix_impl(),
+  # wrap_glibc_bins(), setup_python()).
+  export HOST_GCC_DIR="${HOST_GCC_DIR:-/proj/local/gcc-13.3.0}"
+  export CC="${HOST_GCC_DIR}/bin/gcc"
+  export CXX="${HOST_GCC_DIR}/bin/g++"
+  export LD_LIBRARY_PATH="${HOST_GCC_DIR}/lib64:${LD_LIBRARY_PATH:-}"
 }
 
 # -------------------------
@@ -780,7 +765,9 @@ setup_python() {
     source blob-creation/bin/activate || return 1
     [ "${VIRTUAL_ENV:-}" != "${__OLD_VIRTUAL_ENV:-}" ] && __TSI_CHANGED_VENV=1 || true
   else
-    run /proj/local/Python-3.11.12/bin/python3 -m venv blob-creation || return 1
+    # Not SDK/toolbox-derived -- the build host's own local Python install.
+    HOST_PYTHON3_BIN="${HOST_PYTHON3_BIN:-/proj/local/Python-3.11.12/bin/python3}"
+    run "${HOST_PYTHON3_BIN}" -m venv blob-creation || return 1
     run bash -c 'source blob-creation/bin/activate && python -V >/dev/null' || return 1
     # shellcheck disable=SC1091
     source blob-creation/bin/activate || return 1
@@ -854,8 +841,9 @@ setup_python() {
   # ---------------------------------------------------------------------------
   # This venv/python toolchain always runs natively on the host (x86_64), regardless
   # of build target, so it needs the native posix toolbox libs here specifically --
-  # not the possibly-fpga-flavored TOOLBOX_DIR resolved above.
-  export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/toolbox/build/install-posix/lib:${LD_LIBRARY_PATH:-}"
+  # hence target="posix" always, not whichever target(s) this invocation builds.
+  resolve_toolbox_dir_for_target posix || return 1
+  export LD_LIBRARY_PATH="${TOOLBOX_DIR}/lib:${LD_LIBRARY_PATH:-}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/lib:${LD_LIBRARY_PATH}"
   export LD_LIBRARY_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-wrapper/lib:${LD_LIBRARY_PATH}"
 
@@ -888,9 +876,9 @@ fpga_host_objs_present() {
 
 build_fpga_blobs() {
   log_info "BLOB: building FPGA kernels/blobs"
-  resolve_fpga_toolbox_dir || return 1
+  resolve_toolbox_dir_for_target fpga || return 1
   cd fpga-kernel || return 1
-  run cmake -B build-fpga -DTOOLBOX_DIR="${FPGA_TOOLBOX_DIR}" -DCOMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}" || return 1
+  run cmake -B build-fpga -DTOOLBOX_DIR="${TOOLBOX_DIR}" -DCOMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}" || return 1
   run ./create-all-kernels.sh || return 1
   cd .. || return 1
   return 0
@@ -963,6 +951,13 @@ build_posix_impl() {
 
   compute_perf_and_debug_defs "posix"
 
+  # Toolbox isn't actually consumed by anything in this function today (no
+  # posix-side CMakeLists.txt/cmake package needs it), but resolve+validate it
+  # anyway for the same fail-fast reason build_fpga_impl() does for "fpga" --
+  # and for symmetry, so both build steps follow the same pattern rather than
+  # only one of them being explicit about which toolbox flavor it needs.
+  resolve_toolbox_dir_for_target posix || return 1
+
   local common="-DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DGGML_NATIVE=ON -DGGML_AMX_TILE=OFF -DGGML_AMX_INT8=OFF -DGGML_AMX_BF16=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF"
 
   local supported=""
@@ -977,8 +972,8 @@ build_posix_impl() {
     -DCMAKE_C_COMPILER="${CC}" -DCMAKE_CXX_COMPILER="${CXX}" \
     -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} ${cflags_base}" \
     -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} ${cflags_base}" \
--DCMAKE_EXE_LINKER_FLAGS="-L/proj/local/gcc-13.3.0/lib64 -Wl,-rpath-link,/proj/local/gcc-13.3.0/lib64 -Wl,-rpath,/proj/local/gcc-13.3.0/lib64 -L/usr/lib64 -lomp -lgcc_s" \
--DCMAKE_SHARED_LINKER_FLAGS="-L/proj/local/gcc-13.3.0/lib64 -Wl,-rpath-link,/proj/local/gcc-13.3.0/lib64 -Wl,-rpath,/proj/local/gcc-13.3.0/lib64 -L/usr/lib64 -lomp -lgcc_s" \
+-DCMAKE_EXE_LINKER_FLAGS="-L${HOST_GCC_DIR}/lib64 -Wl,-rpath-link,${HOST_GCC_DIR}/lib64 -Wl,-rpath,${HOST_GCC_DIR}/lib64 -L/usr/lib64 -lomp -lgcc_s" \
+-DCMAKE_SHARED_LINKER_FLAGS="-L${HOST_GCC_DIR}/lib64 -Wl,-rpath-link,${HOST_GCC_DIR}/lib64 -Wl,-rpath,${HOST_GCC_DIR}/lib64 -L/usr/lib64 -lomp -lgcc_s" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
@@ -993,13 +988,18 @@ wrap_glibc_bins() {
   local build_dir="$1"
   log_info "fixing GLIBC compatibility for TSI binaries (${build_dir})"
 
+  # Placeholder + sed substitution (not an unquoted heredoc): $LD_LIBRARY_PATH
+  # and $(dirname "$0") below must stay literal, evaluated when the wrapper
+  # runs later -- not expanded now, when this script generates it. Same
+  # technique bundle_fpga() already uses for __TSI_BLOB_INSTALL_DIR__.
   if [ -f "${build_dir}/bin/simple-backend-tsi" ] && [ ! -f "${build_dir}/bin/simple-backend-tsi-original" ]; then
     mv "${build_dir}/bin/simple-backend-tsi" "${build_dir}/bin/simple-backend-tsi-original" || return 1
     cat > "${build_dir}/bin/simple-backend-tsi" <<'EOL'
 #!/bin/bash
-export LD_LIBRARY_PATH="/proj/local/gcc-13.3.0/lib64:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="__HOST_GCC_LIB64__:$LD_LIBRARY_PATH"
 exec "$(dirname "$0")/simple-backend-tsi-original" "$@"
 EOL
+    sed -i "s|__HOST_GCC_LIB64__|${HOST_GCC_DIR}/lib64|g" "${build_dir}/bin/simple-backend-tsi" || return 1
     chmod +x "${build_dir}/bin/simple-backend-tsi" || return 1
   fi
 
@@ -1007,9 +1007,10 @@ EOL
     mv "${build_dir}/bin/llama-cli" "${build_dir}/bin/llama-cli-original" || return 1
     cat > "${build_dir}/bin/llama-cli" <<'EOL'
 #!/bin/bash
-export LD_LIBRARY_PATH="/proj/local/gcc-13.3.0/lib64:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="__HOST_GCC_LIB64__:$LD_LIBRARY_PATH"
 exec "$(dirname "$0")/llama-cli-original" "$@"
 EOL
+    sed -i "s|__HOST_GCC_LIB64__|${HOST_GCC_DIR}/lib64|g" "${build_dir}/bin/llama-cli" || return 1
     chmod +x "${build_dir}/bin/llama-cli" || return 1
   fi
 
@@ -1033,16 +1034,10 @@ build_fpga_impl() {
 
   compute_perf_and_debug_defs "fpga"
 
-  resolve_fpga_toolbox_dir || return 1
+  resolve_toolbox_dir_for_target fpga || return 1
 
-  # The ARM cross-compile toolchain file and link libs always need the
-  # FPGA/ARM-flavored toolbox content, regardless of what the general
-  # TOOLBOX_DIR resolved to above (which follows the requested build target
-  # and would be install-posix for a combined posix+fpga invocation) -- so
-  # both are derived from FPGA_TOOLBOX_DIR (resolve_fpga_toolbox_dir()),
-  # not the possibly-posix-flavored TOOLBOX_DIR.
-  local ARM_TOOLCHAIN_FILE="${FPGA_TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
-  local FPGA_TOOLBOX_LIB_DIR="${FPGA_TOOLBOX_DIR}/lib"
+  local ARM_TOOLCHAIN_FILE="${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
+  local FPGA_TOOLBOX_LIB_DIR="${TOOLBOX_DIR}/lib"
 
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
@@ -1093,7 +1088,9 @@ bundle_fpga() {
   local TSI_GGML_VERSION="${SDK_VERSION}"
   local TSI_GGML_BUNDLE_INSTALL_DIR=tsi-ggml
   local GGML_TSI_INSTALL_DIR=ggml-tsi-kernel
-  local TSI_GGML_RELEASE_DIR=/proj/rel/sw/ggml
+  # Fixed team release location, not SDK/toolbox-derived; kept overridable
+  # for consistency (only reached when BUILD_TYPE=release).
+  local TSI_GGML_RELEASE_DIR="${TSI_GGML_RELEASE_DIR:-/proj/rel/sw/ggml}"
   local TSI_BLOB_INSTALL_DIR
 
   TSI_BLOB_INSTALL_DIR="$(pwd)/${GGML_TSI_INSTALL_DIR}/fpga-kernel/build-fpga"
