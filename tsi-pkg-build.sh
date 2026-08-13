@@ -715,10 +715,21 @@ resolve_paths() {
 # silently replacing it with the SDK's install-fpga.
 resolve_fpga_toolbox_dir() {
     if [ "${TOOLBOX_DIR_EXPLICIT:-0}" -eq 1 ]; then
+        # An explicit override is a single directory the caller asserts is correct
+        # for everything they're building -- same contract the (pre-target-aware)
+        # TOOLBOX_DIR override always had. We can't reliably auto-detect "is this
+        # install-fpga vs install-posix" without hardcoding SDK-version-specific
+        # file names (the toolchain cmake files themselves are byte-identical
+        # between the two installs on every SDK release checked so far), which is
+        # exactly the kind of hardcode this PR removes elsewhere. So: a cheap
+        # sanity check that it's a toolbox install at all, plus a visible NOTE
+        # instead of silently trusting it for FPGA-specific steps too.
+        [ -f "${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake" ] || { die "Explicit TOOLBOX_DIR doesn't look like a toolbox install (missing lib/cmake/toolchains/arm.cmake): ${TOOLBOX_DIR}"; return 1; }
         FPGA_TOOLBOX_DIR="${TOOLBOX_DIR}"
+        log_info "NOTE: explicit TOOLBOX_DIR is also being used for FPGA-specific steps (ARM toolchain file + FPGA link libs) -- caller is responsible for it being FPGA-appropriate if building for FPGA."
     else
         FPGA_TOOLBOX_DIR="$(absdir "${MLIR_SDK_VERSION}/toolbox/build/install-fpga")"
-        [ -n "${FPGA_TOOLBOX_DIR}" ] || die "FPGA_TOOLBOX_DIR not found: ${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
+        [ -n "${FPGA_TOOLBOX_DIR}" ] || { die "FPGA_TOOLBOX_DIR not found: ${MLIR_SDK_VERSION}/toolbox/build/install-fpga"; return 1; }
     fi
     export FPGA_TOOLBOX_DIR
     log_info "FPGA_TOOLBOX_DIR:  ${FPGA_TOOLBOX_DIR}"
