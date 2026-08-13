@@ -389,6 +389,8 @@ parse_args() {
   # across runs when switching SDK versions.
   unset MLIR_COMPILER_DIR
   unset TOOLBOX_DIR
+  unset TOOLBOX_DIR_EXPLICIT
+  unset FPGA_TOOLBOX_DIR
   unset TSICommon_DIR
   unset MLIR_SDK_VERSION
   unset COMPILER_INSTALL_DIR
@@ -662,12 +664,16 @@ resolve_paths() {
         MLIR_COMPILER_DIR_IN="${MLIR_SDK_VERSION}/compiler"
     fi
 
+    TOOLBOX_DIR_EXPLICIT=1
     if [ -z "${TOOLBOX_DIR_IN}" ]; then
+        TOOLBOX_DIR_EXPLICIT=0
         MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR_IN}")}"
         # Toolbox comes from the SDK (${MLIR_SDK_VERSION}/toolbox/build/install-<target>),
         # matching llama.cpp's single SDK_VERSION-driven build. Default now follows the
         # requested build target -- previously this always fell back to install-fpga,
-        # even for posix-only builds. Explicit positional/env TOOLBOX_DIR still overrides.
+        # even for posix-only builds. Explicit positional/env TOOLBOX_DIR still overrides
+        # (TOOLBOX_DIR_EXPLICIT=1 above), including for the FPGA-specific steps resolved
+        # by resolve_fpga_toolbox_dir() below.
         if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
           && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
             TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
@@ -690,12 +696,32 @@ resolve_paths() {
     export MLIR_COMPILER_DIR
     export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
     export TOOLBOX_DIR
+    export TOOLBOX_DIR_EXPLICIT
     export FAU_LOOKUP_TABLE_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/third-party/FAU/include/"
 
     log_info "SDK_VERSION:        ${SDK_VERSION}"
     log_info "MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
     log_info "TOOLBOX_DIR:       ${TOOLBOX_DIR}"
     log_info "TSICommon_DIR:     ${TSICommon_DIR}"
+}
+
+# Resolves the toolbox path that FPGA-specific build steps (blob cross-compile
+# toolchain resolution, ARM linker flags) must use. Independent of whichever
+# target the general TOOLBOX_DIR above resolved to -- which is install-posix
+# in a combined `build-posix build-fpga` invocation (the default) -- so FPGA
+# steps don't end up consuming host-native posix toolbox content instead of
+# the ARM/Xtensa-flavored install-fpga content they actually need. Honors an
+# explicit TOOLBOX_DIR override (positional arg / env var) rather than
+# silently replacing it with the SDK's install-fpga.
+resolve_fpga_toolbox_dir() {
+    if [ "${TOOLBOX_DIR_EXPLICIT:-0}" -eq 1 ]; then
+        FPGA_TOOLBOX_DIR="${TOOLBOX_DIR}"
+    else
+        FPGA_TOOLBOX_DIR="$(absdir "${MLIR_SDK_VERSION}/toolbox/build/install-fpga")"
+        [ -n "${FPGA_TOOLBOX_DIR}" ] || die "FPGA_TOOLBOX_DIR not found: ${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
+    fi
+    export FPGA_TOOLBOX_DIR
+    log_info "FPGA_TOOLBOX_DIR:  ${FPGA_TOOLBOX_DIR}"
 }
 
 setup_toolchain() {
@@ -830,8 +856,9 @@ fpga_host_objs_present() {
 
 build_fpga_blobs() {
   log_info "BLOB: building FPGA kernels/blobs"
+  resolve_fpga_toolbox_dir || return 1
   cd fpga-kernel || return 1
-  run cmake -B build-fpga -DTOOLBOX_DIR="${TOOLBOX_DIR}" -DCOMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}" || return 1
+  run cmake -B build-fpga -DTOOLBOX_DIR="${FPGA_TOOLBOX_DIR}" -DCOMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}" || return 1
   run ./create-all-kernels.sh || return 1
   cd .. || return 1
   return 0
@@ -974,16 +1001,16 @@ build_fpga_impl() {
 
   compute_perf_and_debug_defs "fpga"
 
-  local ARM_TOOLCHAIN_FILE="${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
+  resolve_fpga_toolbox_dir || return 1
 
-  # This link step always needs the FPGA/ARM-flavored toolbox libs, regardless of
-  # what TOOLBOX_DIR resolved to above (which follows the requested build target
-  # and would be install-posix for a combined posix+fpga invocation) -- so it's
-  # derived here from MLIR_SDK_VERSION directly rather than reused from TOOLBOX_DIR.
-  # This also drops the previous hardcoded absolute SDK root + literal SDK_VERSION
-  # + literal "aarch64" segment (install-fpga under the resolved host-arch tree
-  # carries the same ARM-compiled libs).
-  local FPGA_TOOLBOX_LIB_DIR="${MLIR_SDK_VERSION}/toolbox/build/install-fpga/lib"
+  # The ARM cross-compile toolchain file and link libs always need the
+  # FPGA/ARM-flavored toolbox content, regardless of what the general
+  # TOOLBOX_DIR resolved to above (which follows the requested build target
+  # and would be install-posix for a combined posix+fpga invocation) -- so
+  # both are derived from FPGA_TOOLBOX_DIR (resolve_fpga_toolbox_dir()),
+  # not the possibly-posix-flavored TOOLBOX_DIR.
+  local ARM_TOOLCHAIN_FILE="${FPGA_TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
+  local FPGA_TOOLBOX_LIB_DIR="${FPGA_TOOLBOX_DIR}/lib"
 
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
