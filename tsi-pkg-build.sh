@@ -671,9 +671,12 @@ resolve_paths() {
         # Toolbox comes from the SDK (${MLIR_SDK_VERSION}/toolbox/build/install-<target>),
         # matching llama.cpp's single SDK_VERSION-driven build. Default now follows the
         # requested build target -- previously this always fell back to install-fpga,
-        # even for posix-only builds. Explicit positional/env TOOLBOX_DIR still overrides
-        # (TOOLBOX_DIR_EXPLICIT=1 above), including for the FPGA-specific steps resolved
-        # by resolve_fpga_toolbox_dir() below.
+        # even for posix-only builds. The documented trailing positional TOOLBOX_DIR
+        # argument still overrides (TOOLBOX_DIR_EXPLICIT=1 above), including for the
+        # FPGA-specific steps resolved by resolve_fpga_toolbox_dir() below. Note a bare
+        # `TOOLBOX_DIR=...` environment variable does NOT: it's unset unconditionally
+        # above (and TOOLBOX_DIR_IN is always reset to "") to avoid a stale exported
+        # value leaking into a later run with a different SDK_VERSION in the same shell.
         if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
           && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
             TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
@@ -711,8 +714,9 @@ resolve_paths() {
 # in a combined `build-posix build-fpga` invocation (the default) -- so FPGA
 # steps don't end up consuming host-native posix toolbox content instead of
 # the ARM/Xtensa-flavored install-fpga content they actually need. Honors an
-# explicit TOOLBOX_DIR override (positional arg / env var) rather than
-# silently replacing it with the SDK's install-fpga.
+# explicit TOOLBOX_DIR override (the documented trailing positional argument --
+# a bare TOOLBOX_DIR environment variable is not captured, see resolve_paths())
+# rather than silently replacing it with the SDK's install-fpga.
 resolve_fpga_toolbox_dir() {
     if [ "${TOOLBOX_DIR_EXPLICIT:-0}" -eq 1 ]; then
         # An explicit override is a single directory the caller asserts is correct
