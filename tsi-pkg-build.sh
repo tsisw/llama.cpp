@@ -675,6 +675,18 @@ resolve_paths() {
     MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
     [ -n "${MLIR_COMPILER_DIR}" ] || die "MLIR_COMPILER_DIR not found: ${MLIR_COMPILER_DIR_IN}"
 
+    # Normalize a relative positional TOOLBOX_DIR override to absolute here,
+    # while cwd is still the directory the script was invoked from -- main()
+    # cd's into ggml-tsi-kernel/ later (for setup_python()/build_fpga_blobs()/
+    # build_posix_blobs()), and resolve_toolbox_dir_for_target()'s own
+    # absdir() call would otherwise resolve a relative override against
+    # whatever cwd happens to be at the moment each build step calls it,
+    # inconsistently, instead of once against the caller's actual intent.
+    if [ -n "${TOOLBOX_DIR_IN}" ]; then
+        TOOLBOX_DIR_IN="$(absdir "${TOOLBOX_DIR_IN}")"
+        [ -n "${TOOLBOX_DIR_IN}" ] || die "TOOLBOX_DIR override not found: ${TOOLBOX_DIR_IN}"
+    fi
+
     export MLIR_SDK_VERSION="${MLIR_SDK_VERSION:-$(dirname "${MLIR_COMPILER_DIR}")}"
     export MLIR_COMPILER_DIR
     export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
@@ -886,6 +898,13 @@ build_fpga_blobs() {
 
 build_posix_blobs() {
   log_info "BLOB: building POSIX kernels/blobs"
+  # posix-kernel/create-all-kernels.sh (and the aot-*.py it invokes) don't
+  # currently read $TOOLBOX_DIR themselves, but this function can run right
+  # after build_fpga_blobs() (build-all-blobs builds fpga then posix), which
+  # would otherwise leave the exported TOOLBOX_DIR set to install-fpga for
+  # this step. Resolve it explicitly here too, same as every other build
+  # step, so nothing here ever depends on which step happened to run before it.
+  resolve_toolbox_dir_for_target posix || return 1
   cd posix-kernel || return 1
   run ./create-all-kernels.sh || return 1
   cd .. || return 1
