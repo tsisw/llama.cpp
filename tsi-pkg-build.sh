@@ -390,6 +390,7 @@ parse_args() {
   unset MLIR_COMPILER_DIR
   unset TOOLBOX_DIR
   unset TOOLBOX_DIR_EXPLICIT
+  unset TOOLBOX_TARGET
   unset FPGA_TOOLBOX_DIR
   unset TSICommon_DIR
   unset MLIR_SDK_VERSION
@@ -693,7 +694,8 @@ resolve_paths() {
         # `TOOLBOX_DIR=...` environment variable does NOT: it's unset unconditionally
         # above (and TOOLBOX_DIR_IN is always reset to "") to avoid a stale exported
         # value leaking into a later run with a different SDK_VERSION in the same shell.
-        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-$(_toolbox_target_for_general_resolution)"
+        TOOLBOX_TARGET="$(_toolbox_target_for_general_resolution)"
+        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-${TOOLBOX_TARGET}"
     fi
 
     MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
@@ -711,11 +713,15 @@ resolve_paths() {
     export COMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}"
     export TOOLBOX_DIR
     export TOOLBOX_DIR_EXPLICIT
+    # Unset (empty) when TOOLBOX_DIR_EXPLICIT=1 -- an explicit override has no
+    # single "fpga" or "posix" target to name, see resolve_fpga_toolbox_dir().
+    export TOOLBOX_TARGET="${TOOLBOX_TARGET:-}"
     export FAU_LOOKUP_TABLE_PATH="${MLIR_SDK_VERSION}/ffm/txe-ffm-cpp/third-party/FAU/include/"
 
     log_info "SDK_VERSION:        ${SDK_VERSION}"
     log_info "MLIR_COMPILER_DIR: ${MLIR_COMPILER_DIR}"
     log_info "TOOLBOX_DIR:       ${TOOLBOX_DIR}"
+    log_info "TOOLBOX_TARGET:    ${TOOLBOX_TARGET:-<explicit override, no single target>}"
     log_info "TSICommon_DIR:     ${TSICommon_DIR}"
 }
 
