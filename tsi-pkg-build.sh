@@ -656,6 +656,22 @@ parse_args() {
   return 0
 }
 
+# Returns "fpga" or "posix" on stdout: the toolbox install flavor implied by
+# which build(s) were requested. Mirrors GGML_TSAVORITE_TARGET's own
+# fpga-else-posix default (see CMakeLists.txt) -- "fpga" only when FPGA was
+# requested without posix also being requested; "posix" in every other case,
+# including the default combined `build-posix build-fpga` invocation (which
+# needs FPGA_TOOLBOX_DIR, resolved separately below, for its own FPGA-specific
+# steps -- see resolve_fpga_toolbox_dir()).
+_toolbox_target_for_general_resolution() {
+    if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
+      && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
+        echo fpga
+    else
+        echo posix
+    fi
+}
+
 resolve_paths() {
     local arch="$1"
 
@@ -677,12 +693,7 @@ resolve_paths() {
         # `TOOLBOX_DIR=...` environment variable does NOT: it's unset unconditionally
         # above (and TOOLBOX_DIR_IN is always reset to "") to avoid a stale exported
         # value leaking into a later run with a different SDK_VERSION in the same shell.
-        if { [ "${DO_BUILD_FPGA:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_FPGA_TMU_DISABLE:-0}" -eq 1 ]; } \
-          && ! { [ "${DO_BUILD_POSIX:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_ONLY:-0}" -eq 1 ] || [ "${DO_BUILD_POSIX_TMU_DISABLE:-0}" -eq 1 ]; }; then
-            TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-fpga"
-        else
-            TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-posix"
-        fi
+        TOOLBOX_DIR_IN="${MLIR_SDK_VERSION}/toolbox/build/install-$(_toolbox_target_for_general_resolution)"
     fi
 
     MLIR_COMPILER_DIR="$(absdir "${MLIR_COMPILER_DIR_IN}")"
