@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#ifdef OLLAMA
+#include "ggml-backend.h"
+#endif
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -955,6 +959,35 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
+#ifdef OLLAMA
+// Ollama statically links this file into its Go binary while the ggml core
+// (where ggml_perf_accumulate is defined) is built into a separately
+// dlopen'd backend shared library, so the symbol is not link-time visible
+// here. Resolve it once, dynamically, through whichever loaded backend
+// exports it (the function itself is backend-agnostic).
+typedef void (*ggml_perf_accumulate_t)(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph);
+
+static void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
+    static ggml_perf_accumulate_t fn = []() -> ggml_perf_accumulate_t {
+        for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            void * addr = ggml_backend_reg_get_proc_address(reg, "ggml_perf_accumulate");
+            if (addr) {
+                return reinterpret_cast<ggml_perf_accumulate_t>(addr);
+            }
+        }
+        return nullptr;
+    }();
+    if (fn) {
+        fn(totals, cgraph);
+    }
+}
+#else
+static inline void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
+    ggml_perf_accumulate(totals, cgraph);
+}
+#endif
+
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
@@ -1098,7 +1131,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE)
     if (res) {
-        ggml_perf_accumulate(perf_totals, res->get_gf());
+        llama_perf_ggml_accumulate(perf_totals, res->get_gf());
     }
 #elif defined(GGML_PERF_DETAIL)
     if (res) {
@@ -1107,7 +1140,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             fflush(perf_all_shape_fp);
             perf_all_shape_written_once = true;
         } 
-        ggml_perf_accumulate(perf_totals, res->get_gf());
+        llama_perf_ggml_accumulate(perf_totals, res->get_gf());
     } 
 #endif /* GML_PERF-related flags */
 

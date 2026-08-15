@@ -233,6 +233,16 @@ void ggml_backend_free(ggml_backend_t backend) {
     backend->iface.free(backend);
 }
 
+void ggml_backend_log_profile_info(ggml_backend_t backend) {
+    if (backend == NULL) {
+        return;
+    }
+    if (backend->iface.profile == NULL) {
+        return;
+    }
+    backend->iface.profile();
+}
+
 ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend) {
     GGML_ASSERT(backend);
     return ggml_backend_dev_buffer_type(backend->device);

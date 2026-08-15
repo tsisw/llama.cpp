@@ -7759,6 +7759,9 @@ static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, co
         return (void *)ggml_backend_tsavorite_set_threadpool;
     }
 #endif
+    if (strcmp(name, "ggml_perf_accumulate") == 0) {
+        return (void *)ggml_perf_accumulate;
+    }
     return NULL;
 
     GGML_UNUSED(reg);
