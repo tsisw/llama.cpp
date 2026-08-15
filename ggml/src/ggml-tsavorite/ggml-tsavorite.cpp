@@ -1537,6 +1537,26 @@ static void tsi_unload_all_blobs() {
     tsi_blob_free_tables();
 }
 
+// Call at every teardown site that frees device_free (tsi_cleanup,
+// ggml_tsavorite_free, tsi_log_profile_info). tsi_finalize() invalidates
+// the per-TXE tsi_alloc buffers, but packed_args/scalar_*_args keep their
+// old (now dangling) pointers -- tsi_init_per_txe_state_once() only
+// reallocates when a vector's size changes, so leaving them at their
+// current size would make the next dispatch use stale buffers. Clearing
+// them (not just resetting per_txe_state_initialized) forces a full
+// reallocation on the next init.
+static inline void tsi_reset_per_txe_state_after_teardown() {
+    packed_args.clear();
+    scalar_loop_args.clear();
+    scalar_m_args.clear();
+    scalar_n_args.clear();
+    scalar_k_args.clear();
+    scalar_grid1_args.clear();
+    scalar_grid2_args.clear();
+    scalar_grid3_args.clear();
+    per_txe_state_initialized.store(false, std::memory_order_release);
+}
+
 static inline void tsi_init_per_txe_state_once() {
     // This is called unconditionally at the top of every op-dispatch entry
     // point, so once initialization is done, skip the lock entirely rather
@@ -2888,7 +2908,7 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
           free(device_free);
          device_free = NULL;
       }
-      per_txe_state_initialized.store(false, std::memory_order_release);
+      tsi_reset_per_txe_state_after_teardown();
       sleep(2);
       tsi_finalize();
       tsirt::utils::TSIProfiler::finalize();
@@ -2917,7 +2937,7 @@ tsi_cleanup() {
         free(device_free);
         device_free = NULL;
     }
-    per_txe_state_initialized.store(false, std::memory_order_release);
+    tsi_reset_per_txe_state_after_teardown();
     sleep(2);
     tsi_finalize();
     GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
@@ -7253,7 +7273,7 @@ tsi_log_profile_info() {
         free(device_free);
         device_free = NULL;
     }
-    per_txe_state_initialized.store(false, std::memory_order_release);
+    tsi_reset_per_txe_state_after_teardown();
     printf("\n finalize 4 \n");
     tsi_finalize();
     tsirt::utils::TSIProfiler::finalize();
