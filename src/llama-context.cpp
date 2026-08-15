@@ -981,27 +981,42 @@ typedef FILE * (*ggml_perf_log_open_t)(const char * filename);
 typedef void (*ggml_perf_write_detailed_csv_t)(struct ggml_cgraph * cgraph, FILE * fp);
 typedef const char * (*ggml_backend_type_t)(enum ggml_compute_backend_type backend);
 
+// Note: each lookup below retries (rather than permanently caching a null
+// result) since backends can register with the reg after the first call.
 static void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
-    static auto fn = reinterpret_cast<ggml_perf_accumulate_t>(llama_resolve_ggml_proc_address("ggml_perf_accumulate"));
+    static ggml_perf_accumulate_t fn = nullptr;
+    if (!fn) {
+        fn = reinterpret_cast<ggml_perf_accumulate_t>(llama_resolve_ggml_proc_address("ggml_perf_accumulate"));
+    }
     if (fn) {
         fn(totals, cgraph);
     }
 }
 
 static FILE * llama_perf_ggml_log_open(const char * filename) {
-    static auto fn = reinterpret_cast<ggml_perf_log_open_t>(llama_resolve_ggml_proc_address("ggml_perf_log_open"));
+    static ggml_perf_log_open_t fn = nullptr;
+    if (!fn) {
+        fn = reinterpret_cast<ggml_perf_log_open_t>(llama_resolve_ggml_proc_address("ggml_perf_log_open"));
+    }
     return fn ? fn(filename) : nullptr;
 }
 
 static void llama_perf_ggml_write_detailed_csv(struct ggml_cgraph * cgraph, FILE * fp) {
-    static auto fn = reinterpret_cast<ggml_perf_write_detailed_csv_t>(llama_resolve_ggml_proc_address("ggml_perf_write_detailed_csv"));
+    static ggml_perf_write_detailed_csv_t fn = nullptr;
+    if (!fn) {
+        fn = reinterpret_cast<ggml_perf_write_detailed_csv_t>(
+            llama_resolve_ggml_proc_address("ggml_perf_write_detailed_csv"));
+    }
     if (fn) {
         fn(cgraph, fp);
     }
 }
 
 static const char * llama_perf_ggml_backend_type(enum ggml_compute_backend_type backend) {
-    static auto fn = reinterpret_cast<ggml_backend_type_t>(llama_resolve_ggml_proc_address("ggml_backend_type"));
+    static ggml_backend_type_t fn = nullptr;
+    if (!fn) {
+        fn = reinterpret_cast<ggml_backend_type_t>(llama_resolve_ggml_proc_address("ggml_backend_type"));
+    }
     return fn ? fn(backend) : "UNK";
 }
 #else

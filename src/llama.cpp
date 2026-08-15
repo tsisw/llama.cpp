@@ -90,13 +90,28 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
     }
 }
 
+// ggml_backend_init_by_name("TSAVORITE", ...) allocates a fresh backend
+// instance (and runtime context) on every call -- it also resets the
+// device's op-run stats and re-acquires the device. Cache the single
+// instance created for profiling/shutdown here instead of creating (and,
+// for the profile path, leaking) a new one on every call.
+static ggml_backend_t g_tsavorite_profile_backend = nullptr;
+
+static ggml_backend_t llama_tsavorite_backend_for_profile(void) {
+    if (!g_tsavorite_profile_backend) {
+        g_tsavorite_profile_backend = ggml_backend_init_by_name("TSAVORITE", NULL);
+    }
+    return g_tsavorite_profile_backend;
+}
+
 extern "C"
 void llama_backend_log_profile(void) {
-    ggml_backend_log_profile_info(ggml_backend_init_by_name("TSAVORITE", NULL));
+    ggml_backend_log_profile_info(llama_tsavorite_backend_for_profile());
 }
 
 void llama_backend_free(void) {
-    ggml_backend_free(ggml_backend_init_by_name("TSAVORITE", NULL));
+    ggml_backend_free(llama_tsavorite_backend_for_profile());
+    g_tsavorite_profile_backend = nullptr;
     ggml_quantize_free();
 }
 

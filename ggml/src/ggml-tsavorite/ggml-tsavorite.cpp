@@ -57,6 +57,7 @@ using TsavoriteDeviceConfig = tsi::runtime::FPGADeviceConfig;
 #endif
 
 #include <thread>
+#include <atomic>
 #include <vector>
 #include  <mutex>
 #include <condition_variable>
@@ -1530,13 +1531,23 @@ static void tsi_unload_all_blobs() {
 }
 
 static inline void tsi_init_per_txe_state_once() {
+    // This is called unconditionally at the top of every op-dispatch entry
+    // point, so once initialization is done, skip the lock entirely rather
+    // than paying a mutex acquisition on every single dispatch.
+    static std::atomic<bool> initialized{false};
+    if (initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
     // Guards device_free/packed_args/scalar_*_args lazy allocation below.
-    // Multiple op-dispatch entry points call this unconditionally on every
-    // invocation when multi_thread_enable=true, so concurrent worker threads
-    // can race into the check-then-act allocation (a non-atomic std::vector
-    // mutation) on first use, corrupting packed_args and causing an
-    // intermittent, hard-to-repro crash later inside the SDK.
+    // Concurrent worker threads can race into the check-then-act allocation
+    // (a non-atomic std::vector mutation) on first use, corrupting
+    // packed_args and causing an intermittent, hard-to-repro crash later
+    // inside the SDK.
     std::lock_guard<std::mutex> lock(tsi_init_mutex);
+    if (initialized.load(std::memory_order_relaxed)) {
+        return; // another thread finished initializing while we waited for the lock
+    }
 
     // allocate device_free[]
     if (!device_free) {
@@ -1628,6 +1639,8 @@ static inline void tsi_init_per_txe_state_once() {
             }
         }
     }
+
+    initialized.store(true, std::memory_order_release);
 }
 
 // Centralized TSI runtime initialization - called once globally
