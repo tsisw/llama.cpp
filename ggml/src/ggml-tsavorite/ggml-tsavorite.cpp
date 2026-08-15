@@ -101,6 +101,7 @@ struct TsavoriteRuntimeState {
     std::mutex workers_mutex;
     std::mutex device_mutex;
     std::mutex tsi_pack_mutex;
+    std::mutex tsi_init_mutex;
     std::condition_variable device_cv;
     // blobs
     BlobDescriptor **blobDescriptor_add = nullptr;
@@ -161,6 +162,7 @@ auto &workers = g_rt.workers;
 auto &workers_mutex = g_rt.workers_mutex;
 auto &device_mutex = g_rt.device_mutex;
 auto &tsi_pack_mutex = g_rt.tsi_pack_mutex;
+auto &tsi_init_mutex = g_rt.tsi_init_mutex;
 auto &device_cv = g_rt.device_cv;
 
 auto &blobDescriptor_add      = g_rt.blobDescriptor_add;
@@ -1528,6 +1530,14 @@ static void tsi_unload_all_blobs() {
 }
 
 static inline void tsi_init_per_txe_state_once() {
+    // Guards device_free/packed_args/scalar_*_args lazy allocation below.
+    // Multiple op-dispatch entry points call this unconditionally on every
+    // invocation when multi_thread_enable=true, so concurrent worker threads
+    // can race into the check-then-act allocation (a non-atomic std::vector
+    // mutation) on first use, corrupting packed_args and causing an
+    // intermittent, hard-to-repro crash later inside the SDK.
+    std::lock_guard<std::mutex> lock(tsi_init_mutex);
+
     // allocate device_free[]
     if (!device_free) {
         device_free = (bool*)calloc(num_of_txes, sizeof(bool));
