@@ -4827,6 +4827,18 @@ static inline void ensure_triton_full_buffers(
 #endif
 }
 
+// Guards the static descriptor/payload buffers below: they are shared,
+// process-wide storage reused across every call (not per-device, unlike
+// call_triton_matmul_full_packed_on_device()'s g_triton_desc_mt). With
+// multi_thread_enable=true, concurrent calls into this function race on
+// populating those buffers (init_rank1_memref_flat/init_scalar_i32_memref_aligned
+// write them with no synchronization) before ever reaching the
+// tsi_pack_mutex-protected dispatch call -- one caller's in-flight descriptor
+// data can be overwritten by another's mid-dispatch, corrupting the handle
+// tsi_shmem_handle_from_ptr() resolves it to. Serializing the whole
+// populate+dispatch sequence here closes that race.
+static std::mutex g_full_packed_static_mutex;
+
 static inline void call_triton_matmul_full_packed(
     const triton_matmul_txe_shape_t &txe_shape,
     float *A_full,     // physical [M_pad x K]
@@ -4835,6 +4847,8 @@ static inline void call_triton_matmul_full_packed(
     int32_t M_pad,
     int32_t N_pad,
     int32_t K) {
+
+    std::lock_guard<std::mutex> lock(g_full_packed_static_mutex);
 
     static MemRefDescriptor<Rank_Triton> *A_desc = nullptr;
     static MemRefDescriptor<Rank_Triton> *B_desc = nullptr;
