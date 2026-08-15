@@ -961,30 +961,61 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
 #ifdef OLLAMA
 // Ollama statically links this file into its Go binary while the ggml core
-// (where ggml_perf_accumulate is defined) is built into a separately
-// dlopen'd backend shared library, so the symbol is not link-time visible
-// here. Resolve it once, dynamically, through whichever loaded backend
-// exports it (the function itself is backend-agnostic).
+// (where these ggml_perf_*/ggml_backend_type functions are defined) is built
+// into a separately dlopen'd backend shared library, so the symbols are not
+// link-time visible here. Resolve each one once, dynamically, through
+// whichever loaded backend exports it (they're all backend-agnostic).
+static void * llama_resolve_ggml_proc_address(const char * name) {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        void * addr = ggml_backend_reg_get_proc_address(reg, name);
+        if (addr) {
+            return addr;
+        }
+    }
+    return nullptr;
+}
+
 typedef void (*ggml_perf_accumulate_t)(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph);
+typedef FILE * (*ggml_perf_log_open_t)(const char * filename);
+typedef void (*ggml_perf_write_detailed_csv_t)(struct ggml_cgraph * cgraph, FILE * fp);
+typedef const char * (*ggml_backend_type_t)(enum ggml_compute_backend_type backend);
 
 static void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
-    static ggml_perf_accumulate_t fn = []() -> ggml_perf_accumulate_t {
-        for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-            void * addr = ggml_backend_reg_get_proc_address(reg, "ggml_perf_accumulate");
-            if (addr) {
-                return reinterpret_cast<ggml_perf_accumulate_t>(addr);
-            }
-        }
-        return nullptr;
-    }();
+    static auto fn = reinterpret_cast<ggml_perf_accumulate_t>(llama_resolve_ggml_proc_address("ggml_perf_accumulate"));
     if (fn) {
         fn(totals, cgraph);
     }
 }
+
+static FILE * llama_perf_ggml_log_open(const char * filename) {
+    static auto fn = reinterpret_cast<ggml_perf_log_open_t>(llama_resolve_ggml_proc_address("ggml_perf_log_open"));
+    return fn ? fn(filename) : nullptr;
+}
+
+static void llama_perf_ggml_write_detailed_csv(struct ggml_cgraph * cgraph, FILE * fp) {
+    static auto fn = reinterpret_cast<ggml_perf_write_detailed_csv_t>(llama_resolve_ggml_proc_address("ggml_perf_write_detailed_csv"));
+    if (fn) {
+        fn(cgraph, fp);
+    }
+}
+
+static const char * llama_perf_ggml_backend_type(enum ggml_compute_backend_type backend) {
+    static auto fn = reinterpret_cast<ggml_backend_type_t>(llama_resolve_ggml_proc_address("ggml_backend_type"));
+    return fn ? fn(backend) : "UNK";
+}
 #else
 static inline void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
     ggml_perf_accumulate(totals, cgraph);
+}
+static inline FILE * llama_perf_ggml_log_open(const char * filename) {
+    return ggml_perf_log_open(filename);
+}
+static inline void llama_perf_ggml_write_detailed_csv(struct ggml_cgraph * cgraph, FILE * fp) {
+    ggml_perf_write_detailed_csv(cgraph, fp);
+}
+static inline const char * llama_perf_ggml_backend_type(enum ggml_compute_backend_type backend) {
+    return ggml_backend_type(backend);
 }
 #endif
 
@@ -1103,7 +1134,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     static bool perf_all_shape_written_once = false;
 
     if (!perf_all_shape_fp) {
-        perf_all_shape_fp = ggml_perf_log_open("ggml_perf-all-shape.log");
+        perf_all_shape_fp = llama_perf_ggml_log_open("ggml_perf-all-shape.log");
     }
 #endif /* GGML_PERF_DETAIL */
 
@@ -1136,7 +1167,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 #elif defined(GGML_PERF_DETAIL)
     if (res) {
         if (!perf_all_shape_written_once && perf_all_shape_fp) {
-            ggml_perf_write_detailed_csv(res->get_gf(), perf_all_shape_fp);
+            llama_perf_ggml_write_detailed_csv(res->get_gf(), perf_all_shape_fp);
             fflush(perf_all_shape_fp);
             perf_all_shape_written_once = true;
         } 
@@ -2866,7 +2897,7 @@ void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
         if (totals[i].runs > 0) {
             for (int b = 0; b < GGML_COMPUTE_BACKEND_COUNT; ++b) {
                 if (totals[i].backend_subtotals[b].runs > 0) {
-                    const char *backend_name = ggml_backend_type((enum ggml_compute_backend_type) b);
+                    const char *backend_name = llama_perf_ggml_backend_type((enum ggml_compute_backend_type) b);
                     char padded_backend[7] = {0}; // 6 chars + null terminator
                     snprintf(padded_backend, sizeof(padded_backend), "%-6s", backend_name);
 
@@ -2888,7 +2919,7 @@ void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
                         const char *backend_name = NULL;
                         for (int b = 0; b < GGML_COMPUTE_BACKEND_COUNT; ++b) {
                             if (totals[i].backend_subtotals[b].runs > 0) {
-                                backend_name = ggml_backend_type((enum ggml_compute_backend_type) b);
+                                backend_name = llama_perf_ggml_backend_type((enum ggml_compute_backend_type) b);
                                 break;
                             }
                         }

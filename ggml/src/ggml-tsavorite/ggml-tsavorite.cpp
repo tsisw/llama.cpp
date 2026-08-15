@@ -7786,6 +7786,15 @@ static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, co
     if (strcmp(name, "ggml_perf_accumulate") == 0) {
         return (void *)ggml_perf_accumulate;
     }
+    if (strcmp(name, "ggml_perf_log_open") == 0) {
+        return (void *)ggml_perf_log_open;
+    }
+    if (strcmp(name, "ggml_perf_write_detailed_csv") == 0) {
+        return (void *)ggml_perf_write_detailed_csv;
+    }
+    if (strcmp(name, "ggml_backend_type") == 0) {
+        return (void *)ggml_backend_type;
+    }
     return NULL;
 
     GGML_UNUSED(reg);
