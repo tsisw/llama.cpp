@@ -11,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -983,10 +984,16 @@ typedef const char * (*ggml_backend_type_t)(enum ggml_compute_backend_type backe
 
 // Note: each lookup below retries (rather than permanently caching a null
 // result) since backends can register with the reg after the first call.
+// The cache itself is an atomic (not a plain static pointer) because
+// decode() can run concurrently for these -- an unsynchronized read/write
+// of a non-atomic function-local static from multiple threads is a data
+// race even though every writer would store the same resolved value.
 static void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
-    static ggml_perf_accumulate_t fn = nullptr;
+    static std::atomic<ggml_perf_accumulate_t> cached_fn{nullptr};
+    ggml_perf_accumulate_t fn = cached_fn.load(std::memory_order_relaxed);
     if (!fn) {
         fn = reinterpret_cast<ggml_perf_accumulate_t>(llama_resolve_ggml_proc_address("ggml_perf_accumulate"));
+        cached_fn.store(fn, std::memory_order_relaxed);
     }
     if (fn) {
         fn(totals, cgraph);
@@ -994,18 +1001,22 @@ static void llama_perf_ggml_accumulate(struct ggml_perf_totals totals[GGML_OP_CO
 }
 
 static FILE * llama_perf_ggml_log_open(const char * filename) {
-    static ggml_perf_log_open_t fn = nullptr;
+    static std::atomic<ggml_perf_log_open_t> cached_fn{nullptr};
+    ggml_perf_log_open_t fn = cached_fn.load(std::memory_order_relaxed);
     if (!fn) {
         fn = reinterpret_cast<ggml_perf_log_open_t>(llama_resolve_ggml_proc_address("ggml_perf_log_open"));
+        cached_fn.store(fn, std::memory_order_relaxed);
     }
     return fn ? fn(filename) : nullptr;
 }
 
 static void llama_perf_ggml_write_detailed_csv(struct ggml_cgraph * cgraph, FILE * fp) {
-    static ggml_perf_write_detailed_csv_t fn = nullptr;
+    static std::atomic<ggml_perf_write_detailed_csv_t> cached_fn{nullptr};
+    ggml_perf_write_detailed_csv_t fn = cached_fn.load(std::memory_order_relaxed);
     if (!fn) {
         fn = reinterpret_cast<ggml_perf_write_detailed_csv_t>(
             llama_resolve_ggml_proc_address("ggml_perf_write_detailed_csv"));
+        cached_fn.store(fn, std::memory_order_relaxed);
     }
     if (fn) {
         fn(cgraph, fp);
@@ -1013,9 +1024,11 @@ static void llama_perf_ggml_write_detailed_csv(struct ggml_cgraph * cgraph, FILE
 }
 
 static const char * llama_perf_ggml_backend_type(enum ggml_compute_backend_type backend) {
-    static ggml_backend_type_t fn = nullptr;
+    static std::atomic<ggml_backend_type_t> cached_fn{nullptr};
+    ggml_backend_type_t fn = cached_fn.load(std::memory_order_relaxed);
     if (!fn) {
         fn = reinterpret_cast<ggml_backend_type_t>(llama_resolve_ggml_proc_address("ggml_backend_type"));
+        cached_fn.store(fn, std::memory_order_relaxed);
     }
     return fn ? fn(backend) : "UNK";
 }

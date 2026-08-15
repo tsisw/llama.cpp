@@ -84,6 +84,12 @@ struct TsavoriteRuntimeState {
     // device / threading
     uint32_t num_of_txes = 1;
     bool *device_free = nullptr;
+    // Mirrors whether device_free/packed_args/scalar_*_args are currently
+    // allocated. Must be reset to false everywhere device_free is freed
+    // (tsi_cleanup, ggml_tsavorite_free, tsi_log_profile_info) or the next
+    // tsi_init_per_txe_state_once() call will wrongly skip reallocating
+    // them, leaving dangling pointers behind.
+    std::atomic<bool> per_txe_state_initialized{false};
     bool multi_thread_enable = false;
     // one packed-args buffer per TXE
     std::vector<void *> packed_args;
@@ -147,6 +153,7 @@ static TsavoriteRuntimeState g_rt;
 // aliases (USE THESE EVERYWHERE)
 auto &num_of_txes = g_rt.num_of_txes;
 auto &device_free = g_rt.device_free;
+auto &per_txe_state_initialized = g_rt.per_txe_state_initialized;
 auto &multi_thread_enable     = g_rt.multi_thread_enable;
 auto &packed_args     = g_rt.packed_args;
 
@@ -1533,9 +1540,12 @@ static void tsi_unload_all_blobs() {
 static inline void tsi_init_per_txe_state_once() {
     // This is called unconditionally at the top of every op-dispatch entry
     // point, so once initialization is done, skip the lock entirely rather
-    // than paying a mutex acquisition on every single dispatch.
-    static std::atomic<bool> initialized{false};
-    if (initialized.load(std::memory_order_acquire)) {
+    // than paying a mutex acquisition on every single dispatch. The flag
+    // lives in shared runtime state (not a function-local static) because
+    // tsi_cleanup()/ggml_tsavorite_free()/tsi_log_profile_info() free
+    // device_free and must reset this alongside it, or a later dispatch
+    // would skip reallocation and dereference the freed pointer.
+    if (per_txe_state_initialized.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -1545,7 +1555,7 @@ static inline void tsi_init_per_txe_state_once() {
     // packed_args and causing an intermittent, hard-to-repro crash later
     // inside the SDK.
     std::lock_guard<std::mutex> lock(tsi_init_mutex);
-    if (initialized.load(std::memory_order_relaxed)) {
+    if (per_txe_state_initialized.load(std::memory_order_relaxed)) {
         return; // another thread finished initializing while we waited for the lock
     }
 
@@ -1640,7 +1650,7 @@ static inline void tsi_init_per_txe_state_once() {
         }
     }
 
-    initialized.store(true, std::memory_order_release);
+    per_txe_state_initialized.store(true, std::memory_order_release);
 }
 
 // Centralized TSI runtime initialization - called once globally
@@ -2878,6 +2888,7 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
           free(device_free);
          device_free = NULL;
       }
+      per_txe_state_initialized.store(false, std::memory_order_release);
       sleep(2);
       tsi_finalize();
       tsirt::utils::TSIProfiler::finalize();
@@ -2906,6 +2917,7 @@ tsi_cleanup() {
         free(device_free);
         device_free = NULL;
     }
+    per_txe_state_initialized.store(false, std::memory_order_release);
     sleep(2);
     tsi_finalize();
     GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
@@ -7241,6 +7253,7 @@ tsi_log_profile_info() {
         free(device_free);
         device_free = NULL;
     }
+    per_txe_state_initialized.store(false, std::memory_order_release);
     printf("\n finalize 4 \n");
     tsi_finalize();
     tsirt::utils::TSIProfiler::finalize();

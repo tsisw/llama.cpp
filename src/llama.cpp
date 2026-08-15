@@ -96,6 +96,12 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 // instance created for profiling/shutdown here instead of creating (and,
 // for the profile path, leaking) a new one on every call.
 static ggml_backend_t g_tsavorite_profile_backend = nullptr;
+// TSAVORITE's .profile hook (tsi_log_profile_info) doesn't just print --
+// it also finalizes the runtime (unloads blobs, frees device state, calls
+// tsi_finalize()). Once that's run, g_tsavorite_profile_backend wraps an
+// already-torn-down context, so ggml_backend_free()'s normal teardown path
+// must not run on it again afterward.
+static bool g_tsavorite_profile_backend_finalized = false;
 
 static ggml_backend_t llama_tsavorite_backend_for_profile(void) {
     if (!g_tsavorite_profile_backend) {
@@ -107,10 +113,15 @@ static ggml_backend_t llama_tsavorite_backend_for_profile(void) {
 extern "C"
 void llama_backend_log_profile(void) {
     ggml_backend_log_profile_info(llama_tsavorite_backend_for_profile());
+    g_tsavorite_profile_backend_finalized = true;
 }
 
 void llama_backend_free(void) {
-    ggml_backend_free(llama_tsavorite_backend_for_profile());
+    if (g_tsavorite_profile_backend && !g_tsavorite_profile_backend_finalized) {
+        ggml_backend_free(g_tsavorite_profile_backend);
+    }
+    // else: already finalized by the profile hook, or never created --
+    // nothing left to safely tear down, and the process is exiting anyway.
     g_tsavorite_profile_backend = nullptr;
     ggml_quantize_free();
 }
