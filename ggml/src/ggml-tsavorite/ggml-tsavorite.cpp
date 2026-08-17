@@ -57,6 +57,7 @@ using TsavoriteDeviceConfig = tsi::runtime::FPGADeviceConfig;
 #endif
 
 #include <thread>
+#include <atomic>
 #include <vector>
 #include  <mutex>
 #include <condition_variable>
@@ -83,6 +84,12 @@ struct TsavoriteRuntimeState {
     // device / threading
     uint32_t num_of_txes = 1;
     bool *device_free = nullptr;
+    // Mirrors whether device_free/packed_args/scalar_*_args are currently
+    // allocated. Must be reset to false everywhere device_free is freed
+    // (tsi_cleanup, ggml_tsavorite_free, tsi_log_profile_info) or the next
+    // tsi_init_per_txe_state_once() call will wrongly skip reallocating
+    // them, leaving dangling pointers behind.
+    std::atomic<bool> per_txe_state_initialized{false};
     bool multi_thread_enable = false;
     // one packed-args buffer per TXE
     std::vector<void *> packed_args;
@@ -101,6 +108,7 @@ struct TsavoriteRuntimeState {
     std::mutex workers_mutex;
     std::mutex device_mutex;
     std::mutex tsi_pack_mutex;
+    std::mutex tsi_init_mutex;
     std::condition_variable device_cv;
     // blobs
     BlobDescriptor **blobDescriptor_add = nullptr;
@@ -145,6 +153,7 @@ static TsavoriteRuntimeState g_rt;
 // aliases (USE THESE EVERYWHERE)
 auto &num_of_txes = g_rt.num_of_txes;
 auto &device_free = g_rt.device_free;
+auto &per_txe_state_initialized = g_rt.per_txe_state_initialized;
 auto &multi_thread_enable     = g_rt.multi_thread_enable;
 auto &packed_args     = g_rt.packed_args;
 
@@ -161,6 +170,7 @@ auto &workers = g_rt.workers;
 auto &workers_mutex = g_rt.workers_mutex;
 auto &device_mutex = g_rt.device_mutex;
 auto &tsi_pack_mutex = g_rt.tsi_pack_mutex;
+auto &tsi_init_mutex = g_rt.tsi_init_mutex;
 auto &device_cv = g_rt.device_cv;
 
 auto &blobDescriptor_add      = g_rt.blobDescriptor_add;
@@ -1527,7 +1537,48 @@ static void tsi_unload_all_blobs() {
     tsi_blob_free_tables();
 }
 
+// Call at every teardown site that frees device_free (tsi_cleanup,
+// ggml_tsavorite_free, tsi_log_profile_info). tsi_finalize() invalidates
+// the per-TXE tsi_alloc buffers, but packed_args/scalar_*_args keep their
+// old (now dangling) pointers -- tsi_init_per_txe_state_once() only
+// reallocates when a vector's size changes, so leaving them at their
+// current size would make the next dispatch use stale buffers. Clearing
+// them (not just resetting per_txe_state_initialized) forces a full
+// reallocation on the next init.
+static inline void tsi_reset_per_txe_state_after_teardown() {
+    packed_args.clear();
+    scalar_loop_args.clear();
+    scalar_m_args.clear();
+    scalar_n_args.clear();
+    scalar_k_args.clear();
+    scalar_grid1_args.clear();
+    scalar_grid2_args.clear();
+    scalar_grid3_args.clear();
+    per_txe_state_initialized.store(false, std::memory_order_release);
+}
+
 static inline void tsi_init_per_txe_state_once() {
+    // This is called unconditionally at the top of every op-dispatch entry
+    // point, so once initialization is done, skip the lock entirely rather
+    // than paying a mutex acquisition on every single dispatch. The flag
+    // lives in shared runtime state (not a function-local static) because
+    // tsi_cleanup()/ggml_tsavorite_free()/tsi_log_profile_info() free
+    // device_free and must reset this alongside it, or a later dispatch
+    // would skip reallocation and dereference the freed pointer.
+    if (per_txe_state_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Guards device_free/packed_args/scalar_*_args lazy allocation below.
+    // Concurrent worker threads can race into the check-then-act allocation
+    // (a non-atomic std::vector mutation) on first use, corrupting
+    // packed_args and causing an intermittent, hard-to-repro crash later
+    // inside the SDK.
+    std::lock_guard<std::mutex> lock(tsi_init_mutex);
+    if (per_txe_state_initialized.load(std::memory_order_relaxed)) {
+        return; // another thread finished initializing while we waited for the lock
+    }
+
     // allocate device_free[]
     if (!device_free) {
         device_free = (bool*)calloc(num_of_txes, sizeof(bool));
@@ -1618,6 +1669,8 @@ static inline void tsi_init_per_txe_state_once() {
             }
         }
     }
+
+    per_txe_state_initialized.store(true, std::memory_order_release);
 }
 
 // Centralized TSI runtime initialization - called once globally
@@ -2855,6 +2908,7 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
           free(device_free);
          device_free = NULL;
       }
+      tsi_reset_per_txe_state_after_teardown();
       sleep(2);
       tsi_finalize();
       tsirt::utils::TSIProfiler::finalize();
@@ -2883,6 +2937,7 @@ tsi_cleanup() {
         free(device_free);
         device_free = NULL;
     }
+    tsi_reset_per_txe_state_after_teardown();
     sleep(2);
     tsi_finalize();
     GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
@@ -4817,6 +4872,18 @@ static inline void ensure_triton_full_buffers(
 #endif
 }
 
+// Guards the static descriptor/payload buffers below: they are shared,
+// process-wide storage reused across every call (not per-device, unlike
+// call_triton_matmul_full_packed_on_device()'s g_triton_desc_mt). With
+// multi_thread_enable=true, concurrent calls into this function race on
+// populating those buffers (init_rank1_memref_flat/init_scalar_i32_memref_aligned
+// write them with no synchronization) before ever reaching the
+// tsi_pack_mutex-protected dispatch call -- one caller's in-flight descriptor
+// data can be overwritten by another's mid-dispatch, corrupting the handle
+// tsi_shmem_handle_from_ptr() resolves it to. Serializing the whole
+// populate+dispatch sequence here closes that race.
+static std::mutex g_full_packed_static_mutex;
+
 static inline void call_triton_matmul_full_packed(
     const triton_matmul_txe_shape_t &txe_shape,
     float *A_full,     // physical [M_pad x K]
@@ -4825,6 +4892,8 @@ static inline void call_triton_matmul_full_packed(
     int32_t M_pad,
     int32_t N_pad,
     int32_t K) {
+
+    std::lock_guard<std::mutex> lock(g_full_packed_static_mutex);
 
     static MemRefDescriptor<Rank_Triton> *A_desc = nullptr;
     static MemRefDescriptor<Rank_Triton> *B_desc = nullptr;
@@ -7204,6 +7273,7 @@ tsi_log_profile_info() {
         free(device_free);
         device_free = NULL;
     }
+    tsi_reset_per_txe_state_after_teardown();
     printf("\n finalize 4 \n");
     tsi_finalize();
     tsirt::utils::TSIProfiler::finalize();
@@ -7759,6 +7829,24 @@ static void * ggml_backend_tsavorite_get_proc_address(ggml_backend_reg_t reg, co
         return (void *)ggml_backend_tsavorite_set_threadpool;
     }
 #endif
+    if (strcmp(name, "ggml_perf_accumulate") == 0) {
+        return (void *)ggml_perf_accumulate;
+    }
+#if defined(GGML_PERF_DETAIL)
+    // ggml_perf_log_open/write_detailed_csv only exist in ggml.c under
+    // GGML_PERF_DETAIL (see ggml.c's own #if guard around their definitions);
+    // taking their address here unconditionally would leave a dangling
+    // undefined reference in GGML_PERF_RELEASE/GGML_PERF builds.
+    if (strcmp(name, "ggml_perf_log_open") == 0) {
+        return (void *)ggml_perf_log_open;
+    }
+    if (strcmp(name, "ggml_perf_write_detailed_csv") == 0) {
+        return (void *)ggml_perf_write_detailed_csv;
+    }
+#endif
+    if (strcmp(name, "ggml_backend_type") == 0) {
+        return (void *)ggml_backend_type;
+    }
     return NULL;
 
     GGML_UNUSED(reg);
