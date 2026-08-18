@@ -2142,6 +2142,16 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    // perf_totals was added to llama_context after this function was written
+    // and never got wired in here, so callers resetting perf state via this
+    // function (e.g. ollama's per-completion PerfPrint/reset) left the GGML
+    // per-op totals accumulating across every reset, unlike every other
+    // field this function resets.
+    for (auto & t : perf_totals) {
+        t = {};
+    }
+#endif /* GGML_PERF-related flags */
 }
 
 std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context::memory_breakdown() const {
