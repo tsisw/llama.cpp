@@ -6261,11 +6261,6 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     src1 = node->src[1];
     min_num_of_elem = 0;
     max_num_of_elem = 0;
-    // Some op types with no kernel/blob (GET_ROWS, SOFT_MAX, etc.) are handled
-    // by calling ggml's own CPU compute function directly further below,
-    // rather than launching a Tsavorite kernel. Snapshot the kernel-run count
-    // here so the perf Target label below can tell the two cases apart.
-    const int64_t tsi_kernel_runs_before_node = node->tsi_kernel_runs;
     if(node->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && (!src1 || src1->type == GGML_TYPE_F32))
 	    kernel_sub_type = DATA_TYPE_F32_INDEX;
     /*
@@ -6876,15 +6871,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
     int64_t t_end = ggml_time_us();
     node->perf_runs++;
-    // Only report this node as having run on OPU if a kernel was actually
-    // launched for it this call. Op types with no kernel (GET_ROWS, SOFT_MAX,
-    // etc.) reach this point too, having been computed via a direct call to
-    // ggml's own CPU function further up -- without this check they were
-    // unconditionally marked TSAVORITE/OPU despite zero kernel runs, which is
-    // exactly what the Target/TSI_KERNEL-RUN columns are meant to make visible.
-    node->ggml_compute_backend = (node->tsi_kernel_runs > tsi_kernel_runs_before_node)
-        ? GGML_COMPUTE_BACKEND_TSAVORITE
-        : GGML_COMPUTE_BACKEND_CPU;
+    node->ggml_compute_backend = GGML_COMPUTE_BACKEND_TSAVORITE;
     if (t_end >= t_start) {
         node->perf_time_us += (t_end - t_start);
     } else {
