@@ -7405,8 +7405,8 @@ void ggml_perf_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct 
         const int64_t node_tsi_kernel_runs = node->tsi_kernel_runs;
 
         if (op == GGML_OP_RMS_NORM || op == GGML_OP_CONT) {
-            fprintf(stderr, "[TSI_DEBUG2] node_i=%d addr=%p op=%s perf_runs=%lld perf_time_us=%lld tsi_kernel_runs=%lld\n",
-                i, (void *) node, ggml_op_name(op), (long long) node_perf_runs, (long long) node_perf_time_us, (long long) node_tsi_kernel_runs);
+            fprintf(stderr, "[TSI_DEBUG2] node_i=%d addr=%p op=%s perf_runs=%lld perf_time_us=%lld tsi_kernel_runs=%lld ggml_compute_backend=%d\n",
+                i, (void *) node, ggml_op_name(op), (long long) node_perf_runs, (long long) node_perf_time_us, (long long) node_tsi_kernel_runs, (int) node->ggml_compute_backend);
         }
 
         if (node_perf_runs == 0 && node_perf_time_us == 0 && node_tsi_kernel_runs == 0) {

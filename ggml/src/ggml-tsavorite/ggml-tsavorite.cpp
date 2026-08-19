@@ -6878,6 +6878,10 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     }
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
     int64_t t_end = ggml_time_us();
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_CONT) {
+        fprintf(stderr, "[TSI_DEBUG3] BEFORE_WRAPUP i=%d addr=%p op=%s perf_runs=%lld ggml_compute_backend=%d perf_time_us=%lld t_start=%lld t_end=%lld\n",
+            i, (void*)node, ggml_op_name(node->op), (long long)node->perf_runs, (int)node->ggml_compute_backend, (long long)node->perf_time_us, (long long)t_start, (long long)t_end);
+    }
     node->perf_runs++;
     node->ggml_compute_backend = GGML_COMPUTE_BACKEND_TSAVORITE;
     if (t_end >= t_start) {
@@ -6885,6 +6889,10 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     } else {
         // Handle wraparound by assuming timer rolls over at max int64_t value
         node->perf_time_us += (INT64_MAX - t_start + t_end + 1);
+    }
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_CONT) {
+        fprintf(stderr, "[TSI_DEBUG3] AFTER_WRAPUP  i=%d addr=%p op=%s perf_runs=%lld ggml_compute_backend=%d perf_time_us=%lld\n",
+            i, (void*)node, ggml_op_name(node->op), (long long)node->perf_runs, (int)node->ggml_compute_backend, (long long)node->perf_time_us);
     }
 #endif /* GGML_PERF-related flags */
     join_all_workers();
