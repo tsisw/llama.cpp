@@ -1704,6 +1704,13 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.padding      =*/ { 0 },
     };
 
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    if ((int)result->ggml_compute_backend != (int)GGML_COMPUTE_BACKEND_CPU) {
+        fprintf(stderr, "[TSI_DEBUG4] DIRTY_BACKEND_AT_CREATION addr=%p ggml_compute_backend=%d\n",
+            (void *) result, (int) result->ggml_compute_backend);
+    }
+#endif
+
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(result->data);
 
@@ -7405,8 +7412,10 @@ void ggml_perf_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct 
         const int64_t node_tsi_kernel_runs = node->tsi_kernel_runs;
 
         if (op == GGML_OP_RMS_NORM || op == GGML_OP_CONT) {
-            fprintf(stderr, "[TSI_DEBUG2] node_i=%d addr=%p op=%s perf_runs=%lld perf_time_us=%lld tsi_kernel_runs=%lld ggml_compute_backend=%d\n",
-                i, (void *) node, ggml_op_name(op), (long long) node_perf_runs, (long long) node_perf_time_us, (long long) node_tsi_kernel_runs, (int) node->ggml_compute_backend);
+            fprintf(stderr, "[TSI_DEBUG2] node_i=%d addr=%p op=%s perf_runs=%lld perf_time_us=%lld tsi_kernel_runs=%lld ggml_compute_backend=%d data=%p view_src=%p buffer=%p extra=%p src0=%p src1=%p ne0=%lld ne1=%lld nb0=%lld nb1=%lld\n",
+                i, (void *) node, ggml_op_name(op), (long long) node_perf_runs, (long long) node_perf_time_us, (long long) node_tsi_kernel_runs, (int) node->ggml_compute_backend,
+                node->data, (void*) node->view_src, (void*) node->buffer, node->extra, (void*) node->src[0], (void*) node->src[1],
+                (long long) node->ne[0], (long long) node->ne[1], (long long) node->nb[0], (long long) node->nb[1]);
         }
 
         if (node_perf_runs == 0 && node_perf_time_us == 0 && node_tsi_kernel_runs == 0) {
