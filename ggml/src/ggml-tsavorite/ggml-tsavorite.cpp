@@ -6257,6 +6257,14 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     int64_t t_start = ggml_time_us();
 #endif /* GGML_PERF-related flags */
     node = cgraph->nodes[i];
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    // tsi_kernel_runs must reflect only this pass's real kernel launches (if
+    // any of the increment sites below fire for this node). Clear it before
+    // dispatch so a node whose kernel_type never launches a real TXE blob
+    // (e.g. CONT/SOFT_MAX/GET_ROWS taking the CPU-fallback path) reports 0
+    // instead of carrying over an unrelated value.
+    node->tsi_kernel_runs = 0;
+#endif /* GGML_PERF-related flags */
     src0 = node->src[0];
     src1 = node->src[1];
     min_num_of_elem = 0;
