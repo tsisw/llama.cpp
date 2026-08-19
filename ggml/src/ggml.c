@@ -1704,6 +1704,13 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.padding      =*/ { 0 },
     };
 
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    if (result->tsi_kernel_runs != 0 || result->perf_runs != 0 || result->perf_time_us != 0) {
+        fprintf(stderr, "[TSI_DEBUG] NEW_TENSOR_DIRTY addr=%p tsi_kernel_runs=%lld perf_runs=%lld perf_time_us=%lld\n",
+            (void *) result, (long long) result->tsi_kernel_runs, (long long) result->perf_runs, (long long) result->perf_time_us);
+    }
+#endif
+
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(result->data);
 
