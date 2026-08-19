@@ -7411,6 +7411,11 @@ void ggml_perf_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct 
         const int64_t node_perf_runs = node->perf_runs;
         const int64_t node_tsi_kernel_runs = node->tsi_kernel_runs;
 
+        if (node_tsi_kernel_runs != 0) {
+            fprintf(stderr, "[TSI_DEBUG] ACCUMULATE_READ addr=%p op=%s tsi_kernel_runs=%lld perf_runs=%lld perf_time_us=%lld\n",
+                (void *) node, ggml_op_name(op), (long long) node_tsi_kernel_runs, (long long) node_perf_runs, (long long) node_perf_time_us);
+        }
+
         if (node_perf_runs == 0 && node_perf_time_us == 0 && node_tsi_kernel_runs == 0) {
             continue;
         }
