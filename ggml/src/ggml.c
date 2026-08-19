@@ -1704,13 +1704,6 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.padding      =*/ { 0 },
     };
 
-#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
-    if ((int)result->ggml_compute_backend != (int)GGML_COMPUTE_BACKEND_CPU) {
-        fprintf(stderr, "[TSI_DEBUG4] DIRTY_BACKEND_AT_CREATION addr=%p ggml_compute_backend=%d\n",
-            (void *) result, (int) result->ggml_compute_backend);
-    }
-#endif
-
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(result->data);
 
@@ -1725,6 +1718,15 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     }
 
     ctx->n_objects++;
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    if (result->ne[0] == 1024 && result->ne[1] == 8) {
+        fprintf(stderr, "[TSI_DEBUG5] CREATED addr=%p ggml_compute_backend=%d perf_runs=%lld perf_time_us=%lld tsi_kernel_runs=%lld view_src=%p data=%p obj_alloc_size=%zu\n",
+            (void *) result, (int) result->ggml_compute_backend, (long long) result->perf_runs,
+            (long long) result->perf_time_us, (long long) result->tsi_kernel_runs,
+            (void *) view_src, result->data, obj_alloc_size);
+    }
+#endif
 
     return result;
 }
