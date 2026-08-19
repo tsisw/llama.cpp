@@ -5510,6 +5510,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 }
 
                 ++node->tsi_kernel_runs;
+                fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 5512, ggml_op_name(node->op), (int)kernel_type);
                 ++profile.kernel_calls;
             }
         }
@@ -5735,6 +5736,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     }
 
     node->tsi_kernel_runs += launched_kernel_calls;
+    fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 5737, ggml_op_name(node->op), (int)kernel_type);
     profile.kernel_calls += (int64_t)launched_kernel_calls;
 
     profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
@@ -6093,6 +6095,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         // Stats per kernel call
                         if (device) ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                         ++node->tsi_kernel_runs;
+                        fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 6095, ggml_op_name(node->op), (int)kernel_type);
 
 #ifdef TMU_DEBUG_VALIDATE
                         // -----------------------------------------------------------------
@@ -6601,6 +6604,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, glob_buf);
                         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                         ++node->tsi_kernel_runs;
+                        fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 6603, ggml_op_name(node->op), (int)kernel_type);
 	            }
 	        }
 	    }
@@ -6722,6 +6726,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 #endif /* TRITON_ADD */
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                     ++node->tsi_kernel_runs;
+                    fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 6724, ggml_op_name(node->op), (int)kernel_type);
                 }
             }
         }
@@ -6838,6 +6843,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 	}
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
         ++node->tsi_kernel_runs;
+        fprintf(stderr, "[TSI_DEBUG] kernel_runs++ site=%d node->op=%s kernel_type=%d\n", 6840, ggml_op_name(node->op), (int)kernel_type);
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
           log_data.data_type = GGML_TSAVORITE_TENSOR_NODE;
