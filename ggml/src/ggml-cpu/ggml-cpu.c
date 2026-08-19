@@ -2890,7 +2890,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
-        int64_t t_start = ggml_time_us();
+        // Only the leader reads this (see the ith==0 guard below), so only the
+        // leader needs to pay for the ggml_time_us() call -- every other
+        // worker thread would otherwise read a timestamp it never uses.
+        int64_t t_start = 0;
+        if (state->ith == 0) {
+            t_start = ggml_time_us();
+        }
 #endif /* GGML_PERF-related flags */
         ggml_compute_forward(&params, node);
 
