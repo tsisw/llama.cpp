@@ -1194,13 +1194,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 #elif defined(GGML_PERF_DETAIL)
     if (res) {
+        static int tsi_accumulate_call_count = 0;
+        fprintf(stderr, "[TSI_DEBUG6] ACCUMULATE_CALL #%d n_nodes=%d ubatch.n_tokens=%u\n",
+            ++tsi_accumulate_call_count, res->get_gf()->n_nodes, ubatch.n_tokens);
         if (!perf_all_shape_written_once && perf_all_shape_fp) {
             llama_perf_ggml_write_detailed_csv(res->get_gf(), perf_all_shape_fp);
             fflush(perf_all_shape_fp);
             perf_all_shape_written_once = true;
-        } 
+        }
         llama_perf_ggml_accumulate(perf_totals, res->get_gf());
-    } 
+    }
 #endif /* GML_PERF-related flags */
 
 
