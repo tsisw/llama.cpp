@@ -2890,18 +2890,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
-        int64_t t_start = ggml_time_us();
+        // Only the leader reads this (see the ith==0 guard below), so only the
+        // leader needs to pay for the ggml_time_us() call -- every other
+        // worker thread would otherwise read a timestamp it never uses.
+        int64_t t_start = 0;
+        if (state->ith == 0) {
+            t_start = ggml_time_us();
+        }
 #endif /* GGML_PERF-related flags */
         ggml_compute_forward(&params, node);
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
-        int64_t t_end = ggml_time_us();
-        node->perf_runs++;
-        if (t_end >= t_start) {
-            node->perf_time_us += (t_end - t_start);
-        } else {
-            // Handle wraparound by assuming timer rolls over at max int64_t value
-            node->perf_time_us += (INT64_MAX - t_start + t_end + 1);
+        // Every thread in the pool runs this same loop over cgraph->nodes,
+        // each processing its own slice of a node's data (ggml_compute_forward
+        // splits work across threads internally) -- only the leader (ith==0)
+        // should count the node as "one run", otherwise perf_runs/perf_time_us
+        // get multiplied by the thread count instead of reflecting real
+        // per-node activity.
+        if (state->ith == 0) {
+            int64_t t_end = ggml_time_us();
+            node->perf_runs++;
+            if (t_end >= t_start) {
+                node->perf_time_us += (t_end - t_start);
+            } else {
+                // Handle wraparound by assuming timer rolls over at max int64_t value
+                node->perf_time_us += (INT64_MAX - t_start + t_end + 1);
+            }
         }
 #endif /* GGML_PERF-related flags */
         if (state->ith == 0 && cplan->abort_callback &&
