@@ -78,4 +78,3 @@ print("\n📊 Benchmark Summary:")
 print(f"{'Run':<5} {'Prompt Size':<12} {'Load Time (ms)':<18} {'Prompt Eval Time (ms)':<24} {'Eval Time (ms)':<18}")
 for result in results:
     print(f"{result['Run']:<5} {result['Prompt Size']:<12} {str(result['Load Time (ms)']):<18} {str(result['Prompt Eval Time (ms)']):<24} {str(result['Eval Time (ms)']):<18}")
-

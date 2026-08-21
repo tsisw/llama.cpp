@@ -42,4 +42,3 @@ set_target_properties(ggml-tsavorite PROPERTIES
   BUILD_RPATH "${CMAKE_BINARY_DIR}/lib/ollama"
 )
 endif()
-

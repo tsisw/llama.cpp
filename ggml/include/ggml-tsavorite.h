@@ -86,7 +86,7 @@ enum ggml_tsavorite_kernel_mode {
     GGML_TSAVORITE_KERNEL_MODE_MLIR
 };
 
-extern enum ggml_tsavorite_kernel_mode ggml_tsavorite_kernel_mode_flag; 
+extern enum ggml_tsavorite_kernel_mode ggml_tsavorite_kernel_mode_flag;
 extern enum ggml_tsavorite_log_type ggml_tsavorite_log_type_val;
 
 #define GGML_TSAVORITE_LOG_INFO(...)                                                               \
@@ -317,8 +317,8 @@ extern void _mlir_ciface_txe_mul_mat_tile_f32_k1024_host(void *A_tile, void *B_t
 extern void _mlir_ciface_txe_mul_mat_tile_f32_k2048_host(void *A_tile, void *B_tile, void *C_tile);
 #endif
 
-/* 
- * FP16 Kernels 
+/*
+ * FP16 Kernels
  */
 extern void _mlir_ciface_txe_add_16_host(void *a, void *b, void *res);
 extern void _mlir_ciface_txe_sub_16_host(void *a, void *b, void *res);

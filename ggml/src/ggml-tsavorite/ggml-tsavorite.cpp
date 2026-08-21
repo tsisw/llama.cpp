@@ -479,13 +479,13 @@ static inline std::string tsi_resolve_deployment_yaml_path() {
 #ifdef TMU_DEBUG_VALIDATE
 
 // CPU reference GEMM for TMU packed tiles using the SAME MemRefDescriptor<4>
-// struct used by your MLIR ciface wrappers (base/data/offset/shape/strides). 
+// struct used by your MLIR ciface wrappers (base/data/offset/shape/strides).
 // Interprets shapes as you set them in init_memref_4d():
 //   A: [1,1,M,K]  -> shape[2]=M, shape[3]=K
 //   B: [1,1,N,K]  -> shape[2]=N, shape[3]=K   (NOTE: your B_pack is stored as rows=N, cols=K)
 //   C: [1,1,M,N]  -> shape[2]=M, shape[3]=N
 //
-// Strides are in ELEMENTS (not bytes), consistent with init_memref_4d(). 
+// Strides are in ELEMENTS (not bytes), consistent with init_memref_4d().
 //
 static void cpu_ref_mul_mat_f32(
     const MemRefDescriptor<4> *A_desc,
@@ -1358,7 +1358,7 @@ static void tsi_load_all_blobs() {
 
     // ensure tables exist (allocates if needed)
     tsi_blob_ensure_tables_allocated();
-    
+
     // size matches runtime txe_count
     //packed_args.resize(num_of_txes, nullptr);
 
@@ -2253,7 +2253,7 @@ static int64_t tsi_blob_execution_internal(void *commandList) {
 static void *_mlir_ciface_txe_add_host_internal(void *a, void *b, void *res, TSI_DeviceIdType deviceId) {
     constexpr int64_t kPackedArgsI64   = 9;
     constexpr int64_t kPackedArgsBytes = kPackedArgsI64 * 8;
-    
+
     // Lock to protect packed_args usage
     std::lock_guard<std::mutex> lock(tsi_pack_mutex);
 
@@ -2331,7 +2331,7 @@ static void _mlir_ciface_txe_add_host_new(void *a, void *b, void *res) {
     }
 
     const int deviceId = acquire_device_blocking();
-    
+
     if (deviceId < 0) {
         fprintf(stderr, "Failed to acquire device for ADD\n");
         tsi_cleanup();
@@ -2392,7 +2392,7 @@ static void *_mlir_ciface_txe_mult_host_internal(void *a, void *b, void *res, TS
     p[idx++] = tsi_shmem_handle_from_ptr(B->data);
     p[idx++] = (int64_t)B->offset;
     p[idx++] = (int64_t)B->shape[0];
-    
+
     p[idx++] = tsi_shmem_handle_from_ptr(C->data);
     p[idx++] = (int64_t)C->offset;
     p[idx++] = (int64_t)C->shape[0];
@@ -2514,7 +2514,7 @@ static void *_mlir_ciface_txe_rms_norm_host_internal(void *a, void *b, void *buf
     tsi_add_command_to_list(commandList, blobExecuteCmd);
 
     return commandList;
-} 
+}
 
 static void _mlir_ciface_txe_rms_norm_host_new(void *a, void *b, void *buf) {
     tsi_init_per_txe_state_once();
@@ -2786,7 +2786,7 @@ static struct ggml_backend_tsavorite_context *ggml_tsavorite_init(ggml_backend_d
   if (tsi_log_setup() == false)
     return NULL;
 
-  
+
   std::string mainProfilerName = "OPU ";
   tsirt::utils::TSIScopedProfiler mainProfiler(mainProfilerName);
 
@@ -6390,22 +6390,24 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
     case GGML_OP_RESHAPE:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_RESHAPE;
       num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-      ggml_compute_forward_reshape(&params, node);
+      // ggml_compute_forward_reshape() no longer exists upstream (target commit
+      // 1f368f354): upstream's op-consolidation refactor turned RESHAPE/VIEW/
+      // PERMUTE/TRANSPOSE into inline "// nop" blocks in ggml-cpu.c's dispatch
+      // switch, since they were already pure no-ops (metadata/view-only, no
+      // per-element compute) even when a named function existed for them.
+      // Removing the call preserves identical behavior.
       break;
     case GGML_OP_VIEW:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_VIEW;
       num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-      ggml_compute_forward_reshape(&params, node);
       break;
     case GGML_OP_PERMUTE:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_PERMUTE;
       num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-      ggml_compute_forward_permute(&params, node);
       break;
     case GGML_OP_TRANSPOSE:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_TRANSPOSE;
       num_of_input_tensors = TSAVORITE_IGNORE_TENSORS;
-      ggml_compute_forward_transpose(&params, node);
       break;
     case GGML_OP_SET:
       kernel_type = GGML_TSAVORITE_KERNEL_TYPE_SET;
@@ -6563,7 +6565,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
             const int64_t ne12 = src1 ? src1->ne[2] : 1;
             const int64_t ne13 = src1 ? src1->ne[3] : 1;
-        
+
             // TODO: is this supposed to be ceil instead of floor?
             const uint32_t n_head      = ne02;
             const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
@@ -6660,7 +6662,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 #if TRITON_ADD
                     if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
                         // MemRefDescriptor
-                        int32_t *scalar_val; 
+                        int32_t *scalar_val;
                         srcP0->strides[0] = 1;
                         srcP1->strides[0] = 1;
                         nodeP->strides[0] = 1;
@@ -7029,6 +7031,8 @@ static struct ggml_backend_buffer_i ggml_backend_tsavorite_buffer_i = {
     /* .memset_tensor   = */ ggml_backend_tsavorite_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_tsavorite_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_tsavorite_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_tsavorite_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_tsavorite_buffer_clear,
     /* .reset           = */ NULL,
@@ -7301,6 +7305,8 @@ static struct ggml_backend_i ggml_backend_tsavorite_i = {
     /* .free                    = */ ggml_backend_tsavorite_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_tsavorite_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -7930,7 +7936,7 @@ ggml_backend_reg_t ggml_backend_tsavorite_reg(void) {
     g_ggml_backend_tsavorite_reg.api_version = GGML_BACKEND_API_VERSION;
 #else
     ensure_tsi_runtime_initialized();
-    
+
 #endif /* OLLAMA */
 
     g_ggml_backend_tsavorite_reg.iface = ggml_backend_tsavorite_reg_i;
@@ -7944,4 +7950,3 @@ ggml_backend_reg_t ggml_backend_tsavorite_reg(void) {
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_tsavorite_reg)
-
