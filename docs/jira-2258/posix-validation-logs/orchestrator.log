@@ -1,0 +1,45 @@
++ LOGDIR=/proj/work/akapoor/tmp/claude-100041/posix-validation-logs
++ NEW_BIN=/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion
++ OLD_BIN=/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli
++ COMMON_ARGS='--device tSavorite --temp 0.0 --n-predict 4 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --no-warmup --no-conversation'
++ run_one new-tinyllama-5m /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion /proj/rel/sw/ggml/models/tinyllama-vo-5m-para.gguf 12288 60
++ local tag=new-tinyllama-5m binary=/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion model=/proj/rel/sw/ggml/models/tinyllama-vo-5m-para.gguf ctx=12288 timeout_s=60
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/new-tinyllama-5m.log
++ echo '=== new-tinyllama-5m ==='
+=== new-tinyllama-5m ===
++ run_one old-tinyllama-5m /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli /proj/rel/sw/ggml/models/tinyllama-vo-5m-para.gguf 12288 60
++ local tag=old-tinyllama-5m binary=/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli model=/proj/rel/sw/ggml/models/tinyllama-vo-5m-para.gguf ctx=12288 timeout_s=60
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/old-tinyllama-5m.log
++ echo '=== old-tinyllama-5m ==='
+=== old-tinyllama-5m ===
++ run_one new-gemma3-270m /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion /proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf 4096 300
++ local tag=new-gemma3-270m binary=/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion model=/proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf ctx=4096 timeout_s=300
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/new-gemma3-270m.log
++ echo '=== new-gemma3-270m ==='
+=== new-gemma3-270m ===
++ run_one old-gemma3-270m /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli /proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf 4096 300
++ local tag=old-gemma3-270m binary=/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli model=/proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf ctx=4096 timeout_s=300
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/old-gemma3-270m.log
++ echo '=== old-gemma3-270m ==='
+=== old-gemma3-270m ===
++ run_one new-tinyllama-1.1b /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion /proj/rel/sw/ggml/models/Tiny-Llama-v0.3-FP32-1.1B-F32.gguf 12288 600
++ local tag=new-tinyllama-1.1b binary=/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion model=/proj/rel/sw/ggml/models/Tiny-Llama-v0.3-FP32-1.1B-F32.gguf ctx=12288 timeout_s=600
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/new-tinyllama-1.1b.log
++ echo '=== new-tinyllama-1.1b ==='
+=== new-tinyllama-1.1b ===
++ run_one old-tinyllama-1.1b /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli /proj/rel/sw/ggml/models/Tiny-Llama-v0.3-FP32-1.1B-F32.gguf 12288 600
++ local tag=old-tinyllama-1.1b binary=/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli model=/proj/rel/sw/ggml/models/Tiny-Llama-v0.3-FP32-1.1B-F32.gguf ctx=12288 timeout_s=600
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/old-tinyllama-1.1b.log
++ echo '=== old-tinyllama-1.1b ==='
+=== old-tinyllama-1.1b ===
++ run_one new-llama3.2-1b /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion /proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf 4096 600
++ local tag=new-llama3.2-1b binary=/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion model=/proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf ctx=4096 timeout_s=600
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/new-llama3.2-1b.log
++ echo '=== new-llama3.2-1b ==='
+=== new-llama3.2-1b ===
++ run_one old-llama3.2-1b /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli /proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf 4096 600
++ local tag=old-llama3.2-1b binary=/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli model=/proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf ctx=4096 timeout_s=600
++ tee /proj/work/akapoor/tmp/claude-100041/posix-validation-logs/old-llama3.2-1b.log
++ echo '=== old-llama3.2-1b ==='
+=== old-llama3.2-1b ===
++ echo 'ALL DONE'

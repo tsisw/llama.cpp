@@ -1,0 +1,41 @@
+=== old-gemma3-270m ===
++ timeout 300 /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli -p 'My cat'\''s name is' -m /proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf -c 4096 --device tSavorite --temp 0.0 --n-predict 4 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --no-warmup --no-conversation
+
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=8 user_dram_size_bytes=8589934592 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is "Cat" and
+
+llama_perf_sampler_print:    sampling time =     148.94 ms /    11 runs   (   13.54 ms per token,    73.85 tokens per second)
+llama_perf_context_print:        load time =   22463.12 ms
+llama_perf_context_print: prompt eval time =   20471.05 ms /     7 tokens ( 2924.44 ms per token,     0.34 tokens per second)
+llama_perf_context_print:        eval time =    2035.20 ms /     3 runs   (  678.40 ms per token,     1.47 tokens per second)
+llama_perf_context_print:       total time =   24653.04 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op                   Runs        Total us            Avg us
+  ADD                   144           77251            536.47
+  MUL                   436         1379504           3164.00
+  RMS_NORM              436          666295           1528.20
+  MUL_MAT              2346        20326627           8664.38
+  SCALE                  76             291              3.83
+
+
+  CONT                  144           24597            170.81
+  RESHAPE               773             329              0.43
+  VIEW                  906             132              0.15
+  PERMUTE               667             145              0.22
+  TRANSPOSE             266              45              0.17
+  GET_ROWS               12              72              6.00
+  SET_ROWS              549             665              1.21
+  SOFT_MAX               72            6649             92.35
+  ROPE                  354            4810             13.59
+  GLU                   269           30790            114.46
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	0m29.034s
+user	0m46.695s
+sys	0m12.365s
++ echo EXIT_CODE=0
+EXIT_CODE=0

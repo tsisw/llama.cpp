@@ -1,0 +1,65 @@
+=== old-llama3.2-1b ===
++ timeout 600 /proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli -p 'My cat'\''s name is' -m /proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf -c 4096 --device tSavorite --temp 0.0 --n-predict 4 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --no-warmup --no-conversation
+
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=8 user_dram_size_bytes=8589934592 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name isNo symbol table is loaded.  Use the "file" command.
+[New LWP 3210801]
+[New LWP 3210802]
+[New LWP 3210803]
+[New LWP 3210975]
+[New LWP 3210982]
+[New LWP 3210983]
+[New LWP 3210984]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+warning: File "/proj/local/gcc-13.3.0/lib64/libstdc++.so.6.0.32-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+	add-auto-load-safe-path /proj/local/gcc-13.3.0/lib64/libstdc++.so.6.0.32-gdb.py
+line to your configuration file "/users/akapoor/.gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/users/akapoor/.gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+0x00007f14fed12312 in waitpid () from /lib64/libpthread.so.0
+No symbol "frame" in current context.
+[Inferior 1 (process 3210800) detached]
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  Failed to allocate 268435456 in DRAM_akapoor_3210800
+
+
+=== TSAVORITE FATAL SIGNAL 6 ===
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-tsavorite.so(+0x1a3a23)[0x7f14fe3ffa23]
+/lib64/libc.so.6(+0x4e630)[0x7f14fd162630]
+/lib64/libc.so.6(gsignal+0x10f)[0x7f14fd1625af]
+/lib64/libc.so.6(abort+0x127)[0x7f14fd135ee5]
+/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xacb4b)[0x7f14fd918b4b]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-base.so(+0x64d6c)[0x7f14fdfc2d6c]
+/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc2ca)[0x7f14fd9282ca]
+/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc335)[0x7f14fd928335]
+/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc588)[0x7f14fd928588]
+/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTSIRTPosixShmem.so.0.9.2(+0x23a62)[0x7f14faabea62]
+/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTsavRTFPGA.so.0.9.2(_ZN3tsi7runtime6TsavRT8allocateEmNS_11MemorySpaceERPv+0xd8)[0x7f14f99461c8]
+/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTsavRTShimCAPI.so.0.9.2(tsi_alloc+0xf3)[0x7f14f93d40b3]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-tsavorite.so(+0x1ac992)[0x7f14fe408992]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-tsavorite.so(+0x1ae5f1)[0x7f14fe40a5f1]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-tsavorite.so(+0x1b0cc2)[0x7f14fe40ccc2]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-tsavorite.so(+0x1b32e8)[0x7f14fe40f2e8]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-base.so(ggml_backend_graph_compute_async+0x5c)[0x7f14fdfc87ef]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-base.so(+0x6f4e6)[0x7f14fdfcd4e6]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libggml-base.so(ggml_backend_sched_graph_compute_async+0xa9)[0x7f14fdfce1f8]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libllama.so(_ZN13llama_context13graph_computeEP11ggml_cgraphb+0x161)[0x7f14ff323cbf]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libllama.so(_ZN13llama_context14process_ubatchERK12llama_ubatch14llm_graph_typeP22llama_memory_context_iR11ggml_status+0x2e8)[0x7f14ff320e80]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libllama.so(_ZN13llama_context6decodeERK11llama_batch+0x7aa)[0x7f14ff3221c6]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/libllama.so(llama_decode+0x1c)[0x7f14ff328344]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli[0x48b2e2]
+/lib64/libc.so.6(__libc_start_main+0xe5)[0x7f14fd14e865]
+/proj/work/akapoor/llama.cpp-aug-12-tool-chain/llama.cpp/build-posix/bin/llama-cli[0x4891ae]
+=== END BACKTRACE ===
+
+real	0m38.820s
+user	0m18.375s
+sys	0m19.551s
++ echo EXIT_CODE=134
+EXIT_CODE=134
