@@ -166,6 +166,23 @@
 # clean : rm -rf build-* (llama.cpp) and kernel build dirs in ggml-tsi-kernel
 # clean-all : clean + remove python venv blob-creation
 #
+# Consolidated Tsavorite patch (see JIRA-2258 for background):
+#   On every run, this script applies consolidated-patch.patch automatically
+#   the first time it detects an unpatched upstream vendor checkout
+#   (ggml-tsavorite.cpp missing), then never again -- same idempotent,
+#   one-time pattern as the blob-creation venv setup. Day-to-day development
+#   (editing ggml-tsavorite.cpp, llama-context.cpp, etc.) never touches this
+#   patch machinery: git add/commit/push those files normally.
+#
+# no-apply-patch : skip the automatic consolidated-patch.patch apply check
+#                  for this run (rarely needed; mainly for debugging the
+#                  apply step itself)
+# regenerate-patch : maintenance action for preparing the *next* upstream
+#                  sync -- regenerates consolidated-patch.patch from
+#                  UPSTREAM_BASE_COMMIT to current HEAD. See the doc comment
+#                  above do_regenerate_patch() in this file for the full
+#                  next-sync workflow.
+#
 # Coverage:
 # enable_coverage : adds -DENABLE_COVERAGE=ON
 #
@@ -483,6 +500,9 @@ parse_args() {
   DO_CLEAN=0
   DO_CLEAN_ALL=0
 
+  # regenerate consolidated-patch.patch (next-sync maintenance action)
+  DO_REGENERATE_PATCH=0
+
   # cleaning build dirs before build (default ON)
   DO_CLEAN_BUILD_DIRS=1
   INCREMENTAL=0
@@ -682,6 +702,10 @@ parse_args() {
       clean-all)
         DO_CLEAN_ALL=1
         log_info "clean-all selected"
+        ;;
+      regenerate-patch)
+        DO_REGENERATE_PATCH=1
+        log_info "regenerate-patch selected"
         ;;
       *)
         # positional paths
@@ -1466,6 +1490,75 @@ log_info "included ./tsavorite-model-deployment.yaml in FPGA package"
 # -------------------------
 # Cleanup commands
 # -------------------------
+# ============================================================================
+# NEXT-SYNC MAINTENANCE: regenerating consolidated-patch.patch
+# ============================================================================
+# Day-to-day development (e.g. editing ggml-tsavorite.cpp, llama-context.cpp,
+# or any other tracked file) needs NONE of this: just edit, git add, commit,
+# push, open a PR -- exactly like any other file in the repo.
+# consolidated-patch.patch is not involved in normal work at all; it only
+# matters when preparing the *next* upstream sync (the kind of multi-thousand
+# -commit jump JIRA-2258 did). At that point:
+#
+#   1. Before vendoring the new upstream commit, run:
+#        source tsi-pkg-build.sh regenerate-patch
+#      This diffs the commit recorded in UPSTREAM_BASE_COMMIT (the commit
+#      consolidated-patch.patch currently corresponds to) against the current
+#      tsisw HEAD, restricted to Tsavorite-relevant paths, and overwrites
+#      consolidated-patch.patch. This captures every Tsavorite change merged
+#      since the last sync -- including ordinary day-to-day edits landed in
+#      between -- not just what was true back when the patch was last cut.
+#   2. Review the regenerated consolidated-patch.patch like any other diff
+#      before trusting it.
+#   3. Pick the new upstream target commit and vendor it into a fresh
+#      branch/worktree -- do not do this in a working tree you still need for
+#      anything else (see JIRA-2258 for the git-worktree-isolation pattern).
+#   4. Apply the regenerated patch to that fresh vendor checkout
+#      (git apply --check first, then git apply for real). Expect to resolve
+#      real conflicts by hand wherever upstream restructured a file the patch
+#      touches -- this was the bulk of the JIRA-2258 effort and will not be
+#      fully automatable by this script.
+#   5. Re-register the ggml-tsi-kernel gitlink: a plain patch can't carry a
+#      submodule pointer.
+#        git update-index --add --cacheinfo 160000,<sha>,ggml-tsi-kernel
+#   6. Port tsi-pkg-build.sh changes by hand -- it's excluded from the patch
+#      on purpose, since it's a real tracked file, not patch content.
+#   7. Build and test posix and fpga, old vs new, the same way JIRA-2258 did.
+#   8. Update UPSTREAM_BASE_COMMIT to the new upstream target SHA -- this is
+#      what regenerate-patch will diff against next time.
+# ============================================================================
+do_regenerate_patch() {
+  local base_commit
+  local patch_file="consolidated-patch.patch"
+  local base_file="UPSTREAM_BASE_COMMIT"
+
+  [ -f "${base_file}" ] || die "regenerate-patch: ${base_file} not found -- can't determine what to diff against"
+
+  base_commit="$(grep -v '^#' "${base_file}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+  [ -n "${base_commit}" ] || die "regenerate-patch: could not read a commit SHA from ${base_file}"
+
+  git cat-file -e "${base_commit}^{commit}" 2>/dev/null || \
+    die "regenerate-patch: ${base_commit} (from ${base_file}) is not a known commit in this repo -- fetch upstream first"
+
+  log_info "regenerate-patch: diffing ${base_commit} against current HEAD (excluding ggml-tsi-kernel, tsi-pkg-build.sh, ${patch_file}, ${base_file})"
+
+  run git diff "${base_commit}" HEAD -- . \
+    ':!ggml-tsi-kernel' \
+    ':!tsi-pkg-build.sh' \
+    ":!${patch_file}" \
+    ":!${base_file}" \
+    > "${patch_file}.new" || return 1
+
+  if [ ! -s "${patch_file}.new" ]; then
+    rm -f "${patch_file}.new"
+    die "regenerate-patch: diff came back empty -- check that ${base_file}'s commit is actually the right base"
+  fi
+
+  mv "${patch_file}.new" "${patch_file}"
+  log_info "regenerate-patch: wrote ${patch_file} ($(wc -l < "${patch_file}") lines). Review the diff, then continue with the next-sync steps documented above this function."
+  return 0
+}
+
 do_clean() {
   log_info "clean: removing build directories"
   rm -rf \
@@ -1512,6 +1605,13 @@ main() {
     do_clean
     cd "${ORIG_PWD}" >/dev/null 2>&1 || true
     return 0
+  fi
+
+  if [ "${DO_REGENERATE_PATCH}" -eq 1 ]; then
+    do_regenerate_patch
+    local __rc=$?
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return "${__rc}"
   fi
 
   # Must run before ensure_submodules(): on a fresh, unpatched upstream
