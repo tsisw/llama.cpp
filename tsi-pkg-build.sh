@@ -1504,10 +1504,13 @@ log_info "included ./tsavorite-model-deployment.yaml in FPGA package"
 #        source tsi-pkg-build.sh regenerate-patch
 #      This diffs the commit recorded in UPSTREAM_BASE_COMMIT (the commit
 #      consolidated-patch.patch currently corresponds to) against the current
-#      tsisw HEAD, restricted to Tsavorite-relevant paths, and overwrites
-#      consolidated-patch.patch. This captures every Tsavorite change merged
-#      since the last sync -- including ordinary day-to-day edits landed in
-#      between -- not just what was true back when the patch was last cut.
+#      tsisw HEAD, excluding ggml-tsi-kernel, tsi-pkg-build.sh, and docs/
+#      (PR-evidence directories like docs/jira-2258/ are documentation, not
+#      Tsavorite source -- they don't belong in a patch meant to be re-applied
+#      to a fresh vendor checkout), and overwrites consolidated-patch.patch.
+#      This captures every Tsavorite change merged since the last sync --
+#      including ordinary day-to-day edits landed in between -- not just what
+#      was true back when the patch was last cut.
 #   2. Review the regenerated consolidated-patch.patch like any other diff
 #      before trusting it.
 #   3. Pick the new upstream target commit and vendor it into a fresh
@@ -1540,13 +1543,26 @@ do_regenerate_patch() {
   git cat-file -e "${base_commit}^{commit}" 2>/dev/null || \
     die "regenerate-patch: ${base_commit} (from ${base_file}) is not a known commit in this repo -- fetch upstream first"
 
-  log_info "regenerate-patch: diffing ${base_commit} against current HEAD (excluding ggml-tsi-kernel, tsi-pkg-build.sh, ${patch_file}, ${base_file})"
+  # NOTE: docs/build.md carries real Tsavorite-authored content (the "TSI
+  # compilation steps" section) and must stay IN the patch -- do not exclude
+  # docs/ wholesale. Only PR-evidence subdirectories (validation logs/
+  # summaries checked in purely for reviewers, e.g. docs/jira-2258/) should be
+  # excluded. If a future sync adds another such directory under a different
+  # JIRA number, add it to PATCH_EXCLUDE_PATHS below rather than broadening
+  # this to a glob -- a wrong guess here silently drops real doc content from
+  # every future regenerated patch, the way an early version of this function
+  # almost did.
+  local PATCH_EXCLUDE_PATHS=(
+    ':!ggml-tsi-kernel'
+    ':!tsi-pkg-build.sh'
+    ':!docs/jira-2258'
+    ":!${patch_file}"
+    ":!${base_file}"
+  )
 
-  run git diff "${base_commit}" HEAD -- . \
-    ':!ggml-tsi-kernel' \
-    ':!tsi-pkg-build.sh' \
-    ":!${patch_file}" \
-    ":!${base_file}" \
+  log_info "regenerate-patch: diffing ${base_commit} against current HEAD (excluding: ${PATCH_EXCLUDE_PATHS[*]})"
+
+  run git diff "${base_commit}" HEAD -- . "${PATCH_EXCLUDE_PATHS[@]}" \
     > "${patch_file}.new" || return 1
 
   if [ ! -s "${patch_file}.new" ]; then
