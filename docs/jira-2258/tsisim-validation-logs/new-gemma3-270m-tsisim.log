@@ -1,0 +1,44 @@
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh
+Model Name Gemma3-270M-F32.gguf
+INFO: updated /usr/bin/tsi/bin/tsi-ggml/tsavorite-model-deployment.yaml with txe_count:4, multi_thread_enable:true; preserved advanced_matmul_shape_offload:false, advanced_matmul_broadcast_offload:false, triton_matmul_small_n_transpose_opt:false
+
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=4 multi_thread_enable=1 user_dram_size_gb=16 user_dram_size_bytes=17179869184 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:823> num_vm_segments: 2
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:826> VM segment 0: start_addr = 0xf0cdb6005000, size = 17079185408
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:833> VMA: map_addr = 0xf0cdb6005000, map_size = 17079185408
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:835> VMA: dev_buf = 0xf0d1b6140490
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:836> VMA: dev_buf_num = 1
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:837> VMA: dev_buf_offset = 100683776
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:826> VM segment 1: start_addr = 0xf0cdb0000000, size = 100683776
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:833> VMA: map_addr = 0xf0cdb0000000, map_size = 100683776
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:835> VMA: dev_buf = 0xf0d1b6140490
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:836> VMA: dev_buf_num = 2
+[2026-08-22 16:00:40.633] [info] </proj/work/srv-ghr/git-runner/sdk-ci-arm64-actions-runner/_work/sdk/sdk/runtime/third-party/common-runtime/src/cma/cma.c:837> VMA: dev_buf_offset = 0
+ is "cat" and
+
+llama_perf_context_print:        load time =  441136.39 ms
+llama_perf_context_print: prompt eval time =  441135.58 ms /     5 tokens (88227.12 ms per token,     0.01 tokens per second)
+llama_perf_context_print:        eval time =   16195.85 ms /     5 runs   ( 3239.17 ms per token,     0.31 tokens per second)
+llama_perf_context_print:       total time =  457339.79 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          216             352            224963           1041.50
+  MUL              OPU          654            1614           1280725           1958.30
+  RMS_NORM         OPU          654             654             39728             60.75
+  MUL_MAT          CPU          909               0            182838            201.14
+  MUL_MAT          OPU           69             276         431759739        6257387.52
+  SCALE            CPU          114               0               212              1.86
+  CONT             OPU          216               0             15788             73.09
+  VIEW             OPU          432               0               187              0.43
+  PERMUTE          OPU          324               0                63              0.19
+  TRANSPOSE        OPU          108               0                35              0.32
+  GET_ROWS         OPU           18               0               106              5.89
+  SET_ROWS         OPU          216               0               592              2.74
+  SOFT_MAX         OPU          108               0               910              8.43
+  ROPE             CPU          108               0               384              3.56
+  ROPE             OPU          108               0              1219             11.29
+  GLU              CPU          108               0              1813             16.79
+
+OPU Profiling Results:
+Profiler disabled
