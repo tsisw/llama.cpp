@@ -1243,7 +1243,8 @@ update_one_tsavorite_deployment_yaml() {
   local advanced_matmul_shape_offload="false"
   local advanced_matmul_broadcast_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
-local user_dram_size_gb="8"
+  local multi_thread_enable="true"
+local user_dram_size_gb="16"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1251,11 +1252,13 @@ local user_dram_size_gb="8"
     local existing_advanced
     local existing_broadcast
     local existing_small_n_opt
+    local existing_multi_thread_enable
 local existing_user_dram_size_gb
 
     existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
     existing_broadcast="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_broadcast_offload")"
     existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
+    existing_multi_thread_enable="$(extract_deployment_yaml_value "${deployment_yaml_path}" "multi_thread_enable")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
@@ -1266,6 +1269,9 @@ local existing_user_dram_size_gb
     fi
     if [ -n "${existing_small_n_opt}" ]; then
       triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
+    fi
+    if [ -n "${existing_multi_thread_enable}" ]; then
+      multi_thread_enable="${existing_multi_thread_enable}"
     fi
   fi
 
@@ -1287,7 +1293,7 @@ fi
 cat > "${deployment_yaml_path}" <<EOF
 # Tsavorite deployment config
 txe_count: ${txe_count}
-multi_thread_enable: true
+multi_thread_enable: ${multi_thread_enable}
 
 ## Runtime user DRAM size in GiB.
 ## Example: 1 = 1GB, 2 = 2GB.
@@ -1312,7 +1318,7 @@ advanced_matmul_broadcast_offload: ${advanced_matmul_broadcast_offload}
 triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}; preserved multi_thread_enable:${multi_thread_enable}, advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}, user_dram_size_gb:${user_dram_size_gb}"
   return 0
 }
 
