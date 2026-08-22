@@ -1,62 +1,36 @@
-=== new-llama3.2-1b ===
-+ timeout 600 /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion -p 'My cat'\''s name is' -m /proj/rel/sw/ggml/models/Llama3.2:1B-1.2B-F32.gguf -c 4096 --device tSavorite --temp 0.0 --n-predict 4 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --no-warmup --no-conversation
+=== new-llama3.2-1b (16GB) ===
 
- TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=8 user_dram_size_bytes=8589934592 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
-My cat's name isNo symbol table is loaded.  Use the "file" command.
-[New LWP 3210592]
-[New LWP 3210593]
-[New LWP 3210594]
-[New LWP 3210595]
-[New LWP 3210745]
-[New LWP 3210746]
-[New LWP 3210747]
-[Thread debugging using libthread_db enabled]
-Using host libthread_db library "/lib64/libthread_db.so.1".
-warning: File "/proj/local/gcc-13.3.0/lib64/libstdc++.so.6.0.32-gdb.py" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
-To enable execution of this file add
-	add-auto-load-safe-path /proj/local/gcc-13.3.0/lib64/libstdc++.so.6.0.32-gdb.py
-line to your configuration file "/users/akapoor/.gdbinit".
-To completely disable this security protection add
-	set auto-load safe-path /
-line to your configuration file "/users/akapoor/.gdbinit".
-For more information about this security protection see the
-"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
-	info "(gdb)Auto-loading safe path"
-0x00007f781e20a312 in waitpid () from /lib64/libpthread.so.0
-No symbol "frame" in current context.
-[Inferior 1 (process 3210589) detached]
-terminate called after throwing an instance of 'std::runtime_error'
-  what():  Failed to allocate 134217728 in DRAM_akapoor_3210589
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=16 user_dram_size_bytes=17179869184 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is "Bella"
 
 
-=== TSAVORITE FATAL SIGNAL 6 ===
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libggml-tsavorite.so.0(+0x2e93f)[0x7f781e71093f]
-/lib64/libc.so.6(+0x4e630)[0x7f781d68c630]
-/lib64/libc.so.6(gsignal+0x10f)[0x7f781d68c5af]
-/lib64/libc.so.6(abort+0x127)[0x7f781d65fee5]
-/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xacb4b)[0x7f781de42b4b]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libggml-base.so.0(+0x2f4ab)[0x7f781e4474ab]
-/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc2ca)[0x7f781de522ca]
-/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc335)[0x7f781de52335]
-/proj/local/gcc-13.3.0/lib64/libstdc++.so.6(+0xbc588)[0x7f781de52588]
-/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTSIRTPosixShmem.so.0.9.2(+0x23a62)[0x7f781afe8a62]
-/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTsavRTFPGA.so.0.9.2(_ZN3tsi7runtime6TsavRT8allocateEmNS_11MemorySpaceERPv+0xd8)[0x7f7819e701c8]
-/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.0.4.24/x86_64/posix/runtime/lib/libTsavRTShimCAPI.so.0.9.2(tsi_alloc+0xf3)[0x7f78198fe0b3]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libggml-tsavorite.so.0(+0x393ad)[0x7f781e71b3ad]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libggml-tsavorite.so.0(+0x3cce3)[0x7f781e71ece3]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libggml-base.so.0(ggml_backend_sched_graph_compute_async+0x807)[0x7f781e4517e7]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama.so.0(_ZN13llama_context13graph_computeEP11ggml_cgraphb+0xa1)[0x7f781effb551]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama.so.0(_ZN13llama_context14process_ubatchERK12llama_ubatch14llm_graph_typeP22llama_memory_context_iR11ggml_status+0xee)[0x7f781efff64e]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama.so.0(_ZN13llama_context6decodeERK11llama_batch+0x555)[0x7f781f0065d5]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama.so.0(llama_decode+0xb)[0x7f781f0079bb]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama-common.so.0(_Z26common_prompt_batch_decodeP13llama_contextRKSt6vectorIiSaIiEEiRiiSt17basic_string_viewIcSt11char_traitsIcEEb+0x1c4)[0x7f781f677e84]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/libllama-completion-impl.so(_Z16llama_completioniPPc+0x1f9a)[0x7f781facffaa]
-/lib64/libc.so.6(__libc_start_main+0xe5)[0x7f781d678865]
-/proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion-original[0x40060e]
-=== END BACKTRACE ===
+llama_perf_context_print:        load time =  336548.06 ms
+llama_perf_context_print: prompt eval time =  336528.58 ms /     6 tokens (56088.10 ms per token,     0.02 tokens per second)
+llama_perf_context_print:        eval time =    3844.27 ms /     3 runs   ( 1281.42 ms per token,     0.78 tokens per second)
+llama_perf_context_print:       total time =  340399.92 ms /     9 tokens
 
-real	0m23.686s
-user	0m6.038s
-sys	0m9.161s
-+ echo EXIT_CODE=134
-EXIT_CODE=134
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          128             278             74691            583.52
+  MUL              OPU          132             287            362278           2744.53
+  RMS_NORM         OPU          132             132            529474           4011.17
+  MUL_MAT          CPU          519               0            690745           1330.92
+  MUL_MAT          OPU           61              61         182492913        2991687.10
+  CONT             OPU          128               0             34368            268.50
+  VIEW             OPU          256               0                50              0.20
+  PERMUTE          OPU          192               0                37              0.19
+  TRANSPOSE        OPU           64               0                17              0.27
+  GET_ROWS         OPU           12               0              1794            149.50
+  SET_ROWS         OPU          128               0               260              2.03
+  SOFT_MAX         OPU           64               0              3902             60.97
+  ROPE             CPU          128               0               396              3.09
+  GLU              OPU           64             139            586237           9159.95
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	9m50.788s
+user	4m23.226s
+sys	2m3.176s
+EXIT_CODE=0
