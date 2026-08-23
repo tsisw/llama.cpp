@@ -52,29 +52,60 @@ or specific to Tsavorite.
 
 This one gets much further: architecture recognized, hparams loaded, all 667 tensors
 matched with no `done_getting_tensors` mismatch, and it begins actual token generation
-with real dispatch to the Tsavorite backend. This is the clearest evidence gemma4
-support genuinely works in this sync for at least this checkpoint shape.
+with real dispatch to the Tsavorite backend. **Important caveat: "begins compute
+without crashing" is not the same as "confirmed correct output."** The run was killed
+after ~10 minutes without producing any generated text (see below) — treat this as
+"loads and dispatches," not as a verified-correct result.
 
-However: this is also the **first K-quantized (Q4_K_M) model tested anywhere in this
-validation exercise** — every other model tested (tinyllama-5m, Gemma3-270M, TinyLlama-
-1.1B, Llama3.2-1B) was F32 or BF16. Running this one surfaced a high-volume warning:
+This was also the first K-quantized (Q4_K_M) model tested anywhere in this validation
+exercise — every other model tested up to that point (tinyllama-5m, Gemma3-270M,
+TinyLlama-1.1B, Llama3.2-1B) was F32 or BF16. Running it surfaced a high-volume warning:
 
 ```
 TXE::align_address(): Warning: Unaligned memory access 0x7f22e8800104 not 128-byte aligned, aligning to 0x7f22e8800100
 ```
 
 repeated **381,138 times** in the captured run (see `new-gemma4-12b-trimmed.log` for a
-head/tail excerpt — the full raw log was 45MB, kept locally, not checked in). The
-process was killed after ~10 minutes without completing 4-token generation, given the
-open-ended runtime risk from this print volume, not because it hung or crashed.
+head/tail excerpt — the full raw log was 45MB, kept locally, not checked in).
 
-**This is not confirmed as a sync regression** — there is no old-fork comparison point,
-since the old binary fails before reaching this code path for *any* gemma4 tag, and no
-other K-quantized model was tested earlier in this exercise to compare against. It reads
-as a real, previously-unobserved characteristic of the Tsavorite backend's handling of
-K-quant block-structured tensor data (which isn't naturally 128-byte aligned the way
-F32/BF16 tensors are), surfaced for the first time by this specific test — not something
-I can currently attribute to this sync versus pre-existing behavior.
+**Traced the actual mechanism** (`TXE::align_address()`, `tsisw/TXE-FFM`,
+`include/txe/txe.h`): it checks whether a memory address passed to a vector load/store
+is 128-byte aligned (the hardware's vector-register width). If not, it does **not**
+error — it silently rounds the address down to the nearest 128-byte boundary and
+proceeds with *that* address instead. No crash, no assertion raised. This means "the
+process didn't crash" is weak evidence of correctness here — a silently substituted
+address could mean wrong data was read or written, not just a performance cost.
+
+**Follow-up question raised and answered: is this a Gemma4-specific characteristic, or
+a general K-quant issue — and did this sync cause it?** Tested two additional
+K-quantized, non-Gemma4 models on **both** the old and new binaries, using the exact
+same `TSAVORITE_MODEL_DEPLOYMENT_YAML` config as the Gemma4 runs:
+
+| Model | Quant | Old binary | New binary |
+|---|---|---|---|
+| `qwen2-0_5b-instruct-q5_k_m.gguf` | Q5_K_M | ✅ completes, 0 alignment warnings | ✅ completes, 0 alignment warnings |
+| `Qwen2.5-0.5B-Q4_K_M.gguf` (pulled from ollama, same exact quant type as the failing Gemma4-12b run) | Q4_K_M | ✅ completes, 0 alignment warnings | ✅ completes, 0 alignment warnings |
+
+Both models complete cleanly with real OPU dispatch on both binaries, zero alignment
+warnings in every case — including the Q4_K_M case, the identical quant sub-format used
+by the failing Gemma4-12b run.
+
+**Conclusion, now evidence-based rather than inferred:**
+1. **Not caused by this sync.** Old and new binaries behave identically for every
+   non-Gemma4 K-quantized model tested — this rules out the llama.cpp sync as the
+   cause, on top of `align_address()` living in a completely separate repository
+   (`tsisw/TXE-FFM`) that this PR never touches.
+2. **Not a general K-quantization issue.** Two different K-quant sub-formats (Q5_K_M,
+   Q4_K_M — the latter being the *exact* format that triggered the warnings on
+   Gemma4-12b) both run clean on two different non-Gemma4 architectures. The trigger is
+   something more specific to Gemma4 — its particular tensor shapes, attention
+   structure, or memory-access pattern — not "any quantized model" and not "this quant
+   format in general."
+3. **Still not fully root-caused to the exact line of code inside Gemma4's handling**
+   that produces the misaligned addresses — that would require tracing through an SDK
+   layer between `ggml-tsavorite.cpp` and the TXE simulator that isn't in this repo.
+   That's real follow-up work, but the scope is now well-bounded: Gemma4-specific,
+   not sync-related, not a general regression risk for any other model in this PR.
 
 ## Bottom line
 
@@ -82,11 +113,17 @@ I can currently attribute to this sync versus pre-existing behavior.
   — is confirmed for both tags tested.
 - Whether gemma4 is *usably fast and fully correct* end-to-end depends on which
   checkpoint variant: the MoE-style `e2b`/`e4b` tags hit a real upstream loader gap;
-  the dense-style `12b`/`26b`/`31b` tags load and compute but likely need the
-  K-quant alignment-warning volume investigated/fixed before they're practical to run.
+  the dense-style `12b`/`26b`/`31b` tags load and dispatch real compute, but output
+  correctness is unverified (the run was killed before producing text) and the
+  alignment-warning finding above means "didn't crash" isn't strong evidence of
+  correctness on its own.
+- The alignment-warning finding is confirmed **Gemma4-specific and unrelated to this
+  sync** (see the controlled test above) — it does not represent a regression risk for
+  any other model covered by this PR, and does not block this PR on that basis.
 - Recommend as explicit follow-up work, not blocking this PR: (1) check whether a later
   upstream commit past `1f368f354` fixes the MoE tensor-count gap, worth checking now
   that `regenerate-patch`/`UPSTREAM_BASE_COMMIT` make re-targeting cheaper than before
-  this sync; (2) investigate the K-quant alignment-warning volume in the Tsavorite
-  backend directly (`ggml-tsavorite.cpp` or the TXE runtime) since it's a real,
-  previously-undiscovered characteristic independent of gemma4 specifically.
+  this sync; (2) trace why Gemma4 specifically produces misaligned addresses in the
+  Tsavorite backend, and confirm whether the silent address-realignment in
+  `TXE::align_address()` actually corrupts output for this model before trusting any
+  Gemma4 dense-variant result.
