@@ -14,6 +14,7 @@ this file will be updated with a full comparison table once those land.
 | Tiny-Llama-v0.3-FP32-1.1B-F32.gguf (run 2) | ✅ completes, generates `is Luna.` | 4 | 16 | see [new-tinyllama-1.1b-tsisim-run2.log](new-tinyllama-1.1b-tsisim-run2.log) |
 | tinyllama-vo-5m-para.gguf | ✅ completes, generates `was Tim. He loved` | 4 | 16 | see [new-tinyllama-5m-tsisim.log](new-tinyllama-5m-tsisim.log) |
 | Gemma3-270M-F32.gguf | ✅ completes, generates `is "cat" and` | 4 | 16 | see [new-gemma3-270m-tsisim.log](new-gemma3-270m-tsisim.log) |
+| Llama3.2:1B-1.2B-F32.gguf | ✅ completes, generates `is molly and she` | 4 | 16 | see [new-llama3.2-1b-tsisim.log](new-llama3.2-1b-tsisim.log) |
 
 Both runs show real OPU dispatch (`MUL_MAT`, `ADD`, `MUL`, `RMS_NORM`, `GLU`, etc. hitting
 `OPU` in the `=== GGML Perf Summary ===` table, with `MUL_MAT` correctly split between a
@@ -28,15 +29,24 @@ the updated 16GB DRAM default and landing ~15 minutes later in wall-clock time. 
 timing columns differ, by normal run-to-run noise. This is good independent evidence of
 deterministic op-dispatch behavior on real hardware, not just on posix.
 
-**Cross-environment consistency check (Gemma3-270M):** the tsisim run's op-dispatch
-*structure* matches the posix run for the same model — same op set, same split pattern
-(`MUL_MAT` split CPU/OPU, `ROPE` split CPU/OPU, `SCALE`/`GLU` on CPU), and `MUL_MAT`'s
-OPU run count matches exactly (69 in both). Most other counts scale by a consistent
-~1.5x on tsisim vs posix — expected, not a discrepancy: tsisim auto-detects
-`txe_count=4` here vs posix's `txe_count=1`, and `run_llama_cli.sh` isn't necessarily
-using the identical `-c`/`-b` flags as the posix comparison script. Not a strict
-numeric match by design (different harness), but the qualitative dispatch pattern being
-identical across posix and real hardware is a good consistency signal.
+**Cross-environment consistency check (Gemma3-270M, Llama3.2-1B):** both tsisim runs'
+op-dispatch *structure* matches their posix counterpart — same op set, same split
+pattern (`MUL_MAT` split CPU/OPU in both models; `ROPE` also split for Gemma3-270M,
+CPU-only for Llama3.2-1B, matching posix exactly), and `MUL_MAT`'s OPU run count
+matches exactly in both cases (Gemma3-270M: 69/69; Llama3.2-1B: 61/61). Most other
+counts scale by a consistent ~1.5x on tsisim vs posix — expected, not a discrepancy:
+tsisim auto-detects `txe_count=4` here vs posix's `txe_count=1`, and `run_llama_cli.sh`
+isn't necessarily using identical flags (including sampling temperature — the generated
+text differs from the posix run's deterministic `--temp 0.0` output, e.g. Llama3.2-1B
+gives `molly` on tsisim vs `Bella` on posix; not a discrepancy, just non-deterministic
+sampling in the production harness vs the greedy posix comparison script). Not a strict
+numeric match by design, but the qualitative dispatch pattern being identical across
+posix and real hardware, for two different models now, is a good consistency signal.
+
+**Llama3.2-1B DRAM fix confirmed on real hardware:** this is the model that crashed on
+posix at the old `user_dram_size_gb: 8` default (see POSIX-COMPARISON-SUMMARY.md). On
+tsisim, with the fixed 16GB default, it completes cleanly with no allocation failure —
+direct hardware confirmation of the fix, not just posix.
 
 Per the reporter, results match what's currently deployed for these models on tsisim
 (same generated output, same op-dispatch pattern) — full side-by-side old-tree logs
