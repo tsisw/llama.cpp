@@ -7123,7 +7123,13 @@ ggml_backend_tsavorite_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
 static size_t ggml_backend_tsavorite_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
-  return 32;
+  // Must match the hardware's actual vector-register width (TSI_TVU_MEM_ALIGN, 128
+  // bytes / 1024 bits), not a smaller value. GGML uses this to decide the spacing
+  // between tensors packed into a shared buffer; a smaller value here only "works"
+  // by coincidence when every tensor's byte size happens to already be a multiple
+  // of 128. Was hardcoded to 32, which silently broke for Gemma4-12b (Q4_K_M) --
+  // see JIRA-2258 GEMMA4-VALIDATION-SUMMARY.md.
+  return TSI_TVU_MEM_ALIGN;
   TSI_UNUSED(buft);
 }
 

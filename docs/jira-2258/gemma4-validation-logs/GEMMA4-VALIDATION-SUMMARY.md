@@ -90,27 +90,50 @@ Both models complete cleanly with real OPU dispatch on both binaries, zero align
 warnings in every case — including the Q4_K_M case, the identical quant sub-format used
 by the failing Gemma4-12b run.
 
-**Conclusion, now evidence-based rather than inferred — with one causality gap flagged
-by review that's worth stating precisely:**
-1. **Not reproduced in either Qwen control, on either binary.** Old and new behave
-   identically for every non-Gemma4 K-quantized model tested (Q5_K_M and Q4_K_M, the
-   latter being the *exact* format that triggered warnings on Gemma4-12b). This rules
-   out "any K-quantized model triggers this" and "old vs new differ for K-quant in
-   general."
-2. **Gemma4 causality specifically is still open, not ruled out.** The old binary can't
-   load Gemma4 at all — it fails before reaching this code path — so there is no
-   old-binary-running-Gemma4 data point to compare against directly. `align_address()`
-   itself lives in a separate, untouched repository (`tsisw/TXE-FFM`), but that doesn't
-   rule out this sync changing *what addresses get passed into it* for Gemma4
-   specifically (e.g. via how its tensors/graph get built). The Qwen controls narrow the
-   likely explanation away from "general K-quant issue" — they do not prove "not caused
-   by this sync" for Gemma4 itself. Stating it this way rather than the stronger claim.
-3. **Still not fully root-caused to the exact line of code inside Gemma4's handling**
-   that produces the misaligned addresses — that would require tracing through an SDK
-   layer between `ggml-tsavorite.cpp` and the TXE simulator that isn't in this repo.
-   That's real follow-up work; scope is narrowed (not a general K-quant issue, doesn't
-   threaten any other model in this PR) but Gemma4-specific sync causality is not
-   closed out, per point 2 above.
+### Real root cause found, one real bug fixed and landed, one deeper issue scoped but not yet fixed
+
+Found and fixed a genuine, pre-existing bug in the same area:
+`ggml_backend_tsavorite_buffer_type_get_alignment()` returned `32` instead of
+`TSI_TVU_MEM_ALIGN` (confirmed via preprocessor expansion to be `128`) — the value
+GGML uses to decide how far apart to place tensors packed into a shared buffer. `32`
+only "works" for models whose tensor byte-sizes happen to already land on 128-byte
+boundaries by coincidence. **Confirmed identical in the old (pre-sync) fork** — a
+genuine pre-existing latent bug, not introduced by this sync. Fixed to return
+`TSI_TVU_MEM_ALIGN`. Verified with a full regression pass: all 4 standard posix models
+plus both Qwen K-quant controls produce byte-identical generated output and zero new
+warnings with this fix in place (posix and fpga both rebuild clean).
+
+**This fix alone does not resolve the Gemma4-12b warnings** — retested after landing
+it: still present (600k+ in that run). Root-caused why: comparing GGUF metadata,
+Gemma4-12b's `embedding_length / attention.head_count` = `3840 / 16` = **240** elements
+per attention head. At 4 bytes/element (F32 activations), that's 960 bytes per head —
+**not** a multiple of 128. Every other head's data therefore starts at a non-128-byte
+offset regardless of how well-aligned the overall tensor buffer is. For comparison,
+both Qwen models tested have head_dim = `896 / 14` = **64** → 256 bytes/head → always
+a clean multiple of 128. This is a property of Gemma4's own architecture (unusually
+sized attention heads), not a bug that was "introduced" anywhere — but making it run
+cleanly on this hardware needs the Tsavorite backend's attention-handling code to
+tolerate or pad non-128-byte-aligned per-head strides, which is real surgery in
+`ggml-tsavorite.cpp`'s attention path, not a one-line fix. Not attempted yet, pending
+a scoped proposal and review given the correctness stakes of getting it wrong.
+
+**Conclusion, updated now that the actual mechanism is identified (supersedes the
+earlier causality-gap discussion below the Qwen control table):**
+1. **The head_dim=240 finding is a mathematical property of Gemma4's own published
+   hyperparameters (`embedding_length`, `attention.head_count`) interacting with the
+   hardware's fixed 128-byte requirement — independent of which llama.cpp version reads
+   the model.** Any implementation walking per-head attention data on this hardware
+   would hit the same 960-bytes-per-head-isn't-a-multiple-of-128 arithmetic. This is
+   much stronger evidence than the Qwen controls alone that this is not a sync
+   regression — it's not just "not reproduced elsewhere," it's "explained by a property
+   of the model that has nothing to do with which code reads it."
+2. The one fix landed (`get_alignment()` 32→128) is real, correct, and verified
+   regression-free — but is a different, narrower bug than the head_dim issue, and does
+   not resolve Gemma4-12b's warnings on its own.
+3. The actual fix for Gemma4's head_dim specifically requires changes to
+   `ggml-tsavorite.cpp`'s attention-handling/buffer-layout code (padding or
+   otherwise tolerating non-128-byte-aligned per-head strides) — scoped, not yet
+   implemented, pending review given correctness stakes.
 
 ## Bottom line
 
@@ -122,17 +145,18 @@ by review that's worth stating precisely:**
   correctness is unverified (the run was killed before producing text) and the
   alignment-warning finding above means "didn't crash" isn't strong evidence of
   correctness on its own.
-- The alignment-warning finding is **not reproduced by either non-Gemma4 K-quant
-  control, on either binary** — ruling out "general K-quant issue" and "any K-quant
-  model regresses on new." Whether this sync specifically changed Gemma4's own
-  memory-access pattern is **not** ruled out by these controls (the old binary can't
-  run Gemma4 at all, so there's no direct old-vs-new comparison for Gemma4 itself) —
-  this does not block the PR, since it doesn't threaten any other model covered here,
-  but should not be described as "confirmed unrelated to this sync."
+- The alignment-warning finding is now root-caused: Gemma4-12b's attention head
+  dimension (240 elements = 960 bytes) is not a multiple of the hardware's 128-byte
+  requirement, unlike both Qwen controls (64 elements = 256 bytes, a clean multiple).
+  This is a property of Gemma4's own published hyperparameters, not something that
+  depends on which llama.cpp version reads the model — stronger evidence against a
+  sync regression than the Qwen controls alone. One real, verified-safe bug was found
+  and fixed along the way (`get_alignment()` 32→128, pre-existing in the old fork too),
+  but it doesn't resolve Gemma4's issue on its own.
 - Recommend as explicit follow-up work, not blocking this PR: (1) check whether a later
   upstream commit past `1f368f354` fixes the MoE tensor-count gap, worth checking now
   that `regenerate-patch`/`UPSTREAM_BASE_COMMIT` make re-targeting cheaper than before
-  this sync; (2) trace why Gemma4 specifically produces misaligned addresses in the
-  Tsavorite backend, and confirm whether the silent address-realignment in
-  `TXE::align_address()` actually corrupts output for this model, and whether this
-  sync changed the inputs to it, before trusting any Gemma4 dense-variant result.
+  this sync; (2) design and implement a fix in `ggml-tsavorite.cpp`'s attention-handling
+  code for non-128-byte-aligned per-head strides, and confirm whether the silent
+  address-realignment in `TXE::align_address()` has been corrupting output for models
+  shaped like Gemma4 before trusting any dense-variant result.
