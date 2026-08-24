@@ -90,22 +90,27 @@ Both models complete cleanly with real OPU dispatch on both binaries, zero align
 warnings in every case — including the Q4_K_M case, the identical quant sub-format used
 by the failing Gemma4-12b run.
 
-**Conclusion, now evidence-based rather than inferred:**
-1. **Not caused by this sync.** Old and new binaries behave identically for every
-   non-Gemma4 K-quantized model tested — this rules out the llama.cpp sync as the
-   cause, on top of `align_address()` living in a completely separate repository
-   (`tsisw/TXE-FFM`) that this PR never touches.
-2. **Not a general K-quantization issue.** Two different K-quant sub-formats (Q5_K_M,
-   Q4_K_M — the latter being the *exact* format that triggered the warnings on
-   Gemma4-12b) both run clean on two different non-Gemma4 architectures. The trigger is
-   something more specific to Gemma4 — its particular tensor shapes, attention
-   structure, or memory-access pattern — not "any quantized model" and not "this quant
-   format in general."
+**Conclusion, now evidence-based rather than inferred — with one causality gap flagged
+by review that's worth stating precisely:**
+1. **Not reproduced in either Qwen control, on either binary.** Old and new behave
+   identically for every non-Gemma4 K-quantized model tested (Q5_K_M and Q4_K_M, the
+   latter being the *exact* format that triggered warnings on Gemma4-12b). This rules
+   out "any K-quantized model triggers this" and "old vs new differ for K-quant in
+   general."
+2. **Gemma4 causality specifically is still open, not ruled out.** The old binary can't
+   load Gemma4 at all — it fails before reaching this code path — so there is no
+   old-binary-running-Gemma4 data point to compare against directly. `align_address()`
+   itself lives in a separate, untouched repository (`tsisw/TXE-FFM`), but that doesn't
+   rule out this sync changing *what addresses get passed into it* for Gemma4
+   specifically (e.g. via how its tensors/graph get built). The Qwen controls narrow the
+   likely explanation away from "general K-quant issue" — they do not prove "not caused
+   by this sync" for Gemma4 itself. Stating it this way rather than the stronger claim.
 3. **Still not fully root-caused to the exact line of code inside Gemma4's handling**
    that produces the misaligned addresses — that would require tracing through an SDK
    layer between `ggml-tsavorite.cpp` and the TXE simulator that isn't in this repo.
-   That's real follow-up work, but the scope is now well-bounded: Gemma4-specific,
-   not sync-related, not a general regression risk for any other model in this PR.
+   That's real follow-up work; scope is narrowed (not a general K-quant issue, doesn't
+   threaten any other model in this PR) but Gemma4-specific sync causality is not
+   closed out, per point 2 above.
 
 ## Bottom line
 
@@ -117,13 +122,17 @@ by the failing Gemma4-12b run.
   correctness is unverified (the run was killed before producing text) and the
   alignment-warning finding above means "didn't crash" isn't strong evidence of
   correctness on its own.
-- The alignment-warning finding is confirmed **Gemma4-specific and unrelated to this
-  sync** (see the controlled test above) — it does not represent a regression risk for
-  any other model covered by this PR, and does not block this PR on that basis.
+- The alignment-warning finding is **not reproduced by either non-Gemma4 K-quant
+  control, on either binary** — ruling out "general K-quant issue" and "any K-quant
+  model regresses on new." Whether this sync specifically changed Gemma4's own
+  memory-access pattern is **not** ruled out by these controls (the old binary can't
+  run Gemma4 at all, so there's no direct old-vs-new comparison for Gemma4 itself) —
+  this does not block the PR, since it doesn't threaten any other model covered here,
+  but should not be described as "confirmed unrelated to this sync."
 - Recommend as explicit follow-up work, not blocking this PR: (1) check whether a later
   upstream commit past `1f368f354` fixes the MoE tensor-count gap, worth checking now
   that `regenerate-patch`/`UPSTREAM_BASE_COMMIT` make re-targeting cheaper than before
   this sync; (2) trace why Gemma4 specifically produces misaligned addresses in the
   Tsavorite backend, and confirm whether the silent address-realignment in
-  `TXE::align_address()` actually corrupts output for this model before trusting any
-  Gemma4 dense-variant result.
+  `TXE::align_address()` actually corrupts output for this model, and whether this
+  sync changed the inputs to it, before trusting any Gemma4 dense-variant result.
