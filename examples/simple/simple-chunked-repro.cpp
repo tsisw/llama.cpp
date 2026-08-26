@@ -1,11 +1,15 @@
 // Standalone repro: does ggml_add's broadcast chunking (nr0 = ne00/ne10 > 1)
 // produce correct results on the Tsavorite backend when ne10*sizeof(float)
-// is NOT a multiple of 128 bytes (Gemma4's head_dim=240 pattern: 240*4=960
-// bytes, 960 % 128 = 64, so successive chunks alternate 0/64-byte phase)?
+// is NOT a multiple of 128 bytes? The default width below (240) is chosen
+// only because it is NOT a 32-float/128-byte multiple (240*4=960 bytes,
+// 960 % 128 = 64, so successive chunks alternate 0/64-byte phase) -- it is
+// NOT Gemma4's real head_dim. Gemma4-12b's actual head_dim is 256 (16 query
+// heads, 8 grouped KV heads), already a clean 128-byte multiple; see
+// GEMMA4-VALIDATION-SUMMARY.md for how that was confirmed by direct tracing.
 //
 // The existing simple-backend-tsi.cpp harness never sets nr0 > 1 -- its
 // "scale" test uses equal-sized A/B (nr0 always 1), so it never exercises
-// this alternating-phase multi-chunk broadcast path that Gemma4 actually hits.
+// this alternating-phase multi-chunk broadcast path.
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -30,13 +34,23 @@ static bool close_enough(float a, float b) {
 }
 
 int main(int argc, char *argv[]) {
-    const int64_t HEAD = (argc > 2) ? atoll(argv[2]) : 240;   // Gemma4's head_dim by default
+    const int64_t HEAD = (argc > 2) ? atoll(argv[2]) : 240;   // intentionally not a 32-float multiple; NOT Gemma4's real head_dim (see header comment above)
     const int64_t NCHUNKS = (argc > 1) ? atoll(argv[1]) : 4;
+    if (HEAD <= 0 || NCHUNKS <= 0) {
+        fprintf(stderr, "invalid dimensions: HEAD=%ld NCHUNKS=%ld (both must be > 0)\n", (long)HEAD, (long)NCHUNKS);
+        return 1;
+    }
     const int64_t NA = HEAD * NCHUNKS;        // ne00
     const int64_t NB = HEAD;                  // ne10 -- broadcasts across NCHUNKS
     const char *op = (argc > 3) ? argv[3] : "add";
     const bool is_rms = !strcmp(op, "rms_norm");
     const bool is_rms_looped = !strcmp(op, "rms_norm_looped");
+    const bool is_known_op = is_rms || is_rms_looped ||
+        !strcmp(op, "add") || !strcmp(op, "mul") || !strcmp(op, "sub") || !strcmp(op, "div");
+    if (!is_known_op) {
+        fprintf(stderr, "unrecognized op '%s' (expected add|mul|sub|div|rms_norm|rms_norm_looped)\n", op);
+        return 1;
+    }
 
     fprintf(stderr, "Repro: op=%s A=%ld elements, nr0-like=%ld chunks/rows of %ld floats (%ld bytes, mod128=%ld)\n",
             op, (long)NA, (long)NCHUNKS, (long)HEAD, (long)(HEAD*sizeof(float)), (long)((HEAD*sizeof(float)) % 128));
@@ -117,15 +131,22 @@ int main(int argc, char *argv[]) {
         if (b) ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
     }
 
-    static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
-    static std::vector<uint8_t> buf(buf_size);
+    // rms_norm_looped builds one graph node per row (NCHUNKS of them), which
+    // can exceed GGML_DEFAULT_GRAPH_SIZE (2048) for a large -c NCHUNKS -- size
+    // the graph (and its backing context) from NCHUNKS instead of assuming
+    // the default always fits.
+    const size_t graph_size = is_rms_looped
+        ? std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, (size_t)NCHUNKS + 8)
+        : GGML_DEFAULT_GRAPH_SIZE;
+    size_t buf_size = ggml_tensor_overhead()*graph_size + ggml_graph_overhead_custom(graph_size, false);
+    std::vector<uint8_t> buf(buf_size);
     struct ggml_init_params params0 = {
         /*.mem_size   =*/ buf_size,
         /*.mem_buffer =*/ buf.data(),
         /*.no_alloc   =*/ true,
     };
     struct ggml_context * ctx0 = ggml_init(params0);
-    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, graph_size, false);
 
     std::vector<struct ggml_tensor *> row_results;
     struct ggml_tensor * result = nullptr;
@@ -149,7 +170,16 @@ int main(int argc, char *argv[]) {
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
-    ggml_backend_graph_compute(backend, gf);
+    ggml_status st = ggml_backend_graph_compute(backend, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ggml_backend_graph_compute failed, status=%d\n", (int)st);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
 
     std::vector<float> out_data(NA);
     if (is_rms_looped) {

@@ -163,7 +163,11 @@ both are covered by new fast regression tests):
   floats (128 bytes) **and** that same width gets dispatched repeatedly (≥2 times)
   back-to-back — reproduced deterministically and fast (sub-second, not a 40-minute
   model run) with a new isolated test, `examples/simple/simple-chunked-repro.cpp`,
-  independent of `multi_thread_enable`. A single dispatch at any size is always
+  independent of `multi_thread_enable`. That test's default row width (240) is
+  chosen only because it isn't a 32-float multiple, to reliably trigger this
+  bug class in isolation — it predates the real-model tracing above and is
+  **not** Gemma4's actual head_dim (which is 256, per the correction above).
+  A single dispatch at any size is always
   correct; only repetition at a non-32-multiple width triggers it. Fixed by padding
   each dispatch's length up to the next 32-float multiple via a scratch buffer before
   calling into the kernel, then copying back only the real portion. Also fixed a

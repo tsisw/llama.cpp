@@ -30,6 +30,7 @@ if (GGML_TSAVORITE)
     set(CHUNKED_REPRO_TARGET simple-chunked-repro)
     add_executable(${CHUNKED_REPRO_TARGET} simple-chunked-repro.cpp)
     target_link_libraries(${CHUNKED_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
+    target_compile_features(${CHUNKED_REPRO_TARGET} PRIVATE cxx_std_17)
 
     #
     # simple-scalar-broadcast-2d-repro: regression test for the true
@@ -39,4 +40,5 @@ if (GGML_TSAVORITE)
     set(SCALAR2D_REPRO_TARGET simple-scalar-broadcast-2d-repro)
     add_executable(${SCALAR2D_REPRO_TARGET} simple-scalar-broadcast-2d-repro.cpp)
     target_link_libraries(${SCALAR2D_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
+    target_compile_features(${SCALAR2D_REPRO_TARGET} PRIVATE cxx_std_17)
 endif()

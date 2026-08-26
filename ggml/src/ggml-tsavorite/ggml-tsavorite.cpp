@@ -7063,6 +7063,12 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     tsi_dealloc(row_srcP0);
                     tsi_dealloc(row_nodeP);
                 }
+                // This branch dispatches rms_n_rows real kernel calls (one per
+                // row), but the common ++num_of_kernel_call/++tsi_kernel_runs
+                // below this if/else only accounts for 1 -- add the rest here
+                // so the reported kernel/device-call counts match reality.
+                device->stats.op_run_count[kernel_type].num_of_kernel_call += rms_n_rows - 1;
+                node->tsi_kernel_runs += rms_n_rows - 1;
             } else {
                 int max_dim_index = GGML_MAX_DIMS -1;
                 int strides = 1;
@@ -7472,12 +7478,13 @@ static void ggml_backend_tsavorite_free(ggml_backend_t backend) {
   ggml_tsavorite_disp_stats(ctx, ctx_dev->device);
 
   ggml_backend_tsavorite_device_rel(ctx_dev);
-  ggml_tsavorite_free(ctx);
 
   // The chunk-padding scratch buffers (g_align_scratch[]) are tsi_alloc'd
-  // against this runtime; once it's torn down here, those pointers are no
-  // longer valid even though they're still non-null. Without this, the next
-  // backend init in the same process would see a "large enough" cached
+  // against this runtime, so they must be torn down BEFORE
+  // ggml_tsavorite_free(ctx) -- that call ends with tsi_finalize(), and
+  // tsi_dealloc() on a pointer allocated against an already-finalized
+  // runtime is a use-after-finalize. Without freeing them at all, the next
+  // backend init in the same process would also see a "large enough" cached
   // capacity and reuse the stale pointer instead of reallocating.
   for (int slot = 0; slot < TSI_ALIGN_SLOT_COUNT; ++slot) {
       if (g_align_scratch[slot]) {
@@ -7486,6 +7493,8 @@ static void ggml_backend_tsavorite_free(ggml_backend_t backend) {
       }
       g_align_scratch_cap[slot] = 0;
   }
+
+  ggml_tsavorite_free(ctx);
 
   free(backend);
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
