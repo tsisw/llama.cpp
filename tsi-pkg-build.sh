@@ -1457,6 +1457,14 @@ EOL
 
   cp "${GGML_TSI_INSTALL_DIR}/fpga/blobs" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" -r || return 1
   cp "${build_dir}/bin/llama-completion" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  # llama-cli/llama-server only build when LLAMA_BUILD_SERVER is ON (the
+  # default) -- copy them if present rather than requiring them, since
+  # llama-completion is still the one guaranteed target for this package.
+  for extra_bin in llama-cli llama-server; do
+    if [ -f "${build_dir}/bin/${extra_bin}" ]; then
+      cp "${build_dir}/bin/${extra_bin}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+    fi
+  done
   # -P (no-dereference) + "*.so*" (not just "*.so"): upstream's move of `common`
   # from a static lib to a shared llama-common means these are now real
   # versioned .so.MAJOR.MINOR.PATCH files behind a two-level SONAME symlink
