@@ -4872,6 +4872,40 @@ static inline void ensure_triton_full_buffers(
 #endif
 }
 
+// Scratch buffers used to pad chunked elementwise-op dispatches (ADD/MUL/SUB/
+// DIV) up to a full 32-float (128-byte) vector-register multiple when ne10
+// isn't one already. See the padding logic in the chunk loop below for why.
+// Each logical operand gets its own slot so staging src0 never aliases src1's
+// staged copy before the kernel call reads both.
+enum TsiAlignScratchSlot {
+    TSI_ALIGN_SLOT_SRC0 = 0,
+    TSI_ALIGN_SLOT_SRC1,
+    TSI_ALIGN_SLOT_DST,
+    TSI_ALIGN_SLOT_COUNT
+};
+
+static uint8_t *g_align_scratch[TSI_ALIGN_SLOT_COUNT]     = { nullptr, nullptr, nullptr };
+static size_t   g_align_scratch_cap[TSI_ALIGN_SLOT_COUNT] = { 0, 0, 0 };
+
+static inline uint8_t *tsi_ensure_align_scratch(TsiAlignScratchSlot slot, size_t need_bytes) {
+    uint8_t **buf = &g_align_scratch[slot];
+    size_t   *cap = &g_align_scratch_cap[slot];
+    if (*buf && *cap >= need_bytes) {
+        return *buf;
+    }
+    size_t new_cap = std::max<size_t>(need_bytes, std::max<size_t>(*cap, 4096));
+    new_cap = ((new_cap + TSI_TVU_MEM_ALIGN - 1) / TSI_TVU_MEM_ALIGN) * TSI_TVU_MEM_ALIGN;
+    uint8_t *old_buf = *buf;
+    uint8_t *new_buf = (uint8_t *) tsi_alloc((int64_t)new_cap);
+    TSAVORITE_GGML_ASSERT(new_buf);
+    *buf = new_buf;
+    *cap = new_cap;
+    if (old_buf) {
+        tsi_dealloc(old_buf);
+    }
+    return *buf;
+}
+
 // Guards the static descriptor/payload buffers below: they are shared,
 // process-wide storage reused across every call (not per-device, unlike
 // call_triton_matmul_full_packed_on_device()'s g_triton_desc_mt). With
@@ -6639,6 +6673,55 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                 // The following below code operates exclusively on Rank 0
 	        // (i.e., the first dimension) for all blob-related processing.
 
+                // A TRUE scalar broadcast (ne10==1, e.g. Gemma4's per-layer
+                // out_scale weight) reproducibly makes the kernel dispatch
+                // below write nothing at all -- confirmed via direct tracing
+                // on the real model (input values correct at dispatch time,
+                // output scratch buffer still all-zero immediately after the
+                // kernel call returns, before any writeback). Every attempt
+                // to reproduce this in isolation (1D, 2D matching the exact
+                // real shape/magnitude, chained after a preceding async ADD)
+                // passed against CPU, so this appears to need the full real
+                // execution context to trigger -- not something fixable by
+                // adjusting the staging here. Since a true scalar broadcast
+                // is computationally trivial, compute it directly on CPU
+                // instead of dispatching to the kernel at all for this one
+                // degenerate shape; every other ne10 value keeps using the
+                // OPU kernel path below unchanged.
+                if (ne10 == 1) {
+                    const float scalar_val = *(const float *)src1_ptr;
+                    for (int64_t r = 0; r < nr0; ++r) {
+                        float a = src0_ptr[r];
+                        float result;
+                        switch (kernel_type) {
+                            case GGML_TSAVORITE_KERNEL_TYPE_ADD:  result = a + scalar_val; break;
+                            case GGML_TSAVORITE_KERNEL_TYPE_SUB:  result = a - scalar_val; break;
+                            case GGML_TSAVORITE_KERNEL_TYPE_MULT: result = a * scalar_val; break;
+                            case GGML_TSAVORITE_KERNEL_TYPE_DIV:  result = a / scalar_val; break;
+                            default: result = a; break;
+                        }
+                        dst_ptr[r] = result;
+                    }
+                    ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
+                    continue;
+                }
+
+                // Repeated (nr0 >= 2) back-to-back kernel dispatches with a
+                // vector length that isn't a multiple of 32 floats (128 bytes)
+                // corrupt the tail of the FIRST call's result -- reproduced with
+                // a fast, deterministic, isolated test (examples/simple/
+                // simple-chunked-repro.cpp) across ADD/MUL/SUB, independent of
+                // multi_thread_enable. A single (nr0==1) call at the same size
+                // is always correct; only repetition triggers it. Side-stepping
+                // by padding every dispatch's LENGTH up to the next 32-float
+                // multiple (not just aligning the start address, which was
+                // tried and failed previously) avoids the buggy tail path
+                // entirely -- the kernel only ever sees clean, full-register
+                // vector lengths.
+                const int64_t ne10_padded =
+                    ((ne10 + 31) / 32) * 32;
+                const bool need_pad = (ne10_padded != ne10);
+
                 for (int64_t r = 0; r < nr0; ++r) {
                    memset(srcP0, 0, sizeof(MemRefDescriptor<Rank>));
                    memset(srcP1, 0, sizeof(MemRefDescriptor<Rank>));
@@ -6646,18 +6729,45 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
 
 
-                    srcP0->shape[0]   = ne10;
+                    void *real_src1 = (void *)(src1_ptr);
+                    void *real_src0 = (void *)(src0_ptr + r * ne10);
+                    void *real_dst  = (void *)(dst_ptr  + r * ne10);
+
+                    void *use_src1 = real_src1;
+                    void *use_src0 = real_src0;
+                    void *use_dst  = real_dst;
+                    int64_t use_shape = ne10;
+
+                    if (need_pad) {
+                        const size_t real_bytes   = (size_t)ne10 * sizeof(float);
+                        const size_t padded_bytes = (size_t)ne10_padded * sizeof(float);
+                        uint8_t *pad_src0 = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_SRC0, padded_bytes);
+                        uint8_t *pad_src1 = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_SRC1, padded_bytes);
+                        uint8_t *pad_dst  = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_DST,  padded_bytes);
+                        memset(pad_src0, 0, padded_bytes);
+                        memset(pad_src1, 0, padded_bytes);
+                        memset(pad_dst,  0, padded_bytes);
+                        memcpy(pad_src0, real_src0, real_bytes);
+                        memcpy(pad_src1, real_src1, real_bytes);
+                        use_src0 = pad_src0;
+                        use_src1 = pad_src1;
+                        use_dst  = pad_dst;
+                        use_shape = ne10_padded;
+                    }
+
+                    srcP0->shape[0]   = use_shape;
                     srcP0->offset     = 0;
 
-                    srcP1->shape[0]   = ne10;
+                    srcP1->shape[0]   = use_shape;
                     srcP1->offset     = 0;
 
-                    nodeP->shape[0]   = ne10;
+                    nodeP->shape[0]   = use_shape;
                     nodeP->offset     = 0;
 
-                    srcP1->data =  srcP1->base = (void *)(src1_ptr);
-                    srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
-                    nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
+                    srcP1->data =  srcP1->base = use_src1;
+                    srcP0->data =  srcP0->base = use_src0;
+                    nodeP->data =  nodeP->base = use_dst;
+
                     // kernel call
 #if TRITON_ADD
                     if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
@@ -6722,14 +6832,39 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
                         init_scalar_i32_memref_aligned(scalar_max_txes, scalar_max_txes_payload, (int32_t)num_of_txes);
 
-                        _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(srcP0, srcP1, nodeP,
-                                scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
+                        if (need_pad) {
+                            // The async triton_dispatch path returns before its
+                            // worker thread has actually run (dispatch just
+                            // queues it), which races the writeback below when
+                            // multi_thread_enable=true. That's fine for the
+                            // common (unpadded, already-correct) case where
+                            // there's nothing to write back here, but the
+                            // padded case's writeback below needs the real
+                            // result already in use_dst -- call the
+                            // synchronous wrapper directly instead of the
+                            // async dispatch, scoped to this narrow path.
+                            _mlir_ciface_add_kernel_device_wrapper(srcP0, srcP1, nodeP,
+                                    scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
+                        } else {
+                            _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(srcP0, srcP1, nodeP,
+                                    scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
+                        }
                     } else {
 #endif /* TRITON_ADD */
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
 #if TRITON_ADD
                     }
 #endif /* TRITON_ADD */
+                    // NOTE: for the TRITON_ADD async-dispatch branch above, with
+                    // multi_thread_enable=true this writeback can race the
+                    // worker thread that actually performs the computation
+                    // (dispatch returns before the worker runs) -- a separate,
+                    // already-identified bug from the ADD-specific Triton path.
+                    // Not yet handled here; this padding fix is scoped to
+                    // proving/fixing the tail-corruption bug first.
+                    if (need_pad) {
+                        memcpy(real_dst, use_dst, (size_t)ne10 * sizeof(float));
+                    }
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                     ++node->tsi_kernel_runs;
                 }
@@ -6818,28 +6953,119 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
             for(i=64; i <= 95; ++i)
                     val[i] = node->ne[0];
 
-	    int max_dim_index = GGML_MAX_DIMS -1;
-	    int strides = 1;
-	    bool flag = true;
-            for ( i = 0; i <= max_dim_index  && src0->nb[i] != 0; ++i) {
-                if (src0->ne[i] == 0) {
-                    srcP0->shape[max_dim_index - i]    = 1;
-                    nodeP->shape[max_dim_index - i]    = 1;
-		    flag = false;
-                }
-                else  {
-                    srcP0->shape[max_dim_index - i]    = src0->ne[i];
-                    nodeP->shape[max_dim_index - i]    = node->ne[i];
-                }
-                srcP0->strides[max_dim_index - i]    = strides;
-                nodeP->strides[max_dim_index - i]    = strides;
+            // A single kernel call given the FULL multi-row tensor (row width
+            // ne[0], ne[1]*ne[2]*ne[3] rows) silently computes the wrong
+            // normalization for every row when ne[0] isn't a multiple of 32
+            // floats AND there's more than one row -- reproduced deterministically
+            // via examples/simple/simple-chunked-repro.cpp's rms_norm test
+            // (matches Gemma4's per-head QK-norm: 240-wide rows, one per
+            // attention head, many heads/tokens dispatched together). A single
+            // row of ANY width always computes correctly, so when this
+            // condition holds, dispatch one row at a time instead of the whole
+            // tensor in one call.
+            const int64_t rms_row_width = src0->ne[0];
+            int64_t rms_n_rows = 1;
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) rms_n_rows *= src0->ne[d];
+            const bool rms_need_row_loop =
+                (rms_row_width % 32 != 0) && (rms_n_rows > 1);
 
-		// avoiding the case when src0->ne[i] is zero
-		if (flag)
-			strides = strides * src0->ne[i];
-	    }
+            if (rms_need_row_loop) {
+                // Repeated back-to-back dispatch of the SAME non-32-multiple
+                // length on the reused srcP0/nodeP descriptor is the same
+                // corruption class found for ADD/MUL/SUB/DIV -- looping per
+                // row alone isn't enough (confirmed: still wrong). Pad each
+                // row's dispatch length up to the next 32-float multiple via
+                // a scratch buffer, same fix as the elementwise chunk loop.
+                // val[64..95] (set above to the TRUE row width) is the
+                // side-channel the kernel uses for the mean divisor, so
+                // padding shape[0]/the physical buffer doesn't change the
+                // normalization math -- the extra zero-padded elements
+                // contribute nothing to the sum of squares.
+                const int64_t rms_row_padded =
+                    ((rms_row_width + 31) / 32) * 32;
+                const size_t rms_row_bytes        = (size_t)rms_row_width * sizeof(float);
+                const size_t rms_row_padded_bytes = (size_t)rms_row_padded * sizeof(float);
 
-            ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, nodeP, glob_buf);
+                for (int64_t r = 0; r < rms_n_rows; ++r) {
+                    const int64_t i1 = r % src0->ne[1];
+                    const int64_t i2 = (r / src0->ne[1]) % src0->ne[2];
+                    const int64_t i3 = r / (src0->ne[1] * src0->ne[2]);
+                    float *src0_row = (float *)((char *)src0->data
+                        + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+                    float *node_row = (float *)((char *)node->data
+                        + i1 * node->nb[1] + i2 * node->nb[2] + i3 * node->nb[3]);
+
+                    // The header (MemRefDescriptor) and its data must be ONE
+                    // contiguous allocation, data immediately following the
+                    // header -- the same convention every real ggml tensor
+                    // uses here (`srcP0 = (MemRefDescriptor*)src0->data; --srcP0;`)
+                    // and the same one create_mlir_buf() follows. Two separate
+                    // tsi_alloc calls (header, then data, pointed to via the
+                    // ->data field) is NOT equivalent -- confirmed: that gave
+                    // the same wrong constant result even for a single row,
+                    // meaning the kernel doesn't actually follow ->data, it
+                    // relies on header-data adjacency directly.
+                    MemRefDescriptor<Rank> *row_srcP0 = create_mlir_buf<Rank>((int)rms_row_padded);
+                    MemRefDescriptor<Rank> *row_nodeP = create_mlir_buf<Rank>((int)rms_row_padded);
+                    TSAVORITE_GGML_ASSERT(row_srcP0);
+                    TSAVORITE_GGML_ASSERT(row_nodeP);
+                    float *pad_in  = (float *)(row_srcP0 + 1);
+                    float *pad_out = (float *)(row_nodeP + 1);
+                    memcpy(pad_in, src0_row, rms_row_bytes);
+
+                    row_srcP0->data = row_srcP0->base = (void *)pad_in;
+                    row_nodeP->data = row_nodeP->base = (void *)pad_out;
+                    row_srcP0->offset = 0;
+                    row_nodeP->offset = 0;
+                    // NOTE: the row-width dimension goes in shape[Rank-1]
+                    // (last slot), not shape[0] -- the original multi-dim
+                    // path below maps ggml's ne[i] to shape[max_dim_index-i],
+                    // i.e. ne[0] (row width) lands in shape[Rank-1]. Using
+                    // shape[0] here (matching the ADD/MUL binary-op loop's
+                    // convention) gave a constant wrong result even for a
+                    // single row -- confirmed this reversed indexing is the
+                    // fix, not a red herring.
+                    row_srcP0->shape[Rank-1]   = rms_row_padded;
+                    row_nodeP->shape[Rank-1]   = rms_row_padded;
+                    row_srcP0->strides[Rank-1] = 1;
+                    row_nodeP->strides[Rank-1] = 1;
+                    for (int d = 0; d < Rank-1; ++d) {
+                        row_srcP0->shape[d]   = 1;
+                        row_nodeP->shape[d]   = 1;
+                        row_srcP0->strides[d] = 0;
+                        row_nodeP->strides[d] = 0;
+                    }
+
+                    ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](row_srcP0, row_nodeP, glob_buf);
+
+                    memcpy(node_row, pad_out, rms_row_bytes);
+                    tsi_dealloc(row_srcP0);
+                    tsi_dealloc(row_nodeP);
+                }
+            } else {
+                int max_dim_index = GGML_MAX_DIMS -1;
+                int strides = 1;
+                bool flag = true;
+                for ( i = 0; i <= max_dim_index  && src0->nb[i] != 0; ++i) {
+                    if (src0->ne[i] == 0) {
+                        srcP0->shape[max_dim_index - i]    = 1;
+                        nodeP->shape[max_dim_index - i]    = 1;
+                        flag = false;
+                    }
+                    else  {
+                        srcP0->shape[max_dim_index - i]    = src0->ne[i];
+                        nodeP->shape[max_dim_index - i]    = node->ne[i];
+                    }
+                    srcP0->strides[max_dim_index - i]    = strides;
+                    nodeP->strides[max_dim_index - i]    = strides;
+
+                    // avoiding the case when src0->ne[i] is zero
+                    if (flag)
+                        strides = strides * src0->ne[i];
+                }
+
+                ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, nodeP, glob_buf);
+            }
 
         }
         else {
@@ -7123,12 +7349,6 @@ ggml_backend_tsavorite_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
 static size_t ggml_backend_tsavorite_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
   GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
-  // Must match the hardware's actual vector-register width (TSI_TVU_MEM_ALIGN, 128
-  // bytes / 1024 bits), not a smaller value. GGML uses this to decide the spacing
-  // between tensors packed into a shared buffer; a smaller value here only "works"
-  // by coincidence when every tensor's byte size happens to already be a multiple
-  // of 128. Was hardcoded to 32, which silently broke for Gemma4-12b (Q4_K_M) --
-  // see JIRA-2258 GEMMA4-VALIDATION-SUMMARY.md.
   return TSI_TVU_MEM_ALIGN;
   TSI_UNUSED(buft);
 }
