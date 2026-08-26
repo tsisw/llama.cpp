@@ -306,7 +306,8 @@ static void ggml_log_internal_v(enum ggml_log_level level, const char * format, 
 void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
     va_list args;
     va_start(args, format);
-    ggml_log_internal_v(level, format, args);
+    if (level == GGML_LOG_LEVEL_TSAVORITE)
+        ggml_log_internal_v(level, format, args);
     va_end(args);
 }
 
@@ -1100,6 +1101,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+static const char * GGML_BACKEND_TYPE[GGML_COMPUTE_BACKEND_COUNT] = {
+    "CPU",
+    "OPU"
+};
+#endif /* GGML_PERF-related flags */
+
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
@@ -1363,6 +1371,12 @@ bool ggml_is_quantized(enum ggml_type type) {
 const char * ggml_op_name(enum ggml_op op) {
     return GGML_OP_NAME[op];
 }
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) ||  defined(GGML_PERF_DETAIL)
+const char * ggml_backend_type(enum ggml_compute_backend_type backend) {
+    return GGML_BACKEND_TYPE[backend];
+}
+#endif /* GML_PERF-related flags */
 
 const char * ggml_op_symbol(enum ggml_op op) {
     return GGML_OP_SYMBOL[op];
@@ -1819,6 +1833,11 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) ||  defined(GGML_PERF_DETAIL)
+        /*.perf_runs    =*/ 0,
+        /*.perf_time_us =*/ 0,
+        /*.ggml_compute_backend =*/ GGML_COMPUTE_BACKEND_CPU,
+#endif /* GML_PERF-related flags */
         /*.padding      =*/ { 0 },
     };
 
@@ -8027,3 +8046,362 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) ||  defined(GGML_PERF_DETAIL)
+void ggml_perf_accumulate(struct ggml_perf_totals totals[GGML_OP_COUNT], struct ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        enum ggml_op op = node->op;
+
+        if (op >= GGML_OP_COUNT) continue;
+
+        const int64_t node_perf_time_us = node->perf_time_us;
+        const int64_t node_perf_runs = node->perf_runs;
+        const int64_t node_tsi_kernel_runs = node->tsi_kernel_runs;
+
+        if (node_perf_runs == 0 && node_perf_time_us == 0 && node_tsi_kernel_runs == 0) {
+            continue;
+        }
+
+        totals[op].op_name = ggml_op_name(op);
+        totals[op].total_us += node_perf_time_us;
+        totals[op].runs     += node_perf_runs;
+        totals[op].op_count++;
+
+	// Count backend runs
+        enum ggml_compute_backend_type be = node->ggml_compute_backend;
+        if (be >= GGML_COMPUTE_BACKEND_CPU && be < GGML_COMPUTE_BACKEND_COUNT) {
+            totals[op].backend_subtotals[be].total_us += node_perf_time_us;
+	    totals[op].backend_subtotals[be].runs     += node_perf_runs;
+	    totals[op].backend_subtotals[be].tsi_kernel_count   += node_tsi_kernel_runs;
+        }
+
+        if (op == GGML_OP_UNARY) {
+            enum ggml_unary_op subop = ggml_get_unary_op(node);
+            totals[op].unary_subtotals[subop].total_us += node_perf_time_us;
+            totals[op].unary_subtotals[subop].runs     += node_perf_runs;
+            totals[op].unary_subtotals[subop].tsi_kernel_count   += node_tsi_kernel_runs;
+        }
+        node->perf_time_us = 0;
+        node->perf_runs = 0;
+        node->tsi_kernel_runs = 0;
+    }
+}
+#endif /* GML_PERF-related flags */
+
+#if defined(GGML_PERF_DETAIL)
+FILE * ggml_perf_log_open(const char *filename) {
+    // Try to delete existing file, ignore error if it doesn't exist
+    remove(filename);
+
+    // Create a new file in write mode
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        fprintf(stderr, "Error: Could not create file %s\n", filename);
+        return NULL;
+    }
+
+    return fp;
+}
+
+void ggml_perf_write_detailed_csv(struct ggml_cgraph * cgraph, FILE *fp) {
+    if (!fp || !cgraph) return;
+
+    struct ggml_perf_shape_agg {
+        bool used;
+
+        enum ggml_op op;
+        int unary_subop;
+
+        enum ggml_compute_backend_type backend;
+        enum ggml_type type;
+
+        int64_t ne[GGML_MAX_DIMS];
+
+        bool src_used[GGML_MAX_SRC];
+        enum ggml_type src_type[GGML_MAX_SRC];
+        int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+
+        int64_t runs;
+        int64_t tsi_kernel_runs;
+        int64_t perf_time_us;
+    };
+
+    struct ggml_perf_shape_agg * aggs =
+        (struct ggml_perf_shape_agg *) calloc((size_t) cgraph->n_nodes, sizeof(struct ggml_perf_shape_agg));
+
+    if (!aggs) {
+        return;
+    }
+
+    int n_aggs = 0;
+    int64_t total_time_us = 0;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+
+        if (!node) {
+            continue;
+        }
+
+        if (node->perf_runs == 0) {
+            continue;
+        }
+
+#ifdef TMU_DEBUG
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+#endif /* TMU_DEBUG */
+
+        total_time_us += node->perf_time_us;
+
+        int unary_subop = -1;
+        if (node->op == GGML_OP_UNARY) {
+            unary_subop = (int) ggml_get_unary_op(node);
+        }
+
+        int found = -1;
+
+        for (int a = 0; a < n_aggs; ++a) {
+            if (!aggs[a].used) {
+                continue;
+            }
+
+            if (aggs[a].op != node->op) {
+                continue;
+            }
+
+            if (aggs[a].unary_subop != unary_subop) {
+                continue;
+            }
+
+            if (aggs[a].backend != node->ggml_compute_backend) {
+                continue;
+            }
+
+            if (aggs[a].type != node->type) {
+                continue;
+            }
+
+            bool same = true;
+
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (aggs[a].ne[d] != node->ne[d]) {
+                    same = false;
+                    break;
+                }
+            }
+
+            if (!same) {
+                continue;
+            }
+
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                struct ggml_tensor * src = node->src[s];
+                bool src_used = src != NULL;
+
+                if (aggs[a].src_used[s] != src_used) {
+                    same = false;
+                    break;
+                }
+
+                if (!src_used) {
+                    continue;
+                }
+
+                if (aggs[a].src_type[s] != src->type) {
+                    same = false;
+                    break;
+                }
+
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (aggs[a].src_ne[s][d] != src->ne[d]) {
+                        same = false;
+                        break;
+                    }
+                }
+
+                if (!same) {
+                    break;
+                }
+            }
+
+            if (same) {
+                found = a;
+                break;
+            }
+        }
+
+        if (found < 0) {
+            found = n_aggs++;
+
+            aggs[found].used = true;
+            aggs[found].op = node->op;
+            aggs[found].unary_subop = unary_subop;
+            aggs[found].backend = node->ggml_compute_backend;
+            aggs[found].type = node->type;
+
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                aggs[found].ne[d] = node->ne[d];
+            }
+
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                struct ggml_tensor * src = node->src[s];
+
+                aggs[found].src_used[s] = src != NULL;
+
+                if (src) {
+                    aggs[found].src_type[s] = src->type;
+
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        aggs[found].src_ne[s][d] = src->ne[d];
+                    }
+                }
+            }
+        }
+
+        aggs[found].runs += node->perf_runs;
+        aggs[found].tsi_kernel_runs += node->tsi_kernel_runs;
+        aggs[found].perf_time_us += node->perf_time_us;
+    }
+
+    fprintf(fp,
+            "\n=== GGML Detailed Op Perf Aggregated By Shape (%.3f ms total) ===\n",
+            total_time_us / 1000.0);
+
+    fprintf(fp,
+            "%-10s %-16s %-8s %8s %14s %12s %10s     %s\n",
+            "Backend",
+            "Op",
+            "Type",
+            "Runs",
+            "TSI_KERNEL",
+            "Total ms",
+            "Avg ms",
+            "Dimensions");
+
+    const enum ggml_compute_backend_type backend_order[] = {
+        GGML_COMPUTE_BACKEND_TSAVORITE,
+        GGML_COMPUTE_BACKEND_CPU,
+    };
+
+    for (int op_idx = 0; op_idx < GGML_OP_COUNT; ++op_idx) {
+        bool has_op_printed = false;
+
+        for (int bidx = 0; bidx < (int)(sizeof(backend_order) / sizeof(backend_order[0])); ++bidx) {
+            enum ggml_compute_backend_type backend = backend_order[bidx];
+
+            bool has_backend_shapes = false;
+
+            for (int a = 0; a < n_aggs; ++a) {
+                if (!aggs[a].used) {
+                    continue;
+                }
+
+                if ((int) aggs[a].op != op_idx) {
+                    continue;
+                }
+
+                if (aggs[a].backend != backend) {
+                    continue;
+                }
+
+                has_backend_shapes = true;
+                break;
+            }
+
+            if (!has_backend_shapes) {
+                continue;
+            }
+
+            if (!has_op_printed) {
+                fprintf(fp,
+                        "\n--- OP GROUP: %s ---\n",
+                        ggml_op_name((enum ggml_op) op_idx));
+                has_op_printed = true;
+            }
+
+            fprintf(fp,
+                    "--- BACKEND: %s ---\n",
+                    ggml_backend_type(backend));
+
+            for (int a = 0; a < n_aggs; ++a) {
+                if (!aggs[a].used) {
+                    continue;
+                }
+
+                if ((int) aggs[a].op != op_idx) {
+                    continue;
+                }
+
+                if (aggs[a].backend != backend) {
+                    continue;
+                }
+
+                const char * op_name = ggml_op_name(aggs[a].op);
+                char full_op[64];
+
+                if (aggs[a].op == GGML_OP_UNARY && aggs[a].unary_subop >= 0) {
+                    snprintf(full_op, sizeof(full_op),
+                            "UNARY(%s)",
+                            ggml_unary_op_name((enum ggml_unary_op) aggs[a].unary_subop));
+                    op_name = full_op;
+                }
+
+                double t_ms   = aggs[a].perf_time_us / 1000.0;
+                double avg_ms = aggs[a].runs ? t_ms / aggs[a].runs : 0.0;
+
+                fprintf(fp,
+                        "%-10s %-16s %-8s %8" PRId64 " %14" PRId64 " %12.3f %10.3f     [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                        ggml_backend_type(aggs[a].backend),
+                        op_name,
+                        ggml_type_name(aggs[a].type),
+                        aggs[a].runs,
+                        aggs[a].tsi_kernel_runs,
+                        t_ms,
+                        avg_ms,
+                        aggs[a].ne[0],
+                        aggs[a].ne[1],
+                        aggs[a].ne[2],
+                        aggs[a].ne[3]);
+
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (!aggs[a].src_used[s]) {
+                        continue;
+                    }
+
+                    fprintf(fp,
+                            "%-10s %-16s %-8s %8s %14s %12s %10s         [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                            "",
+                            (s == 0) ? "    src0" :
+                            (s == 1) ? "    src1" :
+                            (s == 2) ? "    src2" :
+                            (s == 3) ? "    src3" :
+                            (s == 4) ? "    src4" :
+                            (s == 5) ? "    src5" :
+                            (s == 6) ? "    src6" :
+                            (s == 7) ? "    src7" :
+                            (s == 8) ? "    src8" :
+                                       "    src9",
+                            ggml_type_name(aggs[a].src_type[s]),
+                            "",
+                            "",
+                            "",
+                            "",
+                            aggs[a].src_ne[s][0],
+                            aggs[a].src_ne[s][1],
+                            aggs[a].src_ne[s][2],
+                            aggs[a].src_ne[s][3]);
+                }
+            }
+        }
+    }
+
+    fprintf(fp,
+            "--------------------------------------------------------------------------------------------------------\n\n");
+
+    free(aggs);
+}
+
+#endif /* GGML_PERF_DETAIL */

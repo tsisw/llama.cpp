@@ -38,6 +38,12 @@ static common_params            * g_params;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
+static void my_logger(ggml_log_level level, const char *text, void *user_data) {
+    if (level == GGML_LOG_LEVEL_TSAVORITE) {
+        fprintf(stderr, "%s", text);  // only show warnings or errors
+    }
+}
+
 static void print_usage(int argc, char ** argv) {
     (void) argc;
 
@@ -92,6 +98,7 @@ int llama_completion(int argc, char ** argv) {
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
+        ggml_backend_cleanup();
         return 1;
     }
 
@@ -106,6 +113,7 @@ int llama_completion(int argc, char ** argv) {
         LOG_ERR("************\n");
         LOG_ERR("%s: please use the 'embedding' tool for embedding calculations\n", __func__);
         LOG_ERR("************\n\n");
+        ggml_backend_cleanup();
 
         return 0;
     }
@@ -123,6 +131,9 @@ int llama_completion(int argc, char ** argv) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    llama_log_set(my_logger, nullptr);
+#endif /* GGML_PERF-related flags */
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
@@ -148,6 +159,7 @@ int llama_completion(int argc, char ** argv) {
 
     if (ctx == NULL) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
+        ggml_backend_cleanup();
         return 1;
     }
 
@@ -165,6 +177,7 @@ int llama_completion(int argc, char ** argv) {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         LOG_ERR("%s: no CPU backend found\n", __func__);
+        ggml_backend_cleanup();
         return 1;
     }
     auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
@@ -178,6 +191,7 @@ int llama_completion(int argc, char ** argv) {
 
     if (!set_process_priority(params.cpuparams.priority)) {
         LOG_ERR("%s: error: failed to set process priority\n", __func__);
+        ggml_backend_cleanup();
         return 1;
     }
 
@@ -186,6 +200,7 @@ int llama_completion(int argc, char ** argv) {
         threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
         if (!threadpool_batch) {
             LOG_ERR("%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
+            ggml_backend_cleanup();
             return 1;
         }
 
@@ -196,6 +211,7 @@ int llama_completion(int argc, char ** argv) {
     struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
     if (!threadpool) {
         LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
+        ggml_backend_cleanup();
         return 1;
     }
 
@@ -259,6 +275,7 @@ int llama_completion(int argc, char ** argv) {
             size_t n_token_count_out = 0;
             if (!llama_state_load_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
                 LOG_ERR("%s: failed to load session file '%s'\n", __func__, path_session.c_str());
+                ggml_backend_cleanup();
                 return 1;
             }
             session_tokens.resize(n_token_count_out);
@@ -334,6 +351,7 @@ int llama_completion(int argc, char ** argv) {
             LOG_WRN("embd_inp was considered empty and bos was added: %s\n", string_from(ctx, embd_inp).c_str());
         } else {
             LOG_ERR("input is empty\n");
+            ggml_backend_cleanup();
             return -1;
         }
     }
@@ -341,6 +359,7 @@ int llama_completion(int argc, char ** argv) {
     // Tokenize negative prompt
     if ((int) embd_inp.size() > n_ctx - 4) {
         LOG_ERR("%s: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
+        ggml_backend_cleanup();
         return 1;
     }
 
@@ -388,6 +407,7 @@ int llama_completion(int argc, char ** argv) {
         // "replay" the last token to get logits for sampling.
         if (!session_tokens.empty() && n_match > 0 && n_match == session_tokens.size()) {
             if (!common_replay_last_token(ctx, session_tokens.back(), n_match - 1)) {
+                ggml_backend_cleanup();
                 return 1;
             }
 
@@ -444,6 +464,7 @@ int llama_completion(int argc, char ** argv) {
         sigaction(SIGINT, &sigint_action, NULL);
 #elif defined (_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+            ggml_backend_cleanup();
             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
@@ -571,6 +592,7 @@ int llama_completion(int argc, char ** argv) {
 
         if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
             LOG_ERR("%s : failed to eval\n", __func__);
+            ggml_backend_cleanup();
             return 1;
         }
 
@@ -686,6 +708,7 @@ int llama_completion(int argc, char ** argv) {
                 const bool save_now = session_do_save && is_last_batch;
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
                 if (!common_prompt_batch_decode(ctx, session_tokens, embd.size(), n_past, params.n_batch, path_session, save_now)) {
+                    ggml_backend_cleanup();
                     return 1;
                 }
                 n_session_consumed += embd.size();
@@ -988,13 +1011,19 @@ int llama_completion(int argc, char ** argv) {
 
     }
 
-    LOG("\n\n");
-    common_perf_print(ctx, smpl);
-
-    llama_backend_free();
-
+    // Ensure all prompt response output is fully completed before printing profiling data.
+    // Free threadpools first to guarantee all worker threads have finished processing and output.
+    // This prevents interleaving of prompt response and profiling output, ensuring correct order.
+    // fflush(stdout) is called to flush any remaining output before printing profiling stats.
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
+
+    LOG("\n\n");
+    fflush(stdout);
+    common_perf_print(ctx, smpl);
+
+    ggml_backend_cleanup();
+    llama_backend_free();
 
     return 0;
 }

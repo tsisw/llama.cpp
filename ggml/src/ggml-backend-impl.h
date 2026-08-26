@@ -137,6 +137,15 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) reserve a graph without allocating (used by ollama)
+        enum ggml_status          (*graph_reserve)      (ggml_backend_t backend, struct ggml_cgraph * cgraph, bool alloc);
+        // (optional) report backend-specific buffer size (used by ollama)
+        size_t                    (*buffer_size)        (ggml_backend_t backend);
+        // (optional) reset backend state (used by ollama)
+        void                      (*reset)              (ggml_backend_t backend);
+        // (optional) print backend-specific profiling info
+        void                      (*profile)            ();
     };
 
     struct ggml_backend {

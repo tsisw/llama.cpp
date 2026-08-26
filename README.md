@@ -123,3 +123,97 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+## References
+
+#### TSI compilation steps
+
+##### Prerequisites
+
+- **TOOLBOX_DIR**: Path to installed toolbox (contains ARM/Xtensa toolchains and common libraries)
+- **MLIR_COMPILER_DIR**: Path to MLIR compiler installation (for blob compilation)
+- Or use **MLIR_SDK_VERSION** which contains both (e.g., `/proj/rel/sw/sdk-r.0.2.2`)
+
+##### Quick build (recommended)
+
+The `tsi-pkg-build.sh` script handles all steps automatically:
+
+```bash
+# Clone the repo
+git clone git@github.com:tsisw/llama.cpp.git
+cd llama.cpp
+
+# Option 1: Using SDK path (derives TOOLBOX_DIR and MLIR_COMPILER_DIR automatically)
+export MLIR_SDK_VERSION=/proj/rel/sw/sdk-r.0.2.2
+./tsi-pkg-build.sh
+
+# Option 2: Explicit paths
+./tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
+
+# Option 3: Environment variables
+export MLIR_COMPILER_DIR=/path/to/mlir-compiler/install
+export TOOLBOX_DIR=/path/to/toolbox/install
+./tsi-pkg-build.sh
+
+# For release build (copies to /proj/rel/sw/ggml)
+./tsi-pkg-build.sh release
+```
+
+##### Manual build steps
+
+```bash
+# Clone and setup
+git clone git@github.com:tsisw/llama.cpp.git
+cd llama.cpp
+git submodule update --recursive --init
+
+# Set paths (adjust as needed)
+export MLIR_COMPILER_DIR=/proj/rel/sw/sdk-r.0.2.2/compiler
+export TOOLBOX_DIR=/proj/rel/sw/sdk-r.0.2.2/toolbox/build/install
+
+# Create Python virtual environment for blob compilation
+cd ggml-tsi-kernel/
+/proj/local/Python-3.11.12/bin/python3 -m venv blob-creation
+source blob-creation/bin/activate
+pip install --upgrade pip torch==2.7.0
+pip install -r ${MLIR_COMPILER_DIR}/python/requirements-common.txt
+pip install ${MLIR_COMPILER_DIR}/python/mlir_external_packages-*.whl
+pip install onnxruntime-training
+
+# Build FPGA kernels (blobs)
+cd fpga-kernel
+cmake -B build-fpga \
+  -DTOOLBOX_DIR=${TOOLBOX_DIR} \
+  -DCOMPILER_INSTALL_DIR=${MLIR_COMPILER_DIR}
+./create-all-kernels.sh
+
+# Build Posix kernels
+cd ../posix-kernel/
+./create-all-kernels.sh
+cd ../../
+
+# Build llama.cpp for Posix (x86_64)
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
+cmake --build build-posix --config Release
+
+# Build llama.cpp for FPGA (ARM cross-compilation using toolbox toolchain)
+cmake -B build-fpga \
+  -DCMAKE_TOOLCHAIN_FILE=${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake \
+  -DGGML_TSAVORITE=ON \
+  -DGGML_TSAVORITE_TARGET=fpga \
+  -DLLAMA_CURL=OFF
+cmake --build build-fpga --config Release
+```
+
+##### Build variants
+
+```bash
+# Debug build with detailed performance logging
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix \
+  -DCMAKE_C_FLAGS="-DGGML_PERF_DETAIL" -DCMAKE_CXX_FLAGS="-DGGML_PERF_DETAIL"
+
+# Release build with performance metrics
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix \
+  -DCMAKE_C_FLAGS="-DGGML_PERF_RELEASE" -DCMAKE_CXX_FLAGS="-DGGML_PERF_RELEASE"
+```
+

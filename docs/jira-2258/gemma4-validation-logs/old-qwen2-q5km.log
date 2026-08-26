@@ -1,0 +1,38 @@
+=== old-qwen2-q5km (600s) ===
+
+ TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is Mimi. She
+
+
+
+llama_perf_sampler_print:    sampling time =      43.82 ms /     9 runs   (    4.87 ms per token,   205.40 tokens per second)
+llama_perf_context_print:        load time =   74411.50 ms
+llama_perf_context_print: prompt eval time =   72783.65 ms /     5 tokens (14556.73 ms per token,     0.07 tokens per second)
+llama_perf_context_print:        eval time =    2571.78 ms /     3 runs   (  857.26 ms per token,     1.17 tokens per second)
+llama_perf_context_print:       total time =   77030.27 ms /     8 tokens
+
+=== GGML Perf Summary ===
+  Op                   Runs        Total us            Avg us
+  ADD                  1302           86405             66.36
+  MUL                   196          258636           1319.57
+  RMS_NORM              196          260585           1329.52
+  MUL_MAT              2937        77682975          26449.77
+  CONT                  192           16548             86.19
+  RESHAPE              1050             232              0.22
+  VIEW                 1179             161              0.14
+  PERMUTE               890             150              0.17
+  TRANSPOSE             346              80              0.23
+  GET_ROWS               12              84              7.00
+  SET_ROWS              711             674              0.95
+  SOFT_MAX               96           24260            252.71
+  ROPE                  758            4013              5.29
+  GLU                    96          609272           6346.58
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	1m21.343s
+user	2m0.274s
+sys	0m39.912s
+EXIT_CODE=0

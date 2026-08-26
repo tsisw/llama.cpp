@@ -1,0 +1,37 @@
+=== new-qwen25-q4km ===
+
+ TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is Zane. He
+
+
+llama_perf_context_print:        load time =   72178.72 ms
+llama_perf_context_print: prompt eval time =   72178.54 ms /     5 tokens (14435.71 ms per token,     0.07 tokens per second)
+llama_perf_context_print:        eval time =     973.79 ms /     3 runs   (  324.60 ms per token,     3.08 tokens per second)
+llama_perf_context_print:       total time =   73155.56 ms /     8 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              CPU          288               0               202              0.70
+  ADD              OPU          192             376             76511            398.49
+  MUL              OPU          196             384            329072           1678.94
+  RMS_NORM         OPU          196             196            200029           1020.56
+  MUL_MAT          CPU          703               0             42893             61.01
+  MUL_MAT          OPU          165             165          71600457         433942.16
+  CONT             OPU          192               0             12221             63.65
+  VIEW             OPU          384               0                83              0.22
+  PERMUTE          OPU          288               0                35              0.12
+  TRANSPOSE        OPU           96               0                25              0.26
+  GET_ROWS         OPU           12               0                48              4.00
+  SET_ROWS         OPU          192               0               183              0.95
+  SOFT_MAX         OPU           96               0              2224             23.17
+  ROPE             CPU          192               0               419              2.18
+  GLU              OPU           96             188            560870           5842.40
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	1m18.084s
+user	1m54.134s
+sys	0m39.304s
+EXIT_CODE=0

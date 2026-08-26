@@ -1,0 +1,10 @@
+=== old-gemma4-12b ===
+
+ TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+
+ Unable to load Model
+
+real	0m5.270s
+user	0m1.065s
+sys	0m0.128s
+EXIT_CODE=1

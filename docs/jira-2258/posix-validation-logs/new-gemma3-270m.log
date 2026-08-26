@@ -1,0 +1,40 @@
+=== new-gemma3-270m ===
++ timeout 300 /proj/work/akapoor/tmp/llama-cpp-sync-investigate/llama.cpp/build-posix/bin/llama-completion -p 'My cat'\''s name is' -m /proj/rel/sw/ggml/models/Gemma3-270M-F32.gguf -c 4096 --device tSavorite --temp 0.0 --n-predict 4 --repeat-penalty 1.5 -b 1024 --top-k 50 --top-p 0.9 --repeat-last-n 5 --no-warmup --no-conversation
+
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=8 user_dram_size_bytes=8589934592 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is "Cat" and
+
+
+llama_perf_context_print:        load time =   20178.85 ms
+llama_perf_context_print: prompt eval time =   20178.60 ms /     7 tokens ( 2882.66 ms per token,     0.35 tokens per second)
+llama_perf_context_print:        eval time =    1756.83 ms /     3 runs   (  585.61 ms per token,     1.71 tokens per second)
+llama_perf_context_print:       total time =   21941.08 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          144             348             90625            629.34
+  MUL              OPU          436            1606           1163857           2669.40
+  RMS_NORM         OPU          436             436            498281           1142.85
+  MUL_MAT          CPU          583               0            123938            212.59
+  MUL_MAT          OPU           69              69          18996749         275315.20
+  SCALE            CPU           76               0                89              1.17
+  CONT             OPU          144               0             17317            120.26
+  VIEW             OPU          288               0                58              0.20
+  PERMUTE          OPU          216               0                32              0.15
+  TRANSPOSE        OPU           72               0                21              0.29
+  GET_ROWS         OPU           12               0                51              4.25
+  SET_ROWS         OPU          144               0               156              1.08
+  SOFT_MAX         OPU           72               0               764             10.61
+  ROPE             CPU           72               0               197              2.74
+  ROPE             OPU           72               0               529              7.35
+  GLU              CPU           72               0              3924             54.50
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	0m31.055s
+user	0m45.100s
+sys	0m12.869s
++ echo EXIT_CODE=0
+EXIT_CODE=0

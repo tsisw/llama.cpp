@@ -1,0 +1,38 @@
+=== new-gemma3-270m (post-alignment-fix) ===
+
+ TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is "Cat" and
+
+
+llama_perf_context_print:        load time =   20966.04 ms
+llama_perf_context_print: prompt eval time =   20965.79 ms /     7 tokens ( 2995.11 ms per token,     0.33 tokens per second)
+llama_perf_context_print:        eval time =    1836.00 ms /     3 runs   (  612.00 ms per token,     1.63 tokens per second)
+llama_perf_context_print:       total time =   22807.64 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          144             348             66502            461.82
+  MUL              OPU          436            1606           1166781           2676.10
+  RMS_NORM         OPU          436             436            513891           1178.65
+  MUL_MAT          CPU          583               0            164746            282.58
+  MUL_MAT          OPU           69              69          19809106         287088.49
+  SCALE            CPU           76               0               104              1.37
+  CONT             OPU          144               0             18801            130.56
+  VIEW             OPU          288               0                63              0.22
+  PERMUTE          OPU          216               0                32              0.15
+  TRANSPOSE        OPU           72               0                16              0.22
+  GET_ROWS         OPU           12               0                39              3.25
+  SET_ROWS         OPU          144               0               168              1.17
+  SOFT_MAX         OPU           72               0               735             10.21
+  ROPE             CPU           72               0               206              2.86
+  ROPE             OPU           72               0               572              7.94
+  GLU              CPU           72               0              4210             58.47
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	0m32.237s
+user	0m43.750s
+sys	0m13.205s
+EXIT_CODE=0

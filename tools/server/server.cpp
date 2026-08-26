@@ -404,6 +404,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 models_routes->models.unload_all();
             }
             mcp_mgr.shutdown();
+            ggml_backend_cleanup();
             llama_backend_free();
         };
 
@@ -432,6 +433,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             ctx_http.stop();
             ctx_server.terminate();
             mcp_mgr.shutdown();
+            ggml_backend_cleanup();
             llama_backend_free();
         };
 

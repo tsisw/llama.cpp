@@ -1,0 +1,39 @@
+=== final-qwen2-q5km (qwen2-0_5b-instruct-q5_k_m.gguf (Q5_K_M)): final verification, post all fixes including 2nd cubic-dev-ai review batch (commit 50c227b17) ===
+
+=== qwen2-q5km (final verification, post 2nd cubic review batch, commit 50c227b17) ===
+
+ TSI deploy yaml=/tmp/pr-jira-2258/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=16 user_dram_size_bytes=17179869184 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is Muffy. She
+
+
+llama_perf_context_print:        load time =   74822.29 ms
+llama_perf_context_print: prompt eval time =   74822.13 ms /     5 tokens (14964.43 ms per token,     0.07 tokens per second)
+llama_perf_context_print:        eval time =     956.37 ms /     3 runs   (  318.79 ms per token,     3.14 tokens per second)
+llama_perf_context_print:       total time =   75781.87 ms /     8 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              CPU          288               0               221              0.77
+  ADD              OPU          192             376             73422            382.41
+  MUL              OPU          196             384            275751           1406.89
+  RMS_NORM         OPU          196             196            231170           1179.44
+  MUL_MAT          CPU          703               0             47733             67.90
+  MUL_MAT          OPU          165             165          74255707         450034.59
+  CONT             OPU          192               0             13106             68.26
+  VIEW             OPU          384               0                63              0.16
+  PERMUTE          OPU          288               0                50              0.17
+  TRANSPOSE        OPU           96               0                45              0.47
+  GET_ROWS         OPU           12               0                50              4.17
+  SET_ROWS         OPU          192               0               196              1.02
+  SOFT_MAX         OPU           96               0              1924             20.04
+  ROPE             CPU          192               0               444              2.31
+  GLU              OPU           96             188            564990           5885.31
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	1m22.278s
+user	1m58.309s
+sys	0m42.249s
+EXIT_CODE=0

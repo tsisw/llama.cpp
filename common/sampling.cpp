@@ -580,6 +580,17 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
         common_memory_breakdown_print(ctx);
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+        // Upstream's fit_params/sampling.cpp refactor moved this function's job of
+        // printing perf stats out of llama_perf_context_print() and inlined it here
+        // (via LOG_INF above), bypassing our GGML_PERF-guarded LLAMA_LOG_TSAVORITE
+        // block and the GGML Perf Summary table inside that function entirely. Call
+        // it explicitly so Tsavorite perf builds still get that output. Its own
+        // internal guard means this adds only the LLAMA_LOG_TSAVORITE-tagged lines
+        // and the summary table, not a duplicate of the plain LOG_INF lines above.
+        llama_perf_context_print(ctx);
+#endif /* GGML_PERF-related flags */
     }
 }
 

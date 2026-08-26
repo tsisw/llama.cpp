@@ -1,0 +1,188 @@
+=== Full tsisim session, 2026-08-26, akapoor, run_llama_cli.sh, package built from commit c56d67765 (jira-2258-llama-cpp-sync) ===
+=== Deployment yaml note: session started at user_dram_size_gb=16 (this PR's new default,
+    sufficient on posix), manually raised to 30 partway through -- see
+    TSISIM-VALIDATION-SUMMARY.md for why tsisim specifically needs 30, not just 16. ===
+
+root@tsisim:/usr/bin/tsi/bin# /tsi/tsi-sw/check_tsictl.sh
+Index 0:     execute                     : 0
+    execute_debug               : 0
+[... all 20 TXEs at 0, fresh boot ...]
+
+root@tsisim:/usr/bin/tsi/bin# cat ./tsi-ggml/tsavorite-model-deployment.yaml
+user_dram_size_gb: 16
+[... manually edited to 30 ...]
+user_dram_size_gb: 30
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh
+MODEL_NAME = tinyllama-vo-5m-para.gguf
+[...]
+TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=20 multi_thread_enable=1 user_dram_size_gb=30 user_dram_size_bytes=32212254720 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+[2026-08-26 06:33:46.736] num_vm_segments: 3 (17079185408 + 8589934592 + 6543134720 bytes)
+
+ was Tim. He loved
+
+llama_perf_context_print:        load time =    1587.40 ms
+llama_perf_context_print: prompt eval time =    1586.61 ms /     5 tokens (  317.32 ms per token,     3.15 tokens per second)
+llama_perf_context_print:        eval time =    1806.82 ms /     5 runs   (  361.36 ms per token,     2.77 tokens per second)
+llama_perf_context_print:       total time =    3395.63 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU           96             152              5249             54.68
+  MUL              OPU          102             162              6193             60.72
+  RMS_NORM         OPU          102             102              3359             32.93
+  MUL_MAT          CPU          409               0             42224            103.24
+  MUL_MAT          OPU           29             344            899597          31020.59
+  CONT             OPU           96               0              1191             12.41
+  VIEW             OPU          192               0                29              0.15
+  PERMUTE          OPU          144               0                14              0.10
+  TRANSPOSE        OPU           48               0                 6              0.12
+  GET_ROWS         OPU           18               0               162              9.00
+  SET_ROWS         OPU           96               0                73              0.76
+  SOFT_MAX         OPU           48               0              1015             21.15
+  ROPE             CPU           96               0                86              0.90
+  GLU              OPU           48              76            519021          10812.94
+EXIT: clean. Result matches earlier pre-fix tsisim baseline exactly ("was Tim. He loved").
+
+check_tsictl.sh after run: TXE0=405, TXE1-4=58, TXE5-7=29, TXE8-15=14, TXE16-19=0
+-- sensible first-free-index pool distribution, matches documented scheduler behavior.
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh   (edited MODEL_NAME to Gemma4-12b-Q4_K_M.gguf)
+[...]
+TSI deploy yaml=... txe_count=20 multi_thread_enable=1 user_dram_size_gb=30 ...
+[2026-08-26 06:39:12.972] num_vm_segments: 3
+
+<|channel>thought
+<channel|>The
+
+llama_perf_context_print:        load time = 7278797.45 ms
+llama_perf_context_print: prompt eval time = 7278796.87 ms /     5 tokens (1455759.37 ms per token,     0.00 tokens per second)
+llama_perf_context_print:        eval time =  136820.99 ms /     5 runs   (27364.20 ms per token,     0.04 tokens per second)
+llama_perf_context_print:       total time = 7415627.26 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          576             960             52646             91.40
+  MUL              OPU         2022           12890           1926022            952.53
+  RMS_NORM         CPU          288               0               595              2.07
+  RMS_NORM         OPU         1734            1734            110789             63.89
+  MUL_MAT          CPU         2406               0           1503990            625.10
+  MUL_MAT          OPU          144            2880        7180270044       49862986.42
+  SCALE            CPU           18               0               476             26.44
+  CONT             OPU          576               0            226425            393.10
+  VIEW             OPU         1152               0               494              0.43
+  PERMUTE          OPU          864               0               165              0.19
+  TRANSPOSE        OPU          288               0               113              0.39
+  GET_ROWS         OPU           12               0               102              8.50
+  SET_ROWS         OPU          576               0              3422              5.94
+  SOFT_MAX         OPU          288               0              6480             22.50
+  ROPE             CPU          576               0              2026              3.52
+  UNARY            CPU            6               0             13892           2315.33
+    -> TANH        CPU            6               0             13892           2315.33
+  GLU              CPU          288               0             13336             46.31
+EXIT: clean. Gemma4-12b, real OPU dispatch (MUL_MAT 144 runs / 2880 TSI_KERNEL-RUN,
+matches posix's ADD=960/MUL=12890 kernel-run counts exactly -- the chat-templated
+prompt from run_llama_cli.sh's --jinja is longer than the raw posix test prompt,
+which is why RMS_NORM/MUL_MAT counts are higher here than the posix baseline).
+~2h wall time on tsisim vs ~24min on posix for this model -- tsisim is simply slower
+per-op for MUL_MAT-heavy work at this scale, not a correctness issue.
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh   (edited MODEL_NAME to Tiny-Llama-v0.3-FP32-1.1B-F32.gguf)
+[...]
+ is Luna.
+
+llama_perf_context_print:        load time =  931115.40 ms
+llama_perf_context_print:       total time =  952746.70 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          264             432             23436             88.77
+  MUL              OPU          270             442             21074             78.05
+  RMS_NORM         OPU          270             270             12770             47.30
+  MUL_MAT          CPU         1109               0            247803            223.45
+  MUL_MAT          OPU           85            1700         917348285       10792332.76
+  CONT             OPU          264               0             13772             52.17
+  VIEW             OPU          528               0               141              0.27
+  PERMUTE          OPU          396               0                64              0.16
+  TRANSPOSE        OPU          132               0                38              0.29
+  GET_ROWS         OPU           18               0                53              2.94
+  SET_ROWS         OPU          264               0               518              1.96
+  SOFT_MAX         OPU          132               0              5549             42.04
+  ROPE             CPU          264               0               427              1.62
+  GLU              OPU          132             216          10081460          76374.70
+EXIT: clean. Matches earlier pre-fix tsisim baseline exactly ("is Luna.") and
+MUL_MAT 1109 CPU / 85 OPU split matches the pre-existing TSISIM-VALIDATION-SUMMARY.md
+table exactly (same model, same split, confirmed reproducible across sessions).
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh   (edited MODEL_NAME to Llama3.2:1B-1.2B-F32.gguf)
+[...]
+ is molly and she
+
+llama_perf_context_print:        load time =  924963.12 ms
+llama_perf_context_print:       total time =  943065.60 ms /     9 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          192             282             16402             85.43
+  MUL              OPU          198             291             13472             68.04
+  RMS_NORM         OPU          198             198             10217             51.60
+  MUL_MAT          CPU          809               0            309140            382.13
+  MUL_MAT          OPU           61            1220         915484198       15007937.67
+  CONT             OPU          192               0             19978            104.05
+  VIEW             OPU          384               0               122              0.32
+  PERMUTE          OPU          288               0                40              0.14
+  TRANSPOSE        OPU           96               0                34              0.35
+  GET_ROWS         OPU           18               0                62              3.44
+  SET_ROWS         OPU          192               0               544              2.83
+  SOFT_MAX         OPU           96               0              3698             38.52
+  ROPE             CPU          192               0               386              2.01
+  GLU              OPU           96             141           9287268          96742.38
+EXIT: clean. Matches earlier pre-fix tsisim baseline exactly ("is molly and she").
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh   (edited MODEL_NAME to Gemma4-12b-Q4_K_M.gguf, device none/CPU-only check)
+[...]
+<|channel>thought
+<channel|>It
+
+llama_perf_context_print:        load time =     847.24 ms
+llama_perf_context_print:       total time =    1782.54 ms /    10 tokens
+
+=== GGML Perf Summary ===  (every op Target=CPU -- this is the tsisim CPU control run)
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              CPU          576               0              1126              1.95
+  MUL              CPU          288               0               947              3.29
+  RMS_NORM         CPU          288               0               398              1.38
+  MUL_MAT          CPU         1974               0           1714742            868.66
+  SCALE            CPU           18               0               411             22.83
+  GET_ROWS         CPU           12               0                73              6.08
+  SET_ROWS         CPU          576               0              2079              3.61
+  ROPE             CPU          576               0              1403              2.44
+  FLASH_ATTN_EXT   CPU          288               0              4034             14.01
+  UNARY            CPU            6               0             13654           2275.67
+    -> TANH        CPU            6               0             13654           2275.67
+  GLU              CPU          288               0             10420             36.18
+EXIT: clean. tsisim CPU output ("It") matches posix CPU output exactly, byte for byte
+(both: "<|channel>thought" / "<channel|>It") -- confirms CPU execution is identical
+across platforms, as expected. Tsavorite's one-token divergence from CPU ("The" vs
+"It", see the Tsavorite run above) is the same class of minor greedy-decoding variance
+already documented for this model in GEMMA4-VALIDATION-SUMMARY.md (Luna0 vs Luna).
+
+root@tsisim:/usr/bin/tsi/bin# ./run_llama_cli.sh   (edited MODEL_NAME to Gemma3-270M-F32.gguf, device none/CPU-only check)
+[...]
+ is "cat" and
+
+llama_perf_context_print:        load time =      20.97 ms
+llama_perf_context_print:       total time =     110.53 ms /    10 tokens
+
+=== GGML Perf Summary ===  (every op Target=CPU)
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              CPU          216               0               100              0.46
+  MUL_MAT          CPU          762               0             95386            125.18
+  SCALE            CPU          114               0                16              0.14
+  GET_ROWS         CPU           18               0                30              1.67
+  SET_ROWS         CPU          216               0               196              0.91
+  ROPE             CPU          216               0               226              1.05
+  FLASH_ATTN_EXT   CPU          108               0               487              4.51
+  GLU              CPU          108               0               703              6.51
+EXIT: clean. Matches earlier pre-fix tsisim Tsavorite baseline output exactly
+("is \"cat\" and"), now confirmed on CPU too.

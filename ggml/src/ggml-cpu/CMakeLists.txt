@@ -29,7 +29,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
@@ -52,6 +51,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        )
+
+    # Always include generic repack.cpp for all builds
+    list(APPEND GGML_CPU_SOURCES
+        ggml-cpu/repack.cpp
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
@@ -95,8 +99,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
-    if (GGML_SYSTEM_ARCH STREQUAL "ARM")
-        message(STATUS "ARM detected")
+    if (GGML_SYSTEM_ARCH STREQUAL "ARM" OR ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+        if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+            message(STATUS "FPGA build detected, using ARM architecture")
+        else()
+            message(STATUS "ARM detected")
+        endif()
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/arm/quants.c
             ggml-cpu/arch/arm/repack.cpp
@@ -237,7 +245,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endforeach()
             set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
         endif()
-    elseif (GGML_SYSTEM_ARCH STREQUAL "x86")
+    elseif (GGML_SYSTEM_ARCH STREQUAL "x86" AND NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
         message(STATUS "x86 detected")
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/x86/quants.c

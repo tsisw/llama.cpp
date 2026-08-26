@@ -1,0 +1,36 @@
+=== new-tinyllama-1.1b (post-alignment-fix) ===
+
+ TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+ My cat's name is Luna.
+llama_perf_context_print:        load time =  167423.80 ms
+llama_perf_context_print: prompt eval time =  167423.64 ms /     7 tokens (23917.66 ms per token,     0.04 tokens per second)
+llama_perf_context_print:        eval time =    3680.74 ms /     3 runs   ( 1226.91 ms per token,     0.82 tokens per second)
+llama_perf_context_print:       total time =  171106.04 ms /    10 tokens
+
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          176             428            106582            605.58
+  MUL              OPU          180             438            484431           2691.28
+  RMS_NORM         OPU          180             180            248087           1378.26
+  MUL_MAT          CPU          711               0            417179            586.75
+  MUL_MAT          OPU           85              85         166289154        1956342.99
+  CONT             OPU          176               0             20632            117.23
+  VIEW             OPU          352               0                91              0.26
+ She  PERMUTE          OPU          264               0                43              0.16
+
+
+  TRANSPOSE        OPU           88               0                16              0.18
+  GET_ROWS         OPU           12               0                59              4.92
+  SET_ROWS         OPU          176               0               269              1.53
+  SOFT_MAX         OPU           88               0              5305             60.28
+  ROPE             CPU          176               0               504              2.86
+  GLU              OPU           88             214            525959           5976.81
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	3m15.153s
+user	4m15.746s
+sys	1m41.602s
+EXIT_CODE=0
