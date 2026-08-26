@@ -1,8 +1,0 @@
-=== new-gemma4-e2b (24GB) ===
-
- TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
-
-real	0m4.718s
-user	0m0.520s
-sys	0m0.154s
-EXIT_CODE=1
