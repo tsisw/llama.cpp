@@ -22,6 +22,7 @@
 #include <signal.h>
 
 #include "ggml-tsavorite.h"
+#include "TestModel.h"
 #include <unistd.h>
 #include <inttypes.h>
 #include <math.h>
@@ -7547,7 +7548,8 @@ static void ggml_backend_tsavorite_set_n_cb(ggml_backend_t backend, int n_cb) {
 
 #ifdef OLLAMA
 void
-tsi_log_profile_info() {
+tsi_log_profile_info(ggml_backend_t backend) {
+    TSI_UNUSED(backend);
     GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
     tsi_unload_all_blobs();
     if(device_free) {
@@ -8202,12 +8204,12 @@ ggml_backend_reg_t ggml_backend_tsavorite_reg(void) {
         }
         // else: already initialized in another process
     }
-    g_ggml_backend_tsavorite_reg.api_version = GGML_BACKEND_API_VERSION;
 #else
     ensure_tsi_runtime_initialized();
 
 #endif /* OLLAMA */
 
+    g_ggml_backend_tsavorite_reg.api_version = GGML_BACKEND_API_VERSION;
     g_ggml_backend_tsavorite_reg.iface = ggml_backend_tsavorite_reg_i;
     g_ggml_backend_tsavorite_reg.context = NULL;
 

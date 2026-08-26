@@ -143,12 +143,15 @@ The `tsi-pkg-build.sh` script handles all steps automatically:
 git clone git@github.com:tsisw/llama.cpp.git
 cd llama.cpp
 
+# SDK_VERSION is mandatory for every invocation (fails fast otherwise)
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
+
 # Option 1: Using SDK path (derives TOOLBOX_DIR and MLIR_COMPILER_DIR automatically)
 export MLIR_SDK_VERSION=/proj/rel/sw/sdk-r.0.2.2
-./tsi-pkg-build.sh
+source tsi-pkg-build.sh
 
 # Option 2: Explicit paths
-./tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
+source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
 
 # Option 3: Environment variables
 export MLIR_COMPILER_DIR=/path/to/mlir-compiler/install
@@ -170,6 +173,11 @@ git submodule update --recursive --init
 # Set paths (adjust as needed)
 export MLIR_COMPILER_DIR=/proj/rel/sw/sdk-r.0.2.2/compiler
 export TOOLBOX_DIR=/proj/rel/sw/sdk-r.0.2.2/toolbox/build/install
+
+# SDK_VERSION is mandatory for every cmake invocation below (fails fast
+# otherwise) -- exporting it once here covers all of them via CMakeLists.txt's
+# ENV{SDK_VERSION} fallback, so it doesn't need to be repeated as -D on each line.
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
 
 # Create Python virtual environment for blob compilation
 cd ggml-tsi-kernel/

@@ -28,8 +28,8 @@ static void signal_handler(int) {
 #endif
 
 static void my_logger(ggml_log_level level, const char *text, void *user_data) {
-    if (level == GGML_LOG_LEVEL_TSAVORITE) {
-        fprintf(stderr, "%s", text);  // only show warnings or errors
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
     }
 }
 

@@ -13,6 +13,10 @@ history landing via the version bump — **do not review it file-by-file**.
 For this PR type, scope review to only:
 - `consolidated-patch.patch` at the repo root — every Tsavorite-specific change, as one
   patch file. This is the actual diff to read.
+- `UPSTREAM_BASE_COMMIT` at the repo root — the upstream SHA this sync vendored forward
+  to and that `consolidated-patch.patch` was regenerated against. Check it matches the
+  commit named in the PR title/description; a mismatch here means the patch may not
+  apply cleanly against the base it claims.
 - `tsi-pkg-build.sh` — the build/packaging script, tracked directly (excluded from the
   patch above on purpose).
 - Any one-line config default changes called out explicitly in the PR description

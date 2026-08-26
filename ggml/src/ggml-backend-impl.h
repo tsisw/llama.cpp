@@ -145,7 +145,7 @@ extern "C" {
         // (optional) reset backend state (used by ollama)
         void                      (*reset)              (ggml_backend_t backend);
         // (optional) print backend-specific profiling info
-        void                      (*profile)            ();
+        void                      (*profile)            (ggml_backend_t backend);
     };
 
     struct ggml_backend {

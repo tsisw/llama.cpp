@@ -7,10 +7,10 @@ index 000000000..3ce3a158a
 +* @mmankal @atrivedi-tsavoritesi @dmpatra @mikeuhler @akapoor3518 @dineshReddy6381 @gkethamallax @Nithyanand-G
 diff --git a/.github/copilot-instructions.md b/.github/copilot-instructions.md
 new file mode 100644
-index 000000000..dc776879f
+index 000000000..eaec7eadd
 --- /dev/null
 +++ b/.github/copilot-instructions.md
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +# Instructions for AI code review on this repository
 +
 +This is a fork of `ggml-org/llama.cpp` maintained by Tsavorite (`tsisw`). Most PRs on
@@ -26,6 +26,10 @@ index 000000000..dc776879f
 +For this PR type, scope review to only:
 +- `consolidated-patch.patch` at the repo root — every Tsavorite-specific change, as one
 +  patch file. This is the actual diff to read.
++- `UPSTREAM_BASE_COMMIT` at the repo root — the upstream SHA this sync vendored forward
++  to and that `consolidated-patch.patch` was regenerated against. Check it matches the
++  commit named in the PR title/description; a mismatch here means the patch may not
++  apply cleanly against the base it claims.
 +- `tsi-pkg-build.sh` — the build/packaging script, tracked directly (excluded from the
 +  patch above on purpose).
 +- Any one-line config default changes called out explicitly in the PR description
@@ -56,7 +60,7 @@ index e69de29bb..ff1b6feda 100644
 +	path = ggml-tsi-kernel
 +	url = git@github.com:tsisw/ggml-tsi-kernel.git
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b2092d12d..e70c881ef 100644
+index b2092d12d..6a0e2bacf 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -25,6 +25,82 @@ message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
@@ -68,7 +72,7 @@ index b2092d12d..e70c881ef 100644
 +    if  (NOT DEFINED GGML_TSAVORITE_TARGET)
 +        set(GGML_TSAVORITE_TARGET "posix")
 +    endif()
-+    if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    if (NOT "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +        set(GGML_TSAVORITE_TARGET "posix")
 +    endif()
 +
@@ -96,7 +100,7 @@ index b2092d12d..e70c881ef 100644
 +    endif()
 +
 +    if (NOT DEFINED MLIR_COMPILER_DIR)
-+        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
++        if (NOT DEFINED ENV{MLIR_SDK_VERSION})
 +            set (MLIR_COMPILER_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/compiler)
 +            message("MLIR_SDK_VERSION not set defaulting to ${MLIR_COMPILER_DIR}")
 +        else()
@@ -105,7 +109,7 @@ index b2092d12d..e70c881ef 100644
 +    endif()
 +
 +    if (NOT DEFINED RUNTIME_DIR)
-+        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
++        if (NOT DEFINED ENV{MLIR_SDK_VERSION})
 +            set (RUNTIME_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/${GGML_TSAVORITE_TARGET}/runtime)
 +            message("MLIR_SDK_VERSION not set defaulting to ${RUNTIME_DIR}")
 +        else()
@@ -118,12 +122,12 @@ index b2092d12d..e70c881ef 100644
 +    endif()
 +
 +
-+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +        set(CMAKE_CROSSCOMPILING ON)
 +        set(ARCH_FLAGS -march=armv8-a)
 +        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${RUNTIME_DIR}/../utils/lib/TsavRTShimCAPI.cpp.o")
 +        message("Setting target as fpga")
-+    elseif (${GGML_TSAVORITE_TARGET} STREQUAL "posix")
++    elseif ("${GGML_TSAVORITE_TARGET}" STREQUAL "posix")
 +        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "${MLIR_COMPILER_DIR}/lib/libTsavRTPosixShimCAPI.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-c-native.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-cpp.so" "${MLIR_COMPILER_DIR}/lib/libtvu_fau_full.so")
 +        message("Setting target as posix for tsavorite")
 +    endif()
@@ -156,15 +160,6 @@ index b2092d12d..e70c881ef 100644
  # Add path to modules
  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
  
-@@ -141,7 +224,7 @@ option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT}
- option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
- 
- # 3rd party libs
--option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
-+option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
- option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
- option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
- 
 @@ -229,7 +312,15 @@ if (LLAMA_BUILD_COMMON)
      add_subdirectory(vendor/cpp-httplib)
  endif()
@@ -183,10 +178,10 @@ index b2092d12d..e70c881ef 100644
      add_subdirectory(tests)
  endif()
 diff --git a/README.md b/README.md
-index 1b341e7fb..f20bde5eb 100644
+index 1b341e7fb..d61e9bd57 100644
 --- a/README.md
 +++ b/README.md
-@@ -123,3 +123,97 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
+@@ -123,3 +123,105 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
  - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
  - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
  - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
@@ -210,12 +205,15 @@ index 1b341e7fb..f20bde5eb 100644
 +git clone git@github.com:tsisw/llama.cpp.git
 +cd llama.cpp
 +
++# SDK_VERSION is mandatory for every invocation (fails fast otherwise)
++export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
++
 +# Option 1: Using SDK path (derives TOOLBOX_DIR and MLIR_COMPILER_DIR automatically)
 +export MLIR_SDK_VERSION=/proj/rel/sw/sdk-r.0.2.2
-+./tsi-pkg-build.sh
++source tsi-pkg-build.sh
 +
 +# Option 2: Explicit paths
-+./tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
++source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
 +
 +# Option 3: Environment variables
 +export MLIR_COMPILER_DIR=/path/to/mlir-compiler/install
@@ -237,6 +235,11 @@ index 1b341e7fb..f20bde5eb 100644
 +# Set paths (adjust as needed)
 +export MLIR_COMPILER_DIR=/proj/rel/sw/sdk-r.0.2.2/compiler
 +export TOOLBOX_DIR=/proj/rel/sw/sdk-r.0.2.2/toolbox/build/install
++
++# SDK_VERSION is mandatory for every cmake invocation below (fails fast
++# otherwise) -- exporting it once here covers all of them via CMakeLists.txt's
++# ENV{SDK_VERSION} fallback, so it doesn't need to be repeated as -D on each line.
++export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
 +
 +# Create Python virtual environment for blob compilation
 +cd ggml-tsi-kernel/
@@ -285,20 +288,23 @@ index 1b341e7fb..f20bde5eb 100644
 +```
 +
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index d6cfc9a00..6b83c2a22 100644
+index d6cfc9a00..3a0aab7fd 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -175,4 +175,15 @@ if (LLAMA_LLGUIDANCE)
+@@ -175,4 +175,18 @@ if (LLAMA_LLGUIDANCE)
      endif()
  endif()
  
 -target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
 +if (GGML_TSAVORITE)
-+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
++        # rpath-link for transitively-needed tsi_* symbols is handled globally via
++        # -DCMAKE_EXE_LINKER_FLAGS in tsi-pkg-build.sh (FPGA_TOOLBOX_LIB_DIR /
++        # FPGA_RUNTIME_LIB_DIR) -- no per-target linker flags needed here. A prior
++        # per-target attempt using CMAKE_FIND_ROOT_PATH (the ARM cross-toolchain's
++        # own sysroot search list, not the Tsavorite SDK lib dir) broke the FPGA
++        # link by expanding a 4-entry CMake list into bogus bare linker arguments.
 +        target_link_libraries     (${TARGET} PRIVATE ${TLIBS} PUBLIC llama Threads::Threads)
-+	set(SYSROOT_PATH_FOR_LIBRARIES $ENV{CMAKE_FIND_ROOT_PATH}/lib)
-+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${SYSROOT_PATH_FOR_LIBRARIES} -Wl,-rpath-link,${SYSROOT_PATH_FOR_LIBRARIES}")
-+	target_link_directories(${TARGET} PRIVATE ${SYSROOT_PATH_FOR_LIBRARIES})
 +    else()
 +        target_link_libraries     (${TARGET} PUBLIC llama Threads::Threads)
 +    endif()
@@ -306,20 +312,27 @@ index d6cfc9a00..6b83c2a22 100644
 +    target_link_libraries     (${TARGET} PUBLIC llama Threads::Threads)
 +endif()
 diff --git a/common/common.h b/common/common.h
-index b16bd3bb6..32cff402f 100644
+index b16bd3bb6..495327846 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -465,7 +465,17 @@ struct common_params {
+@@ -465,7 +465,24 @@ struct common_params {
      int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
      int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
      float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-+#ifdef GGML_TSAVORITE
++#if defined(GGML_TSAVORITE) || defined(GGML_USE_TSAVORITE)
 +    // fit_params (a new upstream feature) constructs a throwaway llama_context per
 +    // device purely to probe its free memory, which initializes that device's ggml
 +    // backend as a side effect. The Tsavorite backend's runtime layer assumes it is
 +    // initialized at most once per process; this probe-then-build pattern violates
 +    // that and segfaults inside tsi_alloc() during the probe. Default it off for
 +    // Tsavorite builds until/unless the backend is made safe for repeated init.
++    //
++    // Checks both macros: tsi-pkg-build.sh injects the bare GGML_TSAVORITE into
++    // CMAKE_C_FLAGS/CMAKE_CXX_FLAGS globally (reaching this file directly), while
++    // a plain `cmake -DGGML_TSAVORITE=ON` invocation only gets GGML_USE_TSAVORITE,
++    // which ggml_add_backend() attaches as a PUBLIC compile definition on the
++    // `ggml` target (propagated to linking consumers like this one) -- but only
++    // when GGML_BACKEND_DL is off. Neither macro alone covers every build path.
 +    bool    fit_params         = false; // whether to fit unset model/context parameters to free device memory
 +#else
      bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -328,38 +341,30 @@ index b16bd3bb6..32cff402f 100644
      int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
  
 diff --git a/common/log.h b/common/log.h
-index 45d82f4dd..0952aa8db 100644
+index 45d82f4dd..3d9b848c9 100644
 --- a/common/log.h
 +++ b/common/log.h
-@@ -111,12 +111,22 @@ void common_log_flush         (struct common_log * log);                    // f
+@@ -111,12 +111,14 @@ void common_log_flush         (struct common_log * log);                    // f
  #define LOG(...)             LOG_TMPL(GGML_LOG_LEVEL_NONE, LOG_LEVEL_OUTPUT, __VA_ARGS__)
  #define LOGV(verbosity, ...) LOG_TMPL(GGML_LOG_LEVEL_NONE, verbosity,        __VA_ARGS__)
  
 -#define LOG_DBG(...) LOG_TMPL(GGML_LOG_LEVEL_DEBUG, LOG_LEVEL_DEBUG,  __VA_ARGS__)
  #define LOG_TRC(...) LOG_TMPL(GGML_LOG_LEVEL_INFO,  LOG_LEVEL_TRACE,  __VA_ARGS__)
 +
-+#if ENABLE_LOG
 +#define LOG_DBG(...) LOG_TMPL(GGML_LOG_LEVEL_DEBUG, LOG_LEVEL_DEBUG,  __VA_ARGS__)
  #define LOG_INF(...) LOG_TMPL(GGML_LOG_LEVEL_INFO,  LOG_LEVEL_INFO,   __VA_ARGS__)
  #define LOG_WRN(...) LOG_TMPL(GGML_LOG_LEVEL_WARN,  LOG_LEVEL_WARN,   __VA_ARGS__)
  #define LOG_ERR(...) LOG_TMPL(GGML_LOG_LEVEL_ERROR, LOG_LEVEL_ERROR,  __VA_ARGS__)
  #define LOG_CNT(...) LOG_TMPL(GGML_LOG_LEVEL_CONT,  LOG_LEVEL_INFO,   __VA_ARGS__) // same as INFO
-+#else
-+#define LOG_DBG(...)
-+#define LOG_INF(...)
-+#define LOG_WRN(...)
-+#define LOG_ERR(...)
-+#define LOG_CNT(...)
-+#endif
 +#define LOG_TSAVORITE(...) LOG_TMPL(GGML_LOG_LEVEL_TSAVORITE,  0,                 __VA_ARGS__)
  
  #define LOG_DBGV(verbosity, ...) LOG_TMPL(GGML_LOG_LEVEL_DEBUG, verbosity, __VA_ARGS__)
  #define LOG_TRCV(verbosity, ...) LOG_TMPL(GGML_LOG_LEVEL_TRACE, verbosity, __VA_ARGS__)
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e1c..9a67a159d 100644
+index 06dea1e1c..72be01219 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
-@@ -580,6 +580,17 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+@@ -580,6 +580,16 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
          LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
  
          common_memory_breakdown_print(ctx);
@@ -369,19 +374,18 @@ index 06dea1e1c..9a67a159d 100644
 +        // printing perf stats out of llama_perf_context_print() and inlined it here
 +        // (via LOG_INF above), bypassing our GGML_PERF-guarded LLAMA_LOG_TSAVORITE
 +        // block and the GGML Perf Summary table inside that function entirely. Call
-+        // it explicitly so Tsavorite perf builds still get that output. Its own
-+        // internal guard means this adds only the LLAMA_LOG_TSAVORITE-tagged lines
-+        // and the summary table, not a duplicate of the plain LOG_INF lines above.
-+        llama_perf_context_print(ctx);
++        // the Tsavorite-only summary directly (not llama_perf_context_print()
++        // itself, which would reprint the plain load/eval/total-time lines above).
++        llama_perf_context_print_tsavorite_summary(ctx);
 +#endif /* GGML_PERF-related flags */
      }
  }
  
 diff --git a/docs/build.md b/docs/build.md
-index ca086a0be..612810ed2 100644
+index ca086a0be..a6b7171ce 100644
 --- a/docs/build.md
 +++ b/docs/build.md
-@@ -763,3 +763,66 @@ The GPU may still be used to accelerate some parts of the computation even when
+@@ -763,3 +763,76 @@ The GPU may still be used to accelerate some parts of the computation even when
  In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
  
  Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
@@ -427,6 +431,12 @@ index ca086a0be..612810ed2 100644
 +cd ../../
 +```
 +
++SDK_VERSION is mandatory for every cmake invocation below (CMakeLists.txt fails
++fast otherwise). Export it once before either build:
++```bash
++export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
++```
++
 +Compile for posix with build-posix as a target folder
 +```bash
 +cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
@@ -440,13 +450,17 @@ index ca086a0be..612810ed2 100644
 +cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 +cmake --build build-fpga --config Release
 +```
-+For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.tz
-+If you want to release the build update the TSI-VERSION in the file tsi-pkg-build.sh and add Release as parameter
-+when running ./tsi-pkg-build.sh (Note it will overwrite what exists in /proj/rel/sw/ggml so be sure you want to do
-+it. Example ./tsi-pkg-build.sh release
++For an easier build, use `tsi-pkg-build.sh` instead, which builds both posix and
++fpga and creates a versioned FPGA package bundle `tsi-ggml-${SDK_VERSION}.tz`.
++It must be *sourced*, not executed, and `SDK_VERSION` is passed on the same
++line (there is no separate `TSI-VERSION` setting). Add `release` as a
++parameter to also install the result under `/proj/rel/sw/ggml` (this
++overwrites what's already there, so be sure before using it):
 +
 +```bash
-+./tsi-pkg-build.sh
++SDK_VERSION=0.4.1 source tsi-pkg-build.sh
++# or, to also release:
++SDK_VERSION=0.4.1 source tsi-pkg-build.sh release
 +```
 diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
 index 39f802d25..497fb6e2a 100644
@@ -546,7 +560,7 @@ index 567f7fbbb..cdf65e58a 100644
 +target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT} ${TLIBS})
  target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/simple/CMakeLists.txt b/examples/simple/CMakeLists.txt
-index 104ecabfd..47881941b 100644
+index 104ecabfd..5b97ac2a5 100644
 --- a/examples/simple/CMakeLists.txt
 +++ b/examples/simple/CMakeLists.txt
 @@ -1,5 +1,44 @@
@@ -563,7 +577,7 @@ index 104ecabfd..47881941b 100644
 +if (GGML_TSAVORITE)
 +    #
 +    # tsavorite backend test cases
-+    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
 +    else()
 +        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
@@ -1025,10 +1039,10 @@ index 000000000..7b7de1f16
 +#endif // MAT_MUL_TSI_TEST_CASE_CPP
 diff --git a/examples/simple/simple-backend-tsi.cpp b/examples/simple/simple-backend-tsi.cpp
 new file mode 100644
-index 000000000..5e6aa415b
+index 000000000..18b9b9bbb
 --- /dev/null
 +++ b/examples/simple/simple-backend-tsi.cpp
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,764 @@
 +#include "ggml.h"
 +#include "ggml-alloc.h"
 +#include "ggml-backend.h"
@@ -1580,7 +1594,11 @@ index 000000000..5e6aa415b
 +    // allocate tensors
 +    ggml_gallocr_alloc_graph(allocr, gf);
 +
-+    ggml_backend_graph_compute(model.backend, gf);
++    enum ggml_status status = ggml_backend_graph_compute(model.backend, gf);
++    if (status != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "\ncompute failed: backend graph compute returned status=%d\n", (int)status);
++        return NULL;
++    }
 +
 +    // in this case, the output tensor is the last one in the graph
 +    return ggml_graph_node(gf, -1);
@@ -1612,8 +1630,8 @@ index 000000000..5e6aa415b
 +        else if (!strcmp(testCase,"silu"))
 +            return GGML_TSAVORITE_KERNEL_TYPE_SILU;
 +
-+	fprintf(stderr, "\n un-supported test case %s hence running default test case which is add operation  \n", testCase);
-+	return GGML_TSAVORITE_KERNEL_TYPE_ADD;
++	fprintf(stderr, "\n unrecognized test case '%s' -- rejecting rather than silently running 'add'\n", testCase);
++	exit(1);
 +}
 +
 +const char* convert_ops_type_to_testcase(enum ggml_tsavorite_kernel_type ops_type) {
@@ -1657,9 +1675,13 @@ index 000000000..5e6aa415b
 +    bool test_case_flag = true;
 +    enum ggml_tsavorite_kernel_type ops_type;
 +    simple_model model;
-+    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-+    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-+    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
++    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
++    // Unary ops never assign input2[ops_type] below (num_of_input_tensors ==
++    // NUM_INPUT_URINARY_TENSORS skips it in both branches), but it's still
++    // passed unconditionally to load_model() -- zero-init so unary ops pass
++    // nullptr instead of an indeterminate pointer.
++    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
++    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
 +    bool data_scale = false;
 +
 +    int elements_A=0, elements_B=0;
@@ -2168,10 +2190,10 @@ index cc3f8cd36..4a1d40e31 100644
      GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
 diff --git a/ggml/include/ggml-tsavorite.h b/ggml/include/ggml-tsavorite.h
 new file mode 100644
-index 000000000..4d2bd0e43
+index 000000000..76f14fc5f
 --- /dev/null
 +++ b/ggml/include/ggml-tsavorite.h
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,366 @@
 +// ------------------------------------------------------------------------------
 +// Copyright (c) 2023 Tsavorite Scalable Intelligence, Inc . All rights reserved.
 +//
@@ -2219,8 +2241,6 @@ index 000000000..4d2bd0e43
 +
 +#include "ggml-backend.h"
 +#include "ggml.h"
-+
-+#include "TestModel.h"
 +
 +#include <stdbool.h>
 +#include <stddef.h>
@@ -2541,7 +2561,7 @@ index 000000000..4d2bd0e43
 +}
 +#endif
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 5cb49d0ee..39381bdbb 100644
+index 5cb49d0ee..a6421a739 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -355,6 +355,14 @@ extern "C" {
@@ -2620,13 +2640,13 @@ index 5cb49d0ee..39381bdbb 100644
 +const char * ggml_backend_type(enum ggml_compute_backend_type backend);
 +
 +#endif /* GML_PERF-related flags */
-+void ggml_backend_cleanup();
++GGML_API void ggml_backend_cleanup();
 +
  #ifdef  __cplusplus
  }
  #endif
 diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
-index 82e9480c2..72279259d 100644
+index 82e9480c2..da4507600 100644
 --- a/ggml/src/CMakeLists.txt
 +++ b/ggml/src/CMakeLists.txt
 @@ -222,7 +222,10 @@ if (GGML_SCHED_NO_REALLOC)
@@ -2634,7 +2654,7 @@ index 82e9480c2..72279259d 100644
  endif()
  
 -if (GGML_OPENMP)
-+if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++if (GGML_TSAVORITE AND "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +    message("Target is FPGA no GOMP linked")
 +    set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
 +elseif (GGML_OPENMP)
@@ -2650,7 +2670,7 @@ index 82e9480c2..72279259d 100644
  ggml_add_backend(RPC)
  ggml_add_backend(VirtGPU)
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index 9c56ec30c..fe9db1007 100644
+index 9c56ec30c..aa07b50d2 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
 @@ -137,6 +137,15 @@ extern "C" {
@@ -2665,7 +2685,7 @@ index 9c56ec30c..fe9db1007 100644
 +        // (optional) reset backend state (used by ollama)
 +        void                      (*reset)              (ggml_backend_t backend);
 +        // (optional) print backend-specific profiling info
-+        void                      (*profile)            ();
++        void                      (*profile)            (ggml_backend_t backend);
      };
  
      struct ggml_backend {
@@ -2703,7 +2723,7 @@ index e59594670..325c64f88 100644
      ggml_backend_load_best("sycl", silent, dir_path);
      ggml_backend_load_best("vulkan", silent, dir_path);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..474d0e8ec 100644
+index f6fb91798..a460925e6 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -27,6 +27,10 @@
@@ -2728,7 +2748,7 @@ index f6fb91798..474d0e8ec 100644
 +    if (backend->iface.profile == NULL) {
 +        return;
 +    }
-+    backend->iface.profile();
++    backend->iface.profile(backend);
 +}
 +
  ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend) {
@@ -2766,11 +2786,19 @@ index f6fb91798..474d0e8ec 100644
          }
      }
      // expand gpu up
-@@ -2429,3 +2450,11 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2450,19 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
 +
++// Finalizes the Tsavorite runtime process-wide. Callers MUST ensure every
++// live ggml_backend_t for this backend (and anything that owns buffers
++// through it, e.g. a llama_context/llama_model) has already been destroyed
++// before calling this -- calling it earlier finalizes the runtime while
++// still-owned state (device handles, allocated buffers) depends on it,
++// leading to use-after-finalize on teardown. See tools/completion/
++// completion.cpp and tools/server/server.cpp for the RAII-guard pattern
++// that enforces this ordering on every return path.
 +void ggml_backend_cleanup()
 +{
 +    #ifdef GGML_TSAVORITE
@@ -2779,7 +2807,7 @@ index f6fb91798..474d0e8ec 100644
 +    return;
 +}
 diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
-index 836bae4d0..10b66e435 100644
+index 836bae4d0..89e9e22d3 100644
 --- a/ggml/src/ggml-cpu/CMakeLists.txt
 +++ b/ggml/src/ggml-cpu/CMakeLists.txt
 @@ -29,7 +29,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
@@ -2808,8 +2836,8 @@ index 836bae4d0..10b66e435 100644
  
 -    if (GGML_SYSTEM_ARCH STREQUAL "ARM")
 -        message(STATUS "ARM detected")
-+    if (GGML_SYSTEM_ARCH STREQUAL "ARM" OR ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
-+        if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    if (GGML_SYSTEM_ARCH STREQUAL "ARM" OR (GGML_TSAVORITE AND "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga"))
++        if (GGML_TSAVORITE AND "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +            message(STATUS "FPGA build detected, using ARM architecture")
 +        else()
 +            message(STATUS "ARM detected")
@@ -2822,7 +2850,7 @@ index 836bae4d0..10b66e435 100644
              set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
          endif()
 -    elseif (GGML_SYSTEM_ARCH STREQUAL "x86")
-+    elseif (GGML_SYSTEM_ARCH STREQUAL "x86" AND NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++    elseif (GGML_SYSTEM_ARCH STREQUAL "x86" AND NOT (GGML_TSAVORITE AND "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga"))
          message(STATUS "x86 detected")
          list(APPEND GGML_CPU_SOURCES
              ggml-cpu/arch/x86/quants.c
@@ -2880,7 +2908,7 @@ index 62b76abbc..1b4e0f0d4 100644
  
 diff --git a/ggml/src/ggml-tsavorite/CMakeLists.txt b/ggml/src/ggml-tsavorite/CMakeLists.txt
 new file mode 100644
-index 000000000..d396a9ea8
+index 000000000..66a774745
 --- /dev/null
 +++ b/ggml/src/ggml-tsavorite/CMakeLists.txt
 @@ -0,0 +1,44 @@
@@ -2899,7 +2927,7 @@ index 000000000..d396a9ea8
 +endif()
 +
 +
-+if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
++if (NOT "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 +target_link_libraries(ggml-tsavorite PRIVATE ${TLIBS} dl rt)
 +else()
 +
@@ -2930,10 +2958,10 @@ index 000000000..d396a9ea8
 +endif()
 diff --git a/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
 new file mode 100644
-index 000000000..d03cdcfaf
+index 000000000..7de81f523
 --- /dev/null
 +++ b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
-@@ -0,0 +1,8221 @@
+@@ -0,0 +1,8223 @@
 +// -----------------------------------------------------------------------------n
 +// Copyright (c) 2023 Tsavorite Scalable Intelligence, Inc . All rights reserved.
 +//
@@ -2958,6 +2986,7 @@ index 000000000..d03cdcfaf
 +#include <signal.h>
 +
 +#include "ggml-tsavorite.h"
++#include "TestModel.h"
 +#include <unistd.h>
 +#include <inttypes.h>
 +#include <math.h>
@@ -10483,7 +10512,8 @@ index 000000000..d03cdcfaf
 +
 +#ifdef OLLAMA
 +void
-+tsi_log_profile_info() {
++tsi_log_profile_info(ggml_backend_t backend) {
++    TSI_UNUSED(backend);
 +    GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
 +    tsi_unload_all_blobs();
 +    if(device_free) {
@@ -11138,12 +11168,12 @@ index 000000000..d03cdcfaf
 +        }
 +        // else: already initialized in another process
 +    }
-+    g_ggml_backend_tsavorite_reg.api_version = GGML_BACKEND_API_VERSION;
 +#else
 +    ensure_tsi_runtime_initialized();
 +
 +#endif /* OLLAMA */
 +
++    g_ggml_backend_tsavorite_reg.api_version = GGML_BACKEND_API_VERSION;
 +    g_ggml_backend_tsavorite_reg.iface = ggml_backend_tsavorite_reg_i;
 +    g_ggml_backend_tsavorite_reg.context = NULL;
 +
@@ -11157,14 +11187,15 @@ index 000000000..d03cdcfaf
 +GGML_BACKEND_DL_IMPL(ggml_backend_tsavorite_reg)
 diff --git a/ggml/src/ggml-tsavorite/include/TestModel.h b/ggml/src/ggml-tsavorite/include/TestModel.h
 new file mode 100644
-index 000000000..feff2539a
+index 000000000..b2800e993
 --- /dev/null
 +++ b/ggml/src/ggml-tsavorite/include/TestModel.h
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,207 @@
 +#pragma once
 +
 +#include "HostShimCAPI.h"
 +#include <algorithm>
++#include <cmath>
 +#include <cstddef>
 +#include <fstream>
 +#include <random>
@@ -11201,27 +11232,15 @@ index 000000000..feff2539a
 +                  std::array<int, 2> inputRange = {-10, 10}) {
 +    static_assert(Rank == 1,
 +                  "initRandom(size_t) is only defined for Rank == 1");
++    static_assert(NumInputs <= 2 && NumOutputs <= 1,
++                  "initRandom(size_t) hardcodes 2 input rows and 1 output "
++                  "row; it is not defined for models with more inputs or "
++                  "outputs than that");
 +    size_t inputSizes[2][Rank] = {{numElements}, {numElements}};
 +    size_t outputSizes[1][Rank] = {{numElements}};
 +    init<ElType, ElType>(inputSizes, outputSizes,
 +                         /*initWithRandom=*/true, inputRange);
 +  }
-+
-+#if 0
-+  template <typename ElType>
-+  void initFill(size_t numElements, ElType val) {
-+    static_assert(Rank == 1,
-+                  "initRandom(size_t) is only defined for Rank == 1");
-+    size_t inputSizes[2][Rank] = {{numElements}, {numElements}};
-+    size_t outputSizes[1][Rank] = {{numElements}};
-+    init<ElType, ElType>(inputSizes, outputSizes);
-+    for (int i = 0; i < NumInputs; i++) {
-+      auto nEls = getNumElements(inputs[i]);
-+      for (size_t j = 0; j < nEls; j++)
-+        static_cast<ElType *>(inputs[i].data)[j] = val;
-+    }
-+  }
-+#endif /* 0 */
 +
 +  template <typename InputsElType, typename OutputsElType>
 +  void init(size_t inputSizes[NumInputs][Rank],
@@ -11263,10 +11282,13 @@ index 000000000..feff2539a
 +    size_t nEls = getNumElements(outputs[index].shape);
 +    float sqrSumOfDiff = 0.0;
 +    for (size_t j = 0; j < nEls; j++) {
-+      sqrSumOfDiff +=
-+          std::pow(((ElType *)outputs[index].base)[j] - expected[j], 2);
-+      if (std::abs(((ElType *)outputs[index].base)[j] - expected[j]) >
-+          tolerance) {
++      ElType actual = ((ElType *)outputs[index].base)[j];
++      sqrSumOfDiff += std::pow(actual - expected[j], 2);
++      // NaN/Inf comparisons with std::abs(...) > tolerance are always false
++      // (IEEE 754 ordering comparisons involving NaN never hold), so a NaN
++      // or Inf actual/expected value would otherwise silently pass here.
++      if (!std::isfinite(actual) || !std::isfinite(expected[j]) ||
++          std::abs(actual - expected[j]) > tolerance) {
 +        retCode = 1;
 +        if (printErrs && j < MAX_RESULT_VALUES_TO_PRINT) {
 +          printf("Mismatch at index %d: expected %1.6f, got %1.6f\n", (int)j,
@@ -11366,11 +11388,9 @@ index 000000000..feff2539a
 +
 +  size_t getNumElements(const int64_t shape[Rank]) const {
 +    size_t numElements = 1;
-+    printf("\n Anoop Rank %d and shape[Rank] %d \n\n", Rank, shape[Rank]);
 +    for (int i = 0; i < Rank; i++) {
 +      numElements *= shape[i];
 +    }
-+    printf("\n numElements %d \n", numElements);
 +    return numElements;
 +  }
 +
@@ -11379,20 +11399,10 @@ index 000000000..feff2539a
 +  }
 +};
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index da7f3a5f2..8898294af 100644
+index da7f3a5f2..637475978 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -306,7 +306,8 @@ static void ggml_log_internal_v(enum ggml_log_level level, const char * format,
- void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
-     va_list args;
-     va_start(args, format);
--    ggml_log_internal_v(level, format, args);
-+    if (level == GGML_LOG_LEVEL_TSAVORITE)
-+        ggml_log_internal_v(level, format, args);
-     va_end(args);
- }
- 
-@@ -1100,6 +1101,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1100,6 +1100,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
@@ -11406,7 +11416,7 @@ index da7f3a5f2..8898294af 100644
  static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-@@ -1364,6 +1372,12 @@ const char * ggml_op_name(enum ggml_op op) {
+@@ -1364,6 +1371,12 @@ const char * ggml_op_name(enum ggml_op op) {
      return GGML_OP_NAME[op];
  }
  
@@ -11419,7 +11429,7 @@ index da7f3a5f2..8898294af 100644
  const char * ggml_op_symbol(enum ggml_op op) {
      return GGML_OP_SYMBOL[op];
  }
-@@ -1819,6 +1833,11 @@ static struct ggml_tensor * ggml_new_tensor_impl(
+@@ -1819,6 +1832,11 @@ static struct ggml_tensor * ggml_new_tensor_impl(
          /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
          /*.name         =*/ { 0 },
          /*.extra        =*/ NULL,
@@ -11431,7 +11441,7 @@ index da7f3a5f2..8898294af 100644
          /*.padding      =*/ { 0 },
      };
  
-@@ -8027,3 +8046,362 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
+@@ -8027,3 +8045,362 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
      if (p0->strict_cpu != p1->strict_cpu ) return false;
      return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
  }
@@ -11795,7 +11805,7 @@ index da7f3a5f2..8898294af 100644
 +
 +#endif /* GGML_PERF_DETAIL */
 diff --git a/include/llama.h b/include/llama.h
-index 177fc10a9..7ce7d82a1 100644
+index 177fc10a9..89fdd7b25 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -474,6 +474,9 @@ extern "C" {
@@ -11808,9 +11818,23 @@ index 177fc10a9..7ce7d82a1 100644
      //optional:
      LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
  
+@@ -1584,6 +1587,13 @@ extern "C" {
+     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
+     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+ 
++#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
++    // Tsavorite-only perf summary (LLAMA_LOG_TSAVORITE lines + GGML Perf Summary
++    // table), without the plain load/eval/total-time lines llama_perf_context_print()
++    // also prints. For callers that already print those lines themselves.
++    LLAMA_API void                           llama_perf_context_print_tsavorite_summary(const struct llama_context * ctx);
++#endif
++
+     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
+     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
+     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
 diff --git a/model-rerun.py b/model-rerun.py
 new file mode 100644
-index 000000000..49d2b5b1a
+index 000000000..e74bca44e
 --- /dev/null
 +++ b/model-rerun.py
 @@ -0,0 +1,80 @@
@@ -11877,7 +11901,7 @@ index 000000000..49d2b5b1a
 +    print("🔍 Parsing performance metrics...")
 +    load_time = re.search(r"load time\s*=\s*([\d.]+) ms", output)
 +    prompt_eval_time = re.search(r"prompt eval time\s*=\s*([\d.]+) ms", output)
-+    eval_time = re.search(r"eval time\s*=\s*([\d.]+) ms", output)
++    eval_time = re.search(r"(?m)^[^\n]*:\s+eval time\s*=\s*([\d.]+) ms", output)
 +
 +    results.append({
 +        "Run": i,
@@ -11911,7 +11935,7 @@ index d49d14dee..0bad68bc2 100644
  endif()
 +endif()
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index aa9fb2c3b..9daddccab 100644
+index aa9fb2c3b..0c4a33ed6 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,5 +1,9 @@
@@ -12173,12 +12197,27 @@ index aa9fb2c3b..9daddccab 100644
  void llama_perf_context_print(const llama_context * ctx) {
      const auto data = llama_perf_context(ctx);
  
-@@ -4164,6 +4375,17 @@ void llama_perf_context_print(const llama_context * ctx) {
+@@ -4164,7 +4375,33 @@ void llama_perf_context_print(const llama_context * ctx) {
              __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
      LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
      LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 +
 +#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
++    llama_perf_context_print_tsavorite_summary(ctx);
++#endif /* GGML_PERF-related flags */
++}
++
++#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
++// Tsavorite-only perf output (LLAMA_LOG_TSAVORITE-tagged lines + the GGML Perf
++// Summary table), split out of llama_perf_context_print() so callers that
++// already print the plain load/eval/total-time lines themselves (e.g.
++// common_perf_print() in common/sampling.cpp) can pull in just this part
++// without re-printing those lines a second time.
++void llama_perf_context_print_tsavorite_summary(const llama_context * ctx) {
++    const auto data = llama_perf_context(ctx);
++
++    const double t_end_ms = 1e-3 * ggml_time_us();
++
 +    LLAMA_LOG_TSAVORITE("\n%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
 +    LLAMA_LOG_TSAVORITE("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
 +            __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
@@ -12187,10 +12226,11 @@ index aa9fb2c3b..9daddccab 100644
 +    LLAMA_LOG_TSAVORITE("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
 +
 +    ggml_perf_print_totals(const_cast<ggml_perf_totals *>(ctx->perf_totals));
-+#endif /* GGML_PERF-related flags */
  }
++#endif /* GGML_PERF-related flags */
  
  void llama_perf_context_reset(llama_context * ctx) {
+     ctx->perf_reset();
 diff --git a/src/llama-context.h b/src/llama-context.h
 index bf91daa8b..1c81f55a9 100644
 --- a/src/llama-context.h
@@ -12310,10 +12350,10 @@ index 419e1eba4..903cf832b 100644
  if (NOT LLAMA_USE_SYSTEM_GGML)
      # Needs non-public ggml-impl.h
 diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
-index 780df3266..0ec90ac84 100644
+index 780df3266..59993a639 100644
 --- a/tools/CMakeLists.txt
 +++ b/tools/CMakeLists.txt
-@@ -14,11 +14,14 @@ llama_add_compile_flags()
+@@ -14,22 +14,25 @@ llama_add_compile_flags()
  
  if (EMSCRIPTEN)
  else()
@@ -12324,35 +12364,48 @@ index 780df3266..0ec90ac84 100644
      add_subdirectory(llama-bench)
 +endif()
      add_subdirectory(completion)
++    add_subdirectory(mtmd) # linked by tools/server's llama-server-impl; must not be Tsavorite-excluded
++if (LLAMA_BUILD_SERVER)
++    add_subdirectory(ui)
++    add_subdirectory(cli)
++    add_subdirectory(server)
++endif()
 +if (NOT DEFINED GGML_TSAVORITE)
      add_subdirectory(perplexity)
      add_subdirectory(quantize)
-     if (LLAMA_BUILD_SERVER)
+-    if (LLAMA_BUILD_SERVER)
+-        add_subdirectory(ui)
+-        add_subdirectory(cli)
+-        add_subdirectory(server)
+-    endif()
+     add_subdirectory(tokenize)
+     add_subdirectory(parser)
+     add_subdirectory(tts)
+-    add_subdirectory(mtmd)
+     if (GGML_RPC)
+         add_subdirectory(rpc)
+     endif()
 @@ -41,3 +44,4 @@ else()
      add_subdirectory(fit-params)
      add_subdirectory(results)
  endif()
 +endif()
 diff --git a/tools/cli/CMakeLists.txt b/tools/cli/CMakeLists.txt
-index 8449cdbaf..402eb28b9 100644
+index 8449cdbaf..362cda14b 100644
 --- a/tools/cli/CMakeLists.txt
 +++ b/tools/cli/CMakeLists.txt
-@@ -20,6 +20,13 @@ set(TARGET llama-cli)
+@@ -20,6 +20,9 @@ set(TARGET llama-cli)
  
  add_executable(${TARGET} main.cpp)
  target_link_libraries(${TARGET} PRIVATE llama-cli-impl)
-+if (GGML_TSAVORITE)
-+if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
-+	set(SYSROOT_PATH_FOR_LIBRARIES $ENV{CMAKE_FIND_ROOT_PATH}/lib)
-+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${SYSROOT_PATH_FOR_LIBRARIES} -Wl,-rpath-link,${SYSROOT_PATH_FOR_LIBRARIES}")
-+	target_link_directories(${TARGET} PRIVATE ${SYSROOT_PATH_FOR_LIBRARIES})
-+endif()
-+endif()
++# rpath-link for transitively-needed tsi_* symbols on FPGA builds is handled
++# globally via -DCMAKE_EXE_LINKER_FLAGS in tsi-pkg-build.sh (FPGA_TOOLBOX_LIB_DIR /
++# FPGA_RUNTIME_LIB_DIR) -- no per-target linker flags needed here.
  target_compile_features(${TARGET} PRIVATE cxx_std_17)
  
  if(LLAMA_TOOLS_INSTALL)
 diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
-index dcdb6aeac..d81d205d1 100644
+index dcdb6aeac..667e41c54 100644
 --- a/tools/cli/cli.cpp
 +++ b/tools/cli/cli.cpp
 @@ -27,6 +27,12 @@ static void signal_handler(int) {
@@ -12360,8 +12413,8 @@ index dcdb6aeac..d81d205d1 100644
  #endif
  
 +static void my_logger(ggml_log_level level, const char *text, void *user_data) {
-+    if (level == GGML_LOG_LEVEL_TSAVORITE) {
-+        fprintf(stderr, "%s", text);  // only show warnings or errors
++    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
++        fprintf(stderr, "%s", text);
 +    }
 +}
 +
@@ -12392,25 +12445,21 @@ index dcdb6aeac..d81d205d1 100644
      }
  
 diff --git a/tools/completion/CMakeLists.txt b/tools/completion/CMakeLists.txt
-index a310251ef..82903fa01 100644
+index a310251ef..e6bd28747 100644
 --- a/tools/completion/CMakeLists.txt
 +++ b/tools/completion/CMakeLists.txt
-@@ -18,6 +18,13 @@ set(TARGET llama-completion)
+@@ -18,6 +18,9 @@ set(TARGET llama-completion)
  
  add_executable(${TARGET} main.cpp)
  target_link_libraries(${TARGET} PRIVATE llama-completion-impl)
-+if (GGML_TSAVORITE)
-+if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
-+	set(SYSROOT_PATH_FOR_LIBRARIES $ENV{CMAKE_FIND_ROOT_PATH}/lib)
-+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${SYSROOT_PATH_FOR_LIBRARIES} -Wl,-rpath-link,${SYSROOT_PATH_FOR_LIBRARIES}")
-+	target_link_directories(${TARGET} PRIVATE ${SYSROOT_PATH_FOR_LIBRARIES})
-+endif()
-+endif()
++# rpath-link for transitively-needed tsi_* symbols on FPGA builds is handled
++# globally via -DCMAKE_EXE_LINKER_FLAGS in tsi-pkg-build.sh (FPGA_TOOLBOX_LIB_DIR /
++# FPGA_RUNTIME_LIB_DIR) -- no per-target linker flags needed here.
  target_compile_features(${TARGET} PRIVATE cxx_std_17)
  
  if(LLAMA_TOOLS_INSTALL)
 diff --git a/tools/completion/completion.cpp b/tools/completion/completion.cpp
-index 6747558fc..b78147661 100644
+index 6747558fc..ac67d68a5 100644
 --- a/tools/completion/completion.cpp
 +++ b/tools/completion/completion.cpp
 @@ -38,6 +38,12 @@ static common_params            * g_params;
@@ -12426,23 +12475,26 @@ index 6747558fc..b78147661 100644
  static void print_usage(int argc, char ** argv) {
      (void) argc;
  
-@@ -92,6 +98,7 @@ int llama_completion(int argc, char ** argv) {
+@@ -91,6 +97,18 @@ int llama_completion(int argc, char ** argv) {
+ 
      common_init();
  
++    // Ensures ggml_backend_cleanup() runs only after every backend-dependent
++    // local (llama_init, chat_templates, etc. -- all declared below this
++    // point) has already been destroyed. C++ destroys locals in reverse
++    // declaration order, so declaring this guard first means it runs last,
++    // on every return path uniformly -- previously, explicit
++    // ggml_backend_cleanup() calls scattered through this function ran
++    // *before* llama_init's destructor (which frees the model/context using
++    // the backend), finalizing the backend while it was still owned.
++    struct BackendCleanupGuard {
++        ~BackendCleanupGuard() { ggml_backend_cleanup(); }
++    } backend_cleanup_guard;
++
      if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
-+        ggml_backend_cleanup();
          return 1;
      }
- 
-@@ -106,6 +113,7 @@ int llama_completion(int argc, char ** argv) {
-         LOG_ERR("************\n");
-         LOG_ERR("%s: please use the 'embedding' tool for embedding calculations\n", __func__);
-         LOG_ERR("************\n\n");
-+        ggml_backend_cleanup();
- 
-         return 0;
-     }
-@@ -123,6 +131,9 @@ int llama_completion(int argc, char ** argv) {
+@@ -123,6 +141,9 @@ int llama_completion(int argc, char ** argv) {
          LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
      }
  
@@ -12452,103 +12504,7 @@ index 6747558fc..b78147661 100644
      LOG_INF("%s: llama backend init\n", __func__);
  
      llama_backend_init();
-@@ -148,6 +159,7 @@ int llama_completion(int argc, char ** argv) {
- 
-     if (ctx == NULL) {
-         LOG_ERR("%s: error: unable to create context\n", __func__);
-+        ggml_backend_cleanup();
-         return 1;
-     }
- 
-@@ -165,6 +177,7 @@ int llama_completion(int argc, char ** argv) {
-     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-     if (!cpu_dev) {
-         LOG_ERR("%s: no CPU backend found\n", __func__);
-+        ggml_backend_cleanup();
-         return 1;
-     }
-     auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
-@@ -178,6 +191,7 @@ int llama_completion(int argc, char ** argv) {
- 
-     if (!set_process_priority(params.cpuparams.priority)) {
-         LOG_ERR("%s: error: failed to set process priority\n", __func__);
-+        ggml_backend_cleanup();
-         return 1;
-     }
- 
-@@ -186,6 +200,7 @@ int llama_completion(int argc, char ** argv) {
-         threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
-         if (!threadpool_batch) {
-             LOG_ERR("%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
-+            ggml_backend_cleanup();
-             return 1;
-         }
- 
-@@ -196,6 +211,7 @@ int llama_completion(int argc, char ** argv) {
-     struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
-     if (!threadpool) {
-         LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
-+        ggml_backend_cleanup();
-         return 1;
-     }
- 
-@@ -259,6 +275,7 @@ int llama_completion(int argc, char ** argv) {
-             size_t n_token_count_out = 0;
-             if (!llama_state_load_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
-                 LOG_ERR("%s: failed to load session file '%s'\n", __func__, path_session.c_str());
-+                ggml_backend_cleanup();
-                 return 1;
-             }
-             session_tokens.resize(n_token_count_out);
-@@ -334,6 +351,7 @@ int llama_completion(int argc, char ** argv) {
-             LOG_WRN("embd_inp was considered empty and bos was added: %s\n", string_from(ctx, embd_inp).c_str());
-         } else {
-             LOG_ERR("input is empty\n");
-+            ggml_backend_cleanup();
-             return -1;
-         }
-     }
-@@ -341,6 +359,7 @@ int llama_completion(int argc, char ** argv) {
-     // Tokenize negative prompt
-     if ((int) embd_inp.size() > n_ctx - 4) {
-         LOG_ERR("%s: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
-+        ggml_backend_cleanup();
-         return 1;
-     }
- 
-@@ -388,6 +407,7 @@ int llama_completion(int argc, char ** argv) {
-         // "replay" the last token to get logits for sampling.
-         if (!session_tokens.empty() && n_match > 0 && n_match == session_tokens.size()) {
-             if (!common_replay_last_token(ctx, session_tokens.back(), n_match - 1)) {
-+                ggml_backend_cleanup();
-                 return 1;
-             }
- 
-@@ -444,6 +464,7 @@ int llama_completion(int argc, char ** argv) {
-         sigaction(SIGINT, &sigint_action, NULL);
- #elif defined (_WIN32)
-         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-+            ggml_backend_cleanup();
-             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
-         };
-         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
-@@ -571,6 +592,7 @@ int llama_completion(int argc, char ** argv) {
- 
-         if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
-             LOG_ERR("%s : failed to eval\n", __func__);
-+            ggml_backend_cleanup();
-             return 1;
-         }
- 
-@@ -686,6 +708,7 @@ int llama_completion(int argc, char ** argv) {
-                 const bool save_now = session_do_save && is_last_batch;
-                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-                 if (!common_prompt_batch_decode(ctx, session_tokens, embd.size(), n_past, params.n_batch, path_session, save_now)) {
-+                    ggml_backend_cleanup();
-                     return 1;
-                 }
-                 n_session_consumed += embd.size();
-@@ -988,13 +1011,19 @@ int llama_completion(int argc, char ** argv) {
+@@ -988,13 +1009,18 @@ int llama_completion(int argc, char ** argv) {
  
      }
  
@@ -12563,7 +12519,6 @@ index 6747558fc..b78147661 100644
 +    fflush(stdout);
      common_perf_print(ctx, smpl);
  
-+    ggml_backend_cleanup();
      llama_backend_free();
  
 -    ggml_threadpool_free_fn(threadpool);
@@ -12572,25 +12527,27 @@ index 6747558fc..b78147661 100644
      return 0;
  }
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 6d1aa4351..32ce62879 100644
+index 6d1aa4351..a4ec9cdbf 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -404,6 +404,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
-                 models_routes->models.unload_all();
-             }
-             mcp_mgr.shutdown();
-+            ggml_backend_cleanup();
-             llama_backend_free();
-         };
+@@ -113,6 +113,17 @@ int llama_server(int argc, char ** argv) {
+ }
  
-@@ -432,6 +433,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
-             ctx_http.stop();
-             ctx_server.terminate();
-             mcp_mgr.shutdown();
-+            ggml_backend_cleanup();
-             llama_backend_free();
-         };
+ int llama_server(common_params & params, int argc, char ** argv) {
++    // Ensures ggml_backend_cleanup() runs only after every backend-owning
++    // local below (ctx_server, models_routes, etc.) has already been
++    // destroyed. C++ destroys locals in reverse declaration order, so
++    // declaring this guard first means it runs last on every return path --
++    // previously, explicit ggml_backend_cleanup() calls inside the clean_up
++    // lambdas ran while ctx_server (whose destructor frees model/context
++    // buffers) was still alive, finalizing the backend while it was owned.
++    struct BackendCleanupGuard {
++        ~BackendCleanupGuard() { ggml_backend_cleanup(); }
++    } backend_cleanup_guard;
++
+     bool is_run_by_cli = (argv == nullptr);
  
+     common_models_handler models_handler;
 diff --git a/tsavorite-model-deployment.yaml b/tsavorite-model-deployment.yaml
 new file mode 100755
 index 000000000..8e7869806

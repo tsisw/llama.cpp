@@ -245,7 +245,7 @@ void ggml_backend_log_profile_info(ggml_backend_t backend) {
     if (backend->iface.profile == NULL) {
         return;
     }
-    backend->iface.profile();
+    backend->iface.profile(backend);
 }
 
 ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend) {
@@ -2451,6 +2451,14 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
 
+// Finalizes the Tsavorite runtime process-wide. Callers MUST ensure every
+// live ggml_backend_t for this backend (and anything that owns buffers
+// through it, e.g. a llama_context/llama_model) has already been destroyed
+// before calling this -- calling it earlier finalizes the runtime while
+// still-owned state (device handles, allocated buffers) depends on it,
+// leading to use-after-finalize on teardown. See tools/completion/
+// completion.cpp and tools/server/server.cpp for the RAII-guard pattern
+// that enforces this ordering on every return path.
 void ggml_backend_cleanup()
 {
     #ifdef GGML_TSAVORITE

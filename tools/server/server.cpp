@@ -113,6 +113,17 @@ int llama_server(int argc, char ** argv) {
 }
 
 int llama_server(common_params & params, int argc, char ** argv) {
+    // Ensures ggml_backend_cleanup() runs only after every backend-owning
+    // local below (ctx_server, models_routes, etc.) has already been
+    // destroyed. C++ destroys locals in reverse declaration order, so
+    // declaring this guard first means it runs last on every return path --
+    // previously, explicit ggml_backend_cleanup() calls inside the clean_up
+    // lambdas ran while ctx_server (whose destructor frees model/context
+    // buffers) was still alive, finalizing the backend while it was owned.
+    struct BackendCleanupGuard {
+        ~BackendCleanupGuard() { ggml_backend_cleanup(); }
+    } backend_cleanup_guard;
+
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
@@ -404,7 +415,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 models_routes->models.unload_all();
             }
             mcp_mgr.shutdown();
-            ggml_backend_cleanup();
             llama_backend_free();
         };
 
@@ -433,7 +443,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
             ctx_http.stop();
             ctx_server.terminate();
             mcp_mgr.shutdown();
-            ggml_backend_cleanup();
             llama_backend_free();
         };
 

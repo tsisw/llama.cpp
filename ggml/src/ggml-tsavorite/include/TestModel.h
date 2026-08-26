@@ -2,6 +2,7 @@
 
 #include "HostShimCAPI.h"
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <random>
@@ -38,27 +39,15 @@ public:
                   std::array<int, 2> inputRange = {-10, 10}) {
     static_assert(Rank == 1,
                   "initRandom(size_t) is only defined for Rank == 1");
+    static_assert(NumInputs <= 2 && NumOutputs <= 1,
+                  "initRandom(size_t) hardcodes 2 input rows and 1 output "
+                  "row; it is not defined for models with more inputs or "
+                  "outputs than that");
     size_t inputSizes[2][Rank] = {{numElements}, {numElements}};
     size_t outputSizes[1][Rank] = {{numElements}};
     init<ElType, ElType>(inputSizes, outputSizes,
                          /*initWithRandom=*/true, inputRange);
   }
-
-#if 0
-  template <typename ElType>
-  void initFill(size_t numElements, ElType val) {
-    static_assert(Rank == 1,
-                  "initRandom(size_t) is only defined for Rank == 1");
-    size_t inputSizes[2][Rank] = {{numElements}, {numElements}};
-    size_t outputSizes[1][Rank] = {{numElements}};
-    init<ElType, ElType>(inputSizes, outputSizes);
-    for (int i = 0; i < NumInputs; i++) {
-      auto nEls = getNumElements(inputs[i]);
-      for (size_t j = 0; j < nEls; j++)
-        static_cast<ElType *>(inputs[i].data)[j] = val;
-    }
-  }
-#endif /* 0 */
 
   template <typename InputsElType, typename OutputsElType>
   void init(size_t inputSizes[NumInputs][Rank],
@@ -100,10 +89,13 @@ public:
     size_t nEls = getNumElements(outputs[index].shape);
     float sqrSumOfDiff = 0.0;
     for (size_t j = 0; j < nEls; j++) {
-      sqrSumOfDiff +=
-          std::pow(((ElType *)outputs[index].base)[j] - expected[j], 2);
-      if (std::abs(((ElType *)outputs[index].base)[j] - expected[j]) >
-          tolerance) {
+      ElType actual = ((ElType *)outputs[index].base)[j];
+      sqrSumOfDiff += std::pow(actual - expected[j], 2);
+      // NaN/Inf comparisons with std::abs(...) > tolerance are always false
+      // (IEEE 754 ordering comparisons involving NaN never hold), so a NaN
+      // or Inf actual/expected value would otherwise silently pass here.
+      if (!std::isfinite(actual) || !std::isfinite(expected[j]) ||
+          std::abs(actual - expected[j]) > tolerance) {
         retCode = 1;
         if (printErrs && j < MAX_RESULT_VALUES_TO_PRINT) {
           printf("Mismatch at index %d: expected %1.6f, got %1.6f\n", (int)j,
@@ -203,11 +195,9 @@ private:
 
   size_t getNumElements(const int64_t shape[Rank]) const {
     size_t numElements = 1;
-    printf("\n Anoop Rank %d and shape[Rank] %d \n\n", Rank, shape[Rank]);
     for (int i = 0; i < Rank; i++) {
       numElements *= shape[i];
     }
-    printf("\n numElements %d \n", numElements);
     return numElements;
   }
 

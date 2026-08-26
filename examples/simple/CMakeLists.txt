@@ -10,7 +10,7 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if (GGML_TSAVORITE)
     #
     # tsavorite backend test cases
-    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
         file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")
     else()
         file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "../../${GGML_TSI_KERNEL_DIR}/host/*.o")

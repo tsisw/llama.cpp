@@ -586,10 +586,9 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         // printing perf stats out of llama_perf_context_print() and inlined it here
         // (via LOG_INF above), bypassing our GGML_PERF-guarded LLAMA_LOG_TSAVORITE
         // block and the GGML Perf Summary table inside that function entirely. Call
-        // it explicitly so Tsavorite perf builds still get that output. Its own
-        // internal guard means this adds only the LLAMA_LOG_TSAVORITE-tagged lines
-        // and the summary table, not a duplicate of the plain LOG_INF lines above.
-        llama_perf_context_print(ctx);
+        // the Tsavorite-only summary directly (not llama_perf_context_print()
+        // itself, which would reprint the plain load/eval/total-time lines above).
+        llama_perf_context_print_tsavorite_summary(ctx);
 #endif /* GGML_PERF-related flags */
     }
 }
