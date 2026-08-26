@@ -65,6 +65,22 @@ int main(int argc, char *argv[]) {
     struct ggml_tensor * result = ggml_mul(ctx0, a, b);
     ggml_build_forward_expand(gf, result);
 
+    // GGML_OP_MUL is only compiled into ggml-tsavorite.cpp's dispatch under
+    // #ifdef TVU_SUPPORTED -- in a TMU-only build there's no code path for
+    // it at all, and calling ggml_backend_graph_compute() directly (bypassing
+    // the scheduler's normal per-op backend selection) would hit that gap
+    // instead of falling back to CPU like a real inference run would. Check
+    // support explicitly and skip cleanly rather than fail unpredictably.
+    if (!ggml_backend_supports_op(backend, result)) {
+        fprintf(stderr, "\nSKIPPED: GGML_OP_MUL not supported on this backend build "
+                "(e.g. TMU-only, no TVU_SUPPORTED) -- nothing to test here.\n");
+        ggml_free(ctx0);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);

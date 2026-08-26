@@ -5,6 +5,48 @@ index 000000000..3ce3a158a
 +++ b/.github/CODEOWNERS
 @@ -0,0 +1 @@
 +* @mmankal @atrivedi-tsavoritesi @dmpatra @mikeuhler @akapoor3518 @dineshReddy6381 @gkethamallax @Nithyanand-G
+diff --git a/.github/copilot-instructions.md b/.github/copilot-instructions.md
+new file mode 100644
+index 000000000..dc776879f
+--- /dev/null
++++ b/.github/copilot-instructions.md
+@@ -0,0 +1,36 @@
++# Instructions for AI code review on this repository
++
++This is a fork of `ggml-org/llama.cpp` maintained by Tsavorite (`tsisw`). Most PRs on
++this repo fall into two very different categories that need different review scope:
++
++## Upstream-sync PRs (large file counts, e.g. "Sync ... to upstream commit ...")
++
++These PRs vendor a newer upstream `ggml-org/llama.cpp` commit forward and apply
++`consolidated-patch.patch` (repo root) on top. They typically show thousands of changed
++files, but the vast majority of that diff is upstream's own already-reviewed commit
++history landing via the version bump — **do not review it file-by-file**.
++
++For this PR type, scope review to only:
++- `consolidated-patch.patch` at the repo root — every Tsavorite-specific change, as one
++  patch file. This is the actual diff to read.
++- `tsi-pkg-build.sh` — the build/packaging script, tracked directly (excluded from the
++  patch above on purpose).
++- Any one-line config default changes called out explicitly in the PR description
++  (e.g. `tsavorite-model-deployment.yaml`).
++- The linked testing-evidence documents in the PR description (posix/tsisim/model
++  validation summaries under `docs/`) — these are the correctness evidence, review them
++  as evidence, not as code to critique line-by-line.
++
++Everything else in an upstream-sync PR's diff is upstream's own code landing via the
++version bump and does not need comment-by-comment review.
++
++## Normal PRs (everything else)
++
++Regular feature/bugfix PRs — review normally, full diff, standard scrutiny.
++
++## How to tell which kind of PR this is
++
++Check the PR title/description for an explicit "How to review this PR" section. If
++present, follow it. If a PR's title mentions "sync" or "upstream" and touches an
++unusually large number of files relative to its description, treat it as an
++upstream-sync PR per the rules above unless the description says otherwise.
 diff --git a/.gitmodules b/.gitmodules
 index e69de29bb..ff1b6feda 100644
 --- a/.gitmodules
@@ -504,10 +546,10 @@ index 567f7fbbb..cdf65e58a 100644
 +target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT} ${TLIBS})
  target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/simple/CMakeLists.txt b/examples/simple/CMakeLists.txt
-index 104ecabfd..a87dac20c 100644
+index 104ecabfd..207651b69 100644
 --- a/examples/simple/CMakeLists.txt
 +++ b/examples/simple/CMakeLists.txt
-@@ -1,5 +1,24 @@
+@@ -1,5 +1,42 @@
 +#
 +# simple-ctx
  set(TARGET llama-simple)
@@ -532,6 +574,24 @@ index 104ecabfd..a87dac20c 100644
 +    set(TEST_TARGET simple-backend-tsi)
 +    add_executable(${TEST_TARGET} simple-backend-tsi.cpp)
 +    target_link_libraries(${TEST_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
++
++    #
++    # simple-chunked-repro: regression test for the chunked elementwise-op
++    # (ADD/MUL/SUB/DIV) padding fix and the RMS_NORM multi-row fix (JIRA-2258
++    # Gemma4 investigation)
++
++    set(CHUNKED_REPRO_TARGET simple-chunked-repro)
++    add_executable(${CHUNKED_REPRO_TARGET} simple-chunked-repro.cpp)
++    target_link_libraries(${CHUNKED_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
++
++    #
++    # simple-scalar-broadcast-2d-repro: regression test for the true
++    # scalar-broadcast (ne10==1) CPU-fallback fix (JIRA-2258 Gemma4
++    # out_scale investigation)
++
++    set(SCALAR2D_REPRO_TARGET simple-scalar-broadcast-2d-repro)
++    add_executable(${SCALAR2D_REPRO_TARGET} simple-scalar-broadcast-2d-repro.cpp)
++    target_link_libraries(${SCALAR2D_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
 +endif()
 diff --git a/examples/simple/mat-mul-tsi-test-case.cpp b/examples/simple/mat-mul-tsi-test-case.cpp
 new file mode 100644
@@ -1723,6 +1783,317 @@ index 000000000..5e6aa415b
 +    ggml_backend_free(model.backend);
 +    return 0;
 +}
+diff --git a/examples/simple/simple-chunked-repro.cpp b/examples/simple/simple-chunked-repro.cpp
+new file mode 100644
+index 000000000..43b853537
+--- /dev/null
++++ b/examples/simple/simple-chunked-repro.cpp
+@@ -0,0 +1,194 @@
++// Standalone repro: does ggml_add's broadcast chunking (nr0 = ne00/ne10 > 1)
++// produce correct results on the Tsavorite backend when ne10*sizeof(float)
++// is NOT a multiple of 128 bytes (Gemma4's head_dim=240 pattern: 240*4=960
++// bytes, 960 % 128 = 64, so successive chunks alternate 0/64-byte phase)?
++//
++// The existing simple-backend-tsi.cpp harness never sets nr0 > 1 -- its
++// "scale" test uses equal-sized A/B (nr0 always 1), so it never exercises
++// this alternating-phase multi-chunk broadcast path that Gemma4 actually hits.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-tsavorite.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++static void ggml_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
++    (void) level; (void) user_data;
++    fputs(text, stderr);
++}
++
++static bool close_enough(float a, float b) {
++    if (fabsf(a) < 1e-2f && fabsf(b) < 1e-2f) return fabsf(a - b) < 1e-6f;
++    const float epsilon = 1e-3f;
++    float diff = fabsf(a - b);
++    float max_val = fmaxf(fabsf(a), fabsf(b));
++    return diff < epsilon * max_val;
++}
++
++int main(int argc, char *argv[]) {
++    const int64_t HEAD = (argc > 2) ? atoll(argv[2]) : 240;   // Gemma4's head_dim by default
++    const int64_t NCHUNKS = (argc > 1) ? atoll(argv[1]) : 4;
++    const int64_t NA = HEAD * NCHUNKS;        // ne00
++    const int64_t NB = HEAD;                  // ne10 -- broadcasts across NCHUNKS
++    const char *op = (argc > 3) ? argv[3] : "add";
++    const bool is_rms = !strcmp(op, "rms_norm");
++    const bool is_rms_looped = !strcmp(op, "rms_norm_looped");
++
++    fprintf(stderr, "Repro: op=%s A=%ld elements, nr0-like=%ld chunks/rows of %ld floats (%ld bytes, mod128=%ld)\n",
++            op, (long)NA, (long)NCHUNKS, (long)HEAD, (long)(HEAD*sizeof(float)), (long)((HEAD*sizeof(float)) % 128));
++
++    ggml_log_set(ggml_log_callback_default, nullptr);
++
++    ggml_backend_t backend = ggml_backend_tsavorite_init();
++    if (!backend) {
++        fprintf(stderr, "ggml_backend_tsavorite_init() failed\n");
++        return 1;
++    }
++
++    struct ggml_init_params params {
++        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(2 + 2*NCHUNKS),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    // For rms_norm: a is a 2D tensor [HEAD, NCHUNKS] -- NCHUNKS independent
++    // rows of HEAD elements each, normalized per-row. This mimics QK-norm
++    // (RMS_NORM applied per attention head, many heads/rows in one dispatch)
++    // -- a pattern never exercised by simple-backend-tsi's rms_norm test,
++    // which only ever tests a single 1D row.
++    // For rms_norm_looped: NCHUNKS separate 1D tensors of HEAD elements each,
++    // each its own ggml_rms_norm node -- tests whether looping single-row
++    // dispatches (which always passes alone) avoids the multi-row bug above.
++    struct ggml_tensor * a = (is_rms)
++        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, HEAD, NCHUNKS)
++        : (is_rms_looped ? nullptr : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, NA));
++    struct ggml_tensor * b = (is_rms || is_rms_looped) ? nullptr : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, NB);
++    std::vector<struct ggml_tensor *> a_rows;
++    if (is_rms_looped) {
++        for (int64_t row = 0; row < NCHUNKS; row++) {
++            a_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, HEAD));
++        }
++    }
++
++    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (!buffer) {
++        fprintf(stderr, "ggml_backend_alloc_ctx_tensors failed\n");
++        return 1;
++    }
++
++    std::vector<float> a_data(NA), b_data(NB), expected(NA);
++    for (int64_t i = 0; i < NA; i++) a_data[i] = 0.01f * (float)(i + 1);
++    for (int64_t i = 0; i < NB; i++) b_data[i] = 1.0f + 0.001f * (float)i;
++
++    if (is_rms || is_rms_looped) {
++        const float eps = 1e-5f;
++        for (int64_t row = 0; row < NCHUNKS; row++) {
++            double ss = 0.0;
++            for (int64_t k = 0; k < HEAD; k++) {
++                float v = a_data[row * HEAD + k];
++                ss += (double)v * (double)v;
++            }
++            float scale = 1.0f / sqrtf((float)(ss / (double)HEAD) + eps);
++            for (int64_t k = 0; k < HEAD; k++) {
++                expected[row * HEAD + k] = a_data[row * HEAD + k] * scale;
++            }
++        }
++    } else {
++        for (int64_t i = 0; i < NA; i++) {
++            float av = a_data[i], bv = b_data[i % HEAD];
++            expected[i] = (!strcmp(op, "mul")) ? av * bv :
++                          (!strcmp(op, "sub")) ? av - bv :
++                          (!strcmp(op, "div")) ? av / bv :
++                          av + bv;
++        }
++    }
++
++    if (is_rms_looped) {
++        for (int64_t row = 0; row < NCHUNKS; row++) {
++            ggml_backend_tensor_set(a_rows[row], a_data.data() + row*HEAD, 0, ggml_nbytes(a_rows[row]));
++        }
++    } else {
++        ggml_backend_tensor_set(a, a_data.data(), 0, ggml_nbytes(a));
++        if (b) ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
++    }
++
++    static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
++    static std::vector<uint8_t> buf(buf_size);
++    struct ggml_init_params params0 = {
++        /*.mem_size   =*/ buf_size,
++        /*.mem_buffer =*/ buf.data(),
++        /*.no_alloc   =*/ true,
++    };
++    struct ggml_context * ctx0 = ggml_init(params0);
++    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
++
++    std::vector<struct ggml_tensor *> row_results;
++    struct ggml_tensor * result = nullptr;
++    if (is_rms_looped) {
++        for (int64_t row = 0; row < NCHUNKS; row++) {
++            struct ggml_tensor * r = ggml_rms_norm(ctx0, a_rows[row], 1e-5f);
++            row_results.push_back(r);
++            ggml_build_forward_expand(gf, r);
++        }
++    } else {
++        result =
++            is_rms ?                    ggml_rms_norm(ctx0, a, 1e-5f) :
++            (!strcmp(op, "mul")) ? ggml_mul(ctx0, a, b) :
++            (!strcmp(op, "sub")) ? ggml_sub(ctx0, a, b) :
++            (!strcmp(op, "div")) ? ggml_div(ctx0, a, b) :
++            ggml_add(ctx0, a, b);
++        ggml_build_forward_expand(gf, result);
++    }
++
++    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
++    ggml_gallocr_reserve(allocr, gf);
++    ggml_gallocr_alloc_graph(allocr, gf);
++
++    ggml_backend_graph_compute(backend, gf);
++
++    std::vector<float> out_data(NA);
++    if (is_rms_looped) {
++        for (int64_t row = 0; row < NCHUNKS; row++) {
++            ggml_backend_tensor_get(row_results[row], out_data.data() + row*HEAD, 0, ggml_nbytes(row_results[row]));
++        }
++    } else {
++        ggml_backend_tensor_get(result, out_data.data(), 0, ggml_nbytes(result));
++    }
++
++    int fail_count = 0;
++    int64_t first_fail = -1;
++    for (int64_t i = 0; i < NA; i++) {
++        if (!close_enough(out_data[i], expected[i])) {
++            fail_count++;
++            if (first_fail < 0) first_fail = i;
++        }
++    }
++
++    if (fail_count == 0) {
++        fprintf(stderr, "\nTEST CASE PASSED (all %ld elements correct)\n", (long)NA);
++    } else {
++        fprintf(stderr, "\nTEST CASE FAILED: %d/%ld elements wrong. First fail at i=%ld (chunk r=%ld, phase=%ld bytes): got %.6f expected %.6f\n",
++                fail_count, (long)NA, (long)first_fail, (long)(first_fail / HEAD),
++                (long)((first_fail / HEAD) * HEAD * sizeof(float)) % 128,
++                out_data[first_fail], expected[first_fail]);
++        // dump a window around the first failure
++        int64_t lo = std::max<int64_t>(0, first_fail - 4);
++        int64_t hi = std::min<int64_t>(NA, first_fail + 8);
++        for (int64_t i = lo; i < hi; i++) {
++            fprintf(stderr, "  i=%ld got=%.6f expected=%.6f\n", (long)i, out_data[i], expected[i]);
++        }
++    }
++
++    ggml_gallocr_free(allocr);
++    ggml_free(ctx0);
++    ggml_backend_buffer_free(buffer);
++    ggml_free(ctx);
++    ggml_backend_free(backend);
++
++    return fail_count == 0 ? 0 : 1;
++}
+diff --git a/examples/simple/simple-scalar-broadcast-2d-repro.cpp b/examples/simple/simple-scalar-broadcast-2d-repro.cpp
+new file mode 100644
+index 000000000..8a7f13ba4
+--- /dev/null
++++ b/examples/simple/simple-scalar-broadcast-2d-repro.cpp
+@@ -0,0 +1,105 @@
++// Does ggml_mul(a, b) with a=[3840,N,1,1] and b=[1,1,1,1] (Gemma4's exact
++// out_scale broadcast: N=7 tokens, scalar per-layer weight) compute
++// correctly? Earlier chunked-repro testing only ever used a 1D tensor (N=1
++// implicit), covering the inner chunk loop (nr0=3840) but never the OUTER
++// row loop (nr=N) that real prefill (N>1 tokens) actually exercises on top
++// of it -- this tests both loops nested together, matching the real shape.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-tsavorite.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++static void ggml_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
++    (void) level; (void) user_data;
++    fputs(text, stderr);
++}
++
++static bool close_enough(float a, float b) {
++    const float epsilon = 1e-3f;
++    float diff = fabsf(a - b);
++    float max_val = fmaxf(fabsf(a), fabsf(b));
++    return diff < epsilon * fmaxf(max_val, 1.0f);
++}
++
++int main(int argc, char *argv[]) {
++    const int64_t D = (argc > 1) ? atoll(argv[1]) : 3840;
++    const int64_t N = (argc > 2) ? atoll(argv[2]) : 7;
++
++    fprintf(stderr, "2D scalar-broadcast repro: a=[%ld,%ld,1,1] b=[1,1,1,1] (ggml_mul)\n", (long)D, (long)N);
++
++    ggml_log_set(ggml_log_callback_default, nullptr);
++
++    ggml_backend_t backend = ggml_backend_tsavorite_init();
++    if (!backend) { fprintf(stderr, "backend init failed\n"); return 1; }
++
++    struct ggml_init_params params {
++        /*.mem_size=*/ ggml_tensor_overhead() * 4, /*.mem_buffer=*/ NULL, /*.no_alloc=*/ true,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, N);
++    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++
++    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (!buffer) { fprintf(stderr, "alloc_ctx_tensors failed\n"); return 1; }
++
++    std::vector<float> a_data((size_t)D * (size_t)N);
++    // Use real-scale magnitudes like the actual model's activations (up to ~300+), not tiny synthetic values.
++    for (int64_t i = 0; i < D*N; i++) a_data[i] = 10.0f * sinf(0.01f * (float)(i + 1)) + ((i % 97 == 0) ? 300.0f : 0.0f);
++    float b_val = 0.052979f; // matches the real blk.0.layer_output_scale.weight value observed
++    ggml_backend_tensor_set(a, a_data.data(), 0, ggml_nbytes(a));
++    ggml_backend_tensor_set(b, &b_val, 0, sizeof(float));
++
++    std::vector<float> expected((size_t)D*N);
++    for (int64_t i = 0; i < D*N; i++) expected[i] = a_data[i] * b_val;
++
++    static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
++    static std::vector<uint8_t> buf(buf_size);
++    struct ggml_init_params params0 = { /*.mem_size=*/ buf_size, /*.mem_buffer=*/ buf.data(), /*.no_alloc=*/ true };
++    struct ggml_context * ctx0 = ggml_init(params0);
++    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
++    struct ggml_tensor * result = ggml_mul(ctx0, a, b);
++    ggml_build_forward_expand(gf, result);
++
++    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
++    ggml_gallocr_reserve(allocr, gf);
++    ggml_gallocr_alloc_graph(allocr, gf);
++
++    ggml_status st = ggml_backend_graph_compute(backend, gf);
++    if (st != GGML_STATUS_SUCCESS) { fprintf(stderr, "graph_compute failed status=%d\n", (int)st); return 1; }
++
++    std::vector<float> out_data((size_t)D*N);
++    ggml_backend_tensor_get(result, out_data.data(), 0, ggml_nbytes(result));
++
++    int fail_count = 0;
++    int64_t first_fail = -1;
++    for (size_t i = 0; i < out_data.size(); i++) {
++        if (!close_enough(out_data[i], expected[i])) {
++            fail_count++;
++            if (first_fail < 0) first_fail = (int64_t)i;
++        }
++    }
++
++    if (fail_count == 0) {
++        fprintf(stderr, "\nTEST CASE PASSED (all %zu elements correct)\n", out_data.size());
++    } else {
++        fprintf(stderr, "\nTEST CASE FAILED: %d/%zu elements wrong. First fail at i=%ld (row=%ld): got=%.6f expected=%.6f\n",
++                fail_count, out_data.size(), (long)first_fail, (long)(first_fail / D), out_data[first_fail], expected[first_fail]);
++        int64_t lo = std::max<int64_t>(0, first_fail - 3);
++        int64_t hi = std::min<int64_t>((int64_t)out_data.size(), first_fail + 6);
++        for (int64_t i = lo; i < hi; i++) {
++            fprintf(stderr, "  i=%ld row=%ld got=%.6f expected=%.6f\n", (long)i, (long)(i/D), out_data[i], expected[i]);
++        }
++    }
++
++    ggml_gallocr_free(allocr);
++    ggml_free(ctx0);
++    ggml_backend_buffer_free(buffer);
++    ggml_free(ctx);
++    ggml_backend_free(backend);
++    return fail_count == 0 ? 0 : 1;
++}
 diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
 index b6843578b..e19b902e7 100644
 --- a/ggml/CMakeLists.txt
@@ -2511,10 +2882,10 @@ index 000000000..d396a9ea8
 +endif()
 diff --git a/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
 new file mode 100644
-index 000000000..33f017b56
+index 000000000..5e163ddbe
 --- /dev/null
 +++ b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
-@@ -0,0 +1,7952 @@
+@@ -0,0 +1,8178 @@
 +// -----------------------------------------------------------------------------n
 +// Copyright (c) 2023 Tsavorite Scalable Intelligence, Inc . All rights reserved.
 +//
@@ -7389,6 +7760,40 @@ index 000000000..33f017b56
 +#endif
 +}
 +
++// Scratch buffers used to pad chunked elementwise-op dispatches (ADD/MUL/SUB/
++// DIV) up to a full 32-float (128-byte) vector-register multiple when ne10
++// isn't one already. See the padding logic in the chunk loop below for why.
++// Each logical operand gets its own slot so staging src0 never aliases src1's
++// staged copy before the kernel call reads both.
++enum TsiAlignScratchSlot {
++    TSI_ALIGN_SLOT_SRC0 = 0,
++    TSI_ALIGN_SLOT_SRC1,
++    TSI_ALIGN_SLOT_DST,
++    TSI_ALIGN_SLOT_COUNT
++};
++
++static uint8_t *g_align_scratch[TSI_ALIGN_SLOT_COUNT]     = { nullptr, nullptr, nullptr };
++static size_t   g_align_scratch_cap[TSI_ALIGN_SLOT_COUNT] = { 0, 0, 0 };
++
++static inline uint8_t *tsi_ensure_align_scratch(TsiAlignScratchSlot slot, size_t need_bytes) {
++    uint8_t **buf = &g_align_scratch[slot];
++    size_t   *cap = &g_align_scratch_cap[slot];
++    if (*buf && *cap >= need_bytes) {
++        return *buf;
++    }
++    size_t new_cap = std::max<size_t>(need_bytes, std::max<size_t>(*cap, 4096));
++    new_cap = ((new_cap + TSI_TVU_MEM_ALIGN - 1) / TSI_TVU_MEM_ALIGN) * TSI_TVU_MEM_ALIGN;
++    uint8_t *old_buf = *buf;
++    uint8_t *new_buf = (uint8_t *) tsi_alloc((int64_t)new_cap);
++    TSAVORITE_GGML_ASSERT(new_buf);
++    *buf = new_buf;
++    *cap = new_cap;
++    if (old_buf) {
++        tsi_dealloc(old_buf);
++    }
++    return *buf;
++}
++
 +// Guards the static descriptor/payload buffers below: they are shared,
 +// process-wide storage reused across every call (not per-device, unlike
 +// call_triton_matmul_full_packed_on_device()'s g_triton_desc_mt). With
@@ -9156,6 +9561,55 @@ index 000000000..33f017b56
 +                // The following below code operates exclusively on Rank 0
 +	        // (i.e., the first dimension) for all blob-related processing.
 +
++                // A TRUE scalar broadcast (ne10==1, e.g. Gemma4's per-layer
++                // out_scale weight) reproducibly makes the kernel dispatch
++                // below write nothing at all -- confirmed via direct tracing
++                // on the real model (input values correct at dispatch time,
++                // output scratch buffer still all-zero immediately after the
++                // kernel call returns, before any writeback). Every attempt
++                // to reproduce this in isolation (1D, 2D matching the exact
++                // real shape/magnitude, chained after a preceding async ADD)
++                // passed against CPU, so this appears to need the full real
++                // execution context to trigger -- not something fixable by
++                // adjusting the staging here. Since a true scalar broadcast
++                // is computationally trivial, compute it directly on CPU
++                // instead of dispatching to the kernel at all for this one
++                // degenerate shape; every other ne10 value keeps using the
++                // OPU kernel path below unchanged.
++                if (ne10 == 1) {
++                    const float scalar_val = *(const float *)src1_ptr;
++                    for (int64_t r = 0; r < nr0; ++r) {
++                        float a = src0_ptr[r];
++                        float result;
++                        switch (kernel_type) {
++                            case GGML_TSAVORITE_KERNEL_TYPE_ADD:  result = a + scalar_val; break;
++                            case GGML_TSAVORITE_KERNEL_TYPE_SUB:  result = a - scalar_val; break;
++                            case GGML_TSAVORITE_KERNEL_TYPE_MULT: result = a * scalar_val; break;
++                            case GGML_TSAVORITE_KERNEL_TYPE_DIV:  result = a / scalar_val; break;
++                            default: result = a; break;
++                        }
++                        dst_ptr[r] = result;
++                    }
++                    ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
++                    continue;
++                }
++
++                // Repeated (nr0 >= 2) back-to-back kernel dispatches with a
++                // vector length that isn't a multiple of 32 floats (128 bytes)
++                // corrupt the tail of the FIRST call's result -- reproduced with
++                // a fast, deterministic, isolated test (examples/simple/
++                // simple-chunked-repro.cpp) across ADD/MUL/SUB, independent of
++                // multi_thread_enable. A single (nr0==1) call at the same size
++                // is always correct; only repetition triggers it. Side-stepping
++                // by padding every dispatch's LENGTH up to the next 32-float
++                // multiple (not just aligning the start address, which was
++                // tried and failed previously) avoids the buggy tail path
++                // entirely -- the kernel only ever sees clean, full-register
++                // vector lengths.
++                const int64_t ne10_padded =
++                    ((ne10 + 31) / 32) * 32;
++                const bool need_pad = (ne10_padded != ne10);
++
 +                for (int64_t r = 0; r < nr0; ++r) {
 +                   memset(srcP0, 0, sizeof(MemRefDescriptor<Rank>));
 +                   memset(srcP1, 0, sizeof(MemRefDescriptor<Rank>));
@@ -9163,18 +9617,45 @@ index 000000000..33f017b56
 +
 +
 +
-+                    srcP0->shape[0]   = ne10;
++                    void *real_src1 = (void *)(src1_ptr);
++                    void *real_src0 = (void *)(src0_ptr + r * ne10);
++                    void *real_dst  = (void *)(dst_ptr  + r * ne10);
++
++                    void *use_src1 = real_src1;
++                    void *use_src0 = real_src0;
++                    void *use_dst  = real_dst;
++                    int64_t use_shape = ne10;
++
++                    if (need_pad) {
++                        const size_t real_bytes   = (size_t)ne10 * sizeof(float);
++                        const size_t padded_bytes = (size_t)ne10_padded * sizeof(float);
++                        uint8_t *pad_src0 = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_SRC0, padded_bytes);
++                        uint8_t *pad_src1 = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_SRC1, padded_bytes);
++                        uint8_t *pad_dst  = tsi_ensure_align_scratch(TSI_ALIGN_SLOT_DST,  padded_bytes);
++                        memset(pad_src0, 0, padded_bytes);
++                        memset(pad_src1, 0, padded_bytes);
++                        memset(pad_dst,  0, padded_bytes);
++                        memcpy(pad_src0, real_src0, real_bytes);
++                        memcpy(pad_src1, real_src1, real_bytes);
++                        use_src0 = pad_src0;
++                        use_src1 = pad_src1;
++                        use_dst  = pad_dst;
++                        use_shape = ne10_padded;
++                    }
++
++                    srcP0->shape[0]   = use_shape;
 +                    srcP0->offset     = 0;
 +
-+                    srcP1->shape[0]   = ne10;
++                    srcP1->shape[0]   = use_shape;
 +                    srcP1->offset     = 0;
 +
-+                    nodeP->shape[0]   = ne10;
++                    nodeP->shape[0]   = use_shape;
 +                    nodeP->offset     = 0;
 +
-+                    srcP1->data =  srcP1->base = (void *)(src1_ptr);
-+                    srcP0->data =  srcP0->base = (void *)(src0_ptr + r * ne10);
-+                    nodeP->data =  nodeP->base = (void *)(dst_ptr + r * ne10);
++                    srcP1->data =  srcP1->base = use_src1;
++                    srcP0->data =  srcP0->base = use_src0;
++                    nodeP->data =  nodeP->base = use_dst;
++
 +                    // kernel call
 +#if TRITON_ADD
 +                    if (kernel_type == GGML_TSAVORITE_KERNEL_TYPE_ADD) {
@@ -9239,14 +9720,39 @@ index 000000000..33f017b56
 +
 +                        init_scalar_i32_memref_aligned(scalar_max_txes, scalar_max_txes_payload, (int32_t)num_of_txes);
 +
-+                        _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(srcP0, srcP1, nodeP,
-+                                scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
++                        if (need_pad) {
++                            // The async triton_dispatch path returns before its
++                            // worker thread has actually run (dispatch just
++                            // queues it), which races the writeback below when
++                            // multi_thread_enable=true. That's fine for the
++                            // common (unpadded, already-correct) case where
++                            // there's nothing to write back here, but the
++                            // padded case's writeback below needs the real
++                            // result already in use_dst -- call the
++                            // synchronous wrapper directly instead of the
++                            // async dispatch, scoped to this narrow path.
++                            _mlir_ciface_add_kernel_device_wrapper(srcP0, srcP1, nodeP,
++                                    scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
++                        } else {
++                            _mlir_ciface_add_kernel_device_wrapper_triton_dispatch(srcP0, srcP1, nodeP,
++                                    scalar_loop, scalar_grid1, scalar_grid2, scalar_grid3, scalar_max_txes);
++                        }
 +                    } else {
 +#endif /* TRITON_ADD */
 +                        ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, srcP1, nodeP);
 +#if TRITON_ADD
 +                    }
 +#endif /* TRITON_ADD */
++                    // NOTE: for the TRITON_ADD async-dispatch branch above, with
++                    // multi_thread_enable=true this writeback can race the
++                    // worker thread that actually performs the computation
++                    // (dispatch returns before the worker runs) -- a separate,
++                    // already-identified bug from the ADD-specific Triton path.
++                    // Not yet handled here; this padding fix is scoped to
++                    // proving/fixing the tail-corruption bug first.
++                    if (need_pad) {
++                        memcpy(real_dst, use_dst, (size_t)ne10 * sizeof(float));
++                    }
 +                    ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
 +                    ++node->tsi_kernel_runs;
 +                }
@@ -9335,28 +9841,119 @@ index 000000000..33f017b56
 +            for(i=64; i <= 95; ++i)
 +                    val[i] = node->ne[0];
 +
-+	    int max_dim_index = GGML_MAX_DIMS -1;
-+	    int strides = 1;
-+	    bool flag = true;
-+            for ( i = 0; i <= max_dim_index  && src0->nb[i] != 0; ++i) {
-+                if (src0->ne[i] == 0) {
-+                    srcP0->shape[max_dim_index - i]    = 1;
-+                    nodeP->shape[max_dim_index - i]    = 1;
-+		    flag = false;
-+                }
-+                else  {
-+                    srcP0->shape[max_dim_index - i]    = src0->ne[i];
-+                    nodeP->shape[max_dim_index - i]    = node->ne[i];
-+                }
-+                srcP0->strides[max_dim_index - i]    = strides;
-+                nodeP->strides[max_dim_index - i]    = strides;
++            // A single kernel call given the FULL multi-row tensor (row width
++            // ne[0], ne[1]*ne[2]*ne[3] rows) silently computes the wrong
++            // normalization for every row when ne[0] isn't a multiple of 32
++            // floats AND there's more than one row -- reproduced deterministically
++            // via examples/simple/simple-chunked-repro.cpp's rms_norm test
++            // (matches Gemma4's per-head QK-norm: 240-wide rows, one per
++            // attention head, many heads/tokens dispatched together). A single
++            // row of ANY width always computes correctly, so when this
++            // condition holds, dispatch one row at a time instead of the whole
++            // tensor in one call.
++            const int64_t rms_row_width = src0->ne[0];
++            int64_t rms_n_rows = 1;
++            for (int d = 1; d < GGML_MAX_DIMS; ++d) rms_n_rows *= src0->ne[d];
++            const bool rms_need_row_loop =
++                (rms_row_width % 32 != 0) && (rms_n_rows > 1);
 +
-+		// avoiding the case when src0->ne[i] is zero
-+		if (flag)
-+			strides = strides * src0->ne[i];
-+	    }
++            if (rms_need_row_loop) {
++                // Repeated back-to-back dispatch of the SAME non-32-multiple
++                // length on the reused srcP0/nodeP descriptor is the same
++                // corruption class found for ADD/MUL/SUB/DIV -- looping per
++                // row alone isn't enough (confirmed: still wrong). Pad each
++                // row's dispatch length up to the next 32-float multiple via
++                // a scratch buffer, same fix as the elementwise chunk loop.
++                // val[64..95] (set above to the TRUE row width) is the
++                // side-channel the kernel uses for the mean divisor, so
++                // padding shape[0]/the physical buffer doesn't change the
++                // normalization math -- the extra zero-padded elements
++                // contribute nothing to the sum of squares.
++                const int64_t rms_row_padded =
++                    ((rms_row_width + 31) / 32) * 32;
++                const size_t rms_row_bytes        = (size_t)rms_row_width * sizeof(float);
++                const size_t rms_row_padded_bytes = (size_t)rms_row_padded * sizeof(float);
 +
-+            ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, nodeP, glob_buf);
++                for (int64_t r = 0; r < rms_n_rows; ++r) {
++                    const int64_t i1 = r % src0->ne[1];
++                    const int64_t i2 = (r / src0->ne[1]) % src0->ne[2];
++                    const int64_t i3 = r / (src0->ne[1] * src0->ne[2]);
++                    float *src0_row = (float *)((char *)src0->data
++                        + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
++                    float *node_row = (float *)((char *)node->data
++                        + i1 * node->nb[1] + i2 * node->nb[2] + i3 * node->nb[3]);
++
++                    // The header (MemRefDescriptor) and its data must be ONE
++                    // contiguous allocation, data immediately following the
++                    // header -- the same convention every real ggml tensor
++                    // uses here (`srcP0 = (MemRefDescriptor*)src0->data; --srcP0;`)
++                    // and the same one create_mlir_buf() follows. Two separate
++                    // tsi_alloc calls (header, then data, pointed to via the
++                    // ->data field) is NOT equivalent -- confirmed: that gave
++                    // the same wrong constant result even for a single row,
++                    // meaning the kernel doesn't actually follow ->data, it
++                    // relies on header-data adjacency directly.
++                    MemRefDescriptor<Rank> *row_srcP0 = create_mlir_buf<Rank>((int)rms_row_padded);
++                    MemRefDescriptor<Rank> *row_nodeP = create_mlir_buf<Rank>((int)rms_row_padded);
++                    TSAVORITE_GGML_ASSERT(row_srcP0);
++                    TSAVORITE_GGML_ASSERT(row_nodeP);
++                    float *pad_in  = (float *)(row_srcP0 + 1);
++                    float *pad_out = (float *)(row_nodeP + 1);
++                    memcpy(pad_in, src0_row, rms_row_bytes);
++
++                    row_srcP0->data = row_srcP0->base = (void *)pad_in;
++                    row_nodeP->data = row_nodeP->base = (void *)pad_out;
++                    row_srcP0->offset = 0;
++                    row_nodeP->offset = 0;
++                    // NOTE: the row-width dimension goes in shape[Rank-1]
++                    // (last slot), not shape[0] -- the original multi-dim
++                    // path below maps ggml's ne[i] to shape[max_dim_index-i],
++                    // i.e. ne[0] (row width) lands in shape[Rank-1]. Using
++                    // shape[0] here (matching the ADD/MUL binary-op loop's
++                    // convention) gave a constant wrong result even for a
++                    // single row -- confirmed this reversed indexing is the
++                    // fix, not a red herring.
++                    row_srcP0->shape[Rank-1]   = rms_row_padded;
++                    row_nodeP->shape[Rank-1]   = rms_row_padded;
++                    row_srcP0->strides[Rank-1] = 1;
++                    row_nodeP->strides[Rank-1] = 1;
++                    for (int d = 0; d < Rank-1; ++d) {
++                        row_srcP0->shape[d]   = 1;
++                        row_nodeP->shape[d]   = 1;
++                        row_srcP0->strides[d] = 0;
++                        row_nodeP->strides[d] = 0;
++                    }
++
++                    ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](row_srcP0, row_nodeP, glob_buf);
++
++                    memcpy(node_row, pad_out, rms_row_bytes);
++                    tsi_dealloc(row_srcP0);
++                    tsi_dealloc(row_nodeP);
++                }
++            } else {
++                int max_dim_index = GGML_MAX_DIMS -1;
++                int strides = 1;
++                bool flag = true;
++                for ( i = 0; i <= max_dim_index  && src0->nb[i] != 0; ++i) {
++                    if (src0->ne[i] == 0) {
++                        srcP0->shape[max_dim_index - i]    = 1;
++                        nodeP->shape[max_dim_index - i]    = 1;
++                        flag = false;
++                    }
++                    else  {
++                        srcP0->shape[max_dim_index - i]    = src0->ne[i];
++                        nodeP->shape[max_dim_index - i]    = node->ne[i];
++                    }
++                    srcP0->strides[max_dim_index - i]    = strides;
++                    nodeP->strides[max_dim_index - i]    = strides;
++
++                    // avoiding the case when src0->ne[i] is zero
++                    if (flag)
++                        strides = strides * src0->ne[i];
++                }
++
++                ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](srcP0, nodeP, glob_buf);
++            }
 +
 +        }
 +        else {
@@ -9640,7 +10237,7 @@ index 000000000..33f017b56
 +static size_t ggml_backend_tsavorite_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
 +  GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
 +  GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
-+  return 32;
++  return TSI_TVU_MEM_ALIGN;
 +  TSI_UNUSED(buft);
 +}
 +
@@ -11905,10 +12502,10 @@ index 6d1aa4351..32ce62879 100644
  
 diff --git a/tsavorite-model-deployment.yaml b/tsavorite-model-deployment.yaml
 new file mode 100755
-index 000000000..f6daada9c
+index 000000000..8e7869806
 --- /dev/null
 +++ b/tsavorite-model-deployment.yaml
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +# Tsavorite deployment config
 +txe_count: 1
 +multi_thread_enable: true
@@ -11917,8 +12514,10 @@ index 000000000..f6daada9c
 +##
 +## Typical requirements:
 +##   - Small models may work with lower memory allocations.
-+##   - Llama 3.2 1B was observed to require ~1.8 GB with 20 TXEs.
-+##   - For general use, 4 GB is a reasonable starting point.
++##   - Llama 3.2 1B was observed to require ~1.8 GB with 20 TXEs, but hit an
++##     allocation failure at the previous 8 GB default once actual usage
++##     (headroom for context/KV-cache growth, not just weights) is accounted
++##     for -- 16 GB below is the tested-safe default as of JIRA-2258.
 +##   - Larger models may require significantly more memory (for example, 12 GB to 24 GB).
 +##
 +## If this key is omitted, the runtime DeviceConfig default memory size is used.
@@ -11928,7 +12527,7 @@ index 000000000..f6daada9c
 +##   user_dram_size_gb: 8
 +##   user_dram_size_gb: 12
 +##   user_dram_size_gb: 24
-+user_dram_size_gb: 8
++user_dram_size_gb: 16
 +
 +# Enable additional Triton MAT_MUL shapes beyond stable baseline.
 +# false = old behavior

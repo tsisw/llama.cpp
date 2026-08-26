@@ -6687,8 +6687,11 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                 // is computationally trivial, compute it directly on CPU
                 // instead of dispatching to the kernel at all for this one
                 // degenerate shape; every other ne10 value keeps using the
-                // OPU kernel path below unchanged.
-                if (ne10 == 1) {
+                // OPU kernel path below unchanged. Scoped to F32: this reads/
+                // writes raw `float` pointers, which would misinterpret F16
+                // (2-byte) elements as 4-byte floats -- F16 keeps using the
+                // unmodified kernel path below instead.
+                if (ne10 == 1 && kernel_sub_type == DATA_TYPE_F32_INDEX) {
                     const float scalar_val = *(const float *)src1_ptr;
                     for (int64_t r = 0; r < nr0; ++r) {
                         float a = src0_ptr[r];
@@ -6718,9 +6721,14 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                 // tried and failed previously) avoids the buggy tail path
                 // entirely -- the kernel only ever sees clean, full-register
                 // vector lengths.
+                // Scoped to F32 for the same reason as the ne10==1 case above:
+                // the scratch buffers below are sized/copied in units of
+                // sizeof(float); F16 elements would be misread/miswritten as
+                // 4-byte floats. F16 falls through to the unmodified path.
                 const int64_t ne10_padded =
                     ((ne10 + 31) / 32) * 32;
-                const bool need_pad = (ne10_padded != ne10);
+                const bool need_pad =
+                    (ne10_padded != ne10) && (kernel_sub_type == DATA_TYPE_F32_INDEX);
 
                 for (int64_t r = 0; r < nr0; ++r) {
                    memset(srcP0, 0, sizeof(MemRefDescriptor<Rank>));
@@ -6855,14 +6863,18 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 #if TRITON_ADD
                     }
 #endif /* TRITON_ADD */
-                    // NOTE: for the TRITON_ADD async-dispatch branch above, with
-                    // multi_thread_enable=true this writeback can race the
-                    // worker thread that actually performs the computation
-                    // (dispatch returns before the worker runs) -- a separate,
-                    // already-identified bug from the ADD-specific Triton path.
-                    // Not yet handled here; this padding fix is scoped to
-                    // proving/fixing the tail-corruption bug first.
+                    // The ADD-specific TRITON_ADD async-dispatch branch above is
+                    // handled by routing its need_pad case through the
+                    // synchronous kernel wrapper (see above). For every other
+                    // path reaching here (MUL/SUB/DIV, and any kernel variant
+                    // whose "_host"/"_host_new" implementation dispatches
+                    // asynchronously under multi_thread_enable=true in ways not
+                    // visible from this file), join_all_workers() before the
+                    // writeback is a no-op when nothing is pending and a
+                    // correctness requirement when something is -- cheap
+                    // insurance against a race this file can't fully rule out.
                     if (need_pad) {
+                        join_all_workers();
                         memcpy(real_dst, use_dst, (size_t)ne10 * sizeof(float));
                     }
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
@@ -6966,8 +6978,12 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
             const int64_t rms_row_width = src0->ne[0];
             int64_t rms_n_rows = 1;
             for (int d = 1; d < GGML_MAX_DIMS; ++d) rms_n_rows *= src0->ne[d];
+            // Scoped to F32: the row-padding scratch buffers below are sized
+            // in units of sizeof(float); F16 rows would be misread/miswritten
+            // as 4-byte floats. F16 falls through to the unmodified path.
             const bool rms_need_row_loop =
-                (rms_row_width % 32 != 0) && (rms_n_rows > 1);
+                (rms_row_width % 32 != 0) && (rms_n_rows > 1) &&
+                (kernel_sub_type == DATA_TYPE_F32_INDEX);
 
             if (rms_need_row_loop) {
                 // Repeated back-to-back dispatch of the SAME non-32-multiple
@@ -7038,6 +7054,11 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
 
                     ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](row_srcP0, row_nodeP, glob_buf);
 
+                    // join_all_workers() before reading pad_out: a no-op when
+                    // nothing is pending, a correctness requirement if this
+                    // kernel variant ever dispatches asynchronously under
+                    // multi_thread_enable=true.
+                    join_all_workers();
                     memcpy(node_row, pad_out, rms_row_bytes);
                     tsi_dealloc(row_srcP0);
                     tsi_dealloc(row_nodeP);
@@ -7452,6 +7473,19 @@ static void ggml_backend_tsavorite_free(ggml_backend_t backend) {
 
   ggml_backend_tsavorite_device_rel(ctx_dev);
   ggml_tsavorite_free(ctx);
+
+  // The chunk-padding scratch buffers (g_align_scratch[]) are tsi_alloc'd
+  // against this runtime; once it's torn down here, those pointers are no
+  // longer valid even though they're still non-null. Without this, the next
+  // backend init in the same process would see a "large enough" cached
+  // capacity and reuse the stale pointer instead of reallocating.
+  for (int slot = 0; slot < TSI_ALIGN_SLOT_COUNT; ++slot) {
+      if (g_align_scratch[slot]) {
+          tsi_dealloc(g_align_scratch[slot]);
+          g_align_scratch[slot] = nullptr;
+      }
+      g_align_scratch_cap[slot] = 0;
+  }
 
   free(backend);
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);

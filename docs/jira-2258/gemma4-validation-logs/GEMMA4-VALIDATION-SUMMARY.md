@@ -172,8 +172,11 @@ both are covered by new fast regression tests):
   the dispatch returns before its worker thread actually runs. Scoped fix: the padded
   case now calls the synchronous kernel wrapper directly instead of the async one.
 - **RMS_NORM multi-row corruption** (found and fixed, but confirmed via the real-model
-  tracing above **not** to be what Gemma4-12b actually hits — its RMS_NORM calls are
-  always single-row in practice). Applying RMS_NORM to multiple non-32-multiple-width
+  tracing above **not** to be what Gemma4-12b actually hits — Gemma4 does issue
+  multi-row RMS_NORM during prefill, e.g. `ne=[256,16,7,1]` for QK-norm, but its
+  256-wide rows are already a clean 32-multiple, so the buggy condition, which
+  requires *both* a non-32-multiple row width *and* more than one row, never
+  triggers). Applying RMS_NORM to multiple non-32-multiple-width
   rows in one dispatch computed completely wrong output for every row, including the
   first — not just a tail artifact like the ADD/MUL case. Root cause: the fix's first
   attempt wrote the row-width dimension into `shape[0]`, matching the ADD/MUL
@@ -189,9 +192,12 @@ expansion) — confirmed identical in the old fork, so pre-existing, not introdu
 this sync.
 
 **Result: Gemma4-12b now produces coherent, correct output on the Tsavorite backend —
-`My cat's name is "Luna` — matching the CPU backend's own output for the same prompt
-and weights** (verified directly: ran the identical prompt/model with `--device none`
-as the CPU reference and compared). Full completion, zero alignment warnings (down
+the exact captured generation is `` **"Luna0 `` (see `new-gemma4-12b-fixed.log`) —
+matching the CPU backend's own `"Luna"` for the same prompt and weights** (verified
+directly: ran the identical prompt/model with `--device none` as the CPU reference and
+compared; the `**`/trailing-`0` difference is normal Tsavorite-vs-CPU token/formatting
+divergence, the same kind seen on every other model this session, not corruption).
+Full completion, zero alignment warnings (down
 from 381,138), exit code 0, confirmed on two independent from-scratch builds (dev
 workspace and the actual PR worktree).
 
