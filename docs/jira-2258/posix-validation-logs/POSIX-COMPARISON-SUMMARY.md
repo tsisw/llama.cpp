@@ -16,6 +16,31 @@ Both built with `SDK_VERSION=0.4.24 source tsi-pkg-build.sh build-posix`. Same c
 
 Full logs for each run are in this directory (`<tag>.log`, e.g. `new-tinyllama-5m.log`, `old-tinyllama-5m.log`) — click through to read the complete raw output.
 
+## Final re-verification, post all Gemma4 fixes (both cubic-dev-ai review batches, commit `50c227b17`)
+
+The comparison above predates this PR's Gemma4 investigation (see
+[GEMMA4-VALIDATION-SUMMARY.md](../gemma4-validation-logs/GEMMA4-VALIDATION-SUMMARY.md))
+and the three real bugs found and fixed along the way. To confirm those fixes don't
+regress the models already validated above, plus the two K-quant control models used
+during the Gemma4 investigation, all six were re-run against the final build
+(`final-<tag>.log` in this directory):
+
+| Model | Result |
+|---|---|
+| tinyllama-vo-5m-para.gguf | ✅ exit 0, 0 warnings |
+| Gemma3-270M-F32.gguf | ✅ exit 0, 0 warnings |
+| Tiny-Llama-v0.3-FP32-1.1B-F32.gguf | ✅ exit 0, 0 warnings |
+| Llama3.2:1B-1.2B-F32.gguf | ✅ exit 0, 0 warnings |
+| qwen2-0_5b-instruct-q5_k_m.gguf (Q5_K_M) | ✅ exit 0, 0 warnings |
+| Qwen2.5-0.5B-Q4_K_M.gguf (Q4_K_M, same quant type as Gemma4-12b) | ✅ exit 0, 0 warnings |
+
+Expected result, not a coincidence: every fix in this PR is scoped to non-32-float-multiple
+chunk/row widths (`kernel_sub_type == DATA_TYPE_F32_INDEX` paths only reached when a
+dispatch width isn't a clean 32-float multiple). None of these six models' tensor shapes
+hit that condition, so byte-for-byte identical behavior here is exactly what should
+happen if the fixes are correctly scoped. Gemma4-12b is the one model in this PR's test
+set that does hit it — see the Gemma4 doc linked above for that result.
+
 ## Reading the results
 
 - All 4 models produce **byte-identical generated text** on old vs new, across four different model sizes/architectures (a tiny synthetic model, Gemma3, TinyLlama-1.1B, and Llama3.2-1B), confirming the sync didn't change functional behavior.

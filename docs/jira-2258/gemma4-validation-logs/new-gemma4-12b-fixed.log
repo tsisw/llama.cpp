@@ -1,40 +1,40 @@
-=== gemma4-12b-FIXED: full completion, all 4 fixes applied (get_alignment, chunked-op padding, RMS_NORM row-loop, true-scalar-broadcast CPU fallback) ===
+=== gemma4-12b-FIXED: final verification, post all fixes including 2nd cubic-dev-ai review batch (commit 50c227b17) ===
 
  TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=16 user_dram_size_bytes=17179869184 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
 My cat's name is **"Luna0
 
 
-llama_perf_context_print:        load time = 1478210.15 ms
-llama_perf_context_print: prompt eval time = 1478209.95 ms /     7 tokens (211172.85 ms per token,     0.00 tokens per second)
-llama_perf_context_print:        eval time =    9526.52 ms /     3 runs   ( 3175.51 ms per token,     0.31 tokens per second)
-llama_perf_context_print:       total time = 1487761.86 ms /    10 tokens
+llama_perf_context_print:        load time = 1375381.94 ms
+llama_perf_context_print: prompt eval time = 1375381.74 ms /     7 tokens (196483.11 ms per token,     0.01 tokens per second)
+llama_perf_context_print:        eval time =    9869.76 ms /     3 runs   ( 3289.92 ms per token,     0.30 tokens per second)
+llama_perf_context_print:       total time = 1385257.14 ms /    10 tokens
 
 === GGML Perf Summary ===
   Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
-  ADD              OPU          384             960            629048           1638.15
-  MUL              OPU         1348           12890          13994055          10381.35
-  RMS_NORM         CPU          192               0               474              2.47
-  RMS_NORM         OPU         1156            1156           3459075           2992.28
-  MUL_MAT          CPU         1556               0           1209198            777.12
-  MUL_MAT          OPU          144             144        1464237761       10168317.78
-  SCALE            CPU           12               0              3171            264.25
-  CONT             OPU          384               0            459567           1196.79
-  VIEW             OPU          768               0               224              0.29
-  PERMUTE          OPU          576               0               103              0.18
-  TRANSPOSE        OPU          192               0                53              0.28
-  GET_ROWS         OPU            8               0              5170            646.25
-  SET_ROWS         OPU          384               0               923              2.40
-  SOFT_MAX         OPU          192               0              6897             35.92
-  ROPE             CPU          384               0              3626              9.44
-  UNARY            CPU            4               0             48404          12101.00
-    -> TANH        CPU            4               0             48404          12101.00
-  GLU              CPU          192               0             34743            180.95
+  ADD              OPU          384             960            310125            807.62
+  MUL              OPU         1348           12890          12646631           9381.77
+  RMS_NORM         CPU          192               0               467              2.43
+  RMS_NORM         OPU         1156            1156           3449587           2984.07
+  MUL_MAT          CPU         1556               0           1261047            810.44
+  MUL_MAT          OPU          144             144        1363672568        9469948.39
+  SCALE            CPU           12               0               442             36.83
+  CONT             OPU          384               0            508371           1323.88
+  VIEW             OPU          768               0               255              0.33
+  PERMUTE          OPU          576               0               142              0.25
+  TRANSPOSE        OPU          192               0                37              0.19
+  GET_ROWS         OPU            8               0               113             14.12
+  SET_ROWS         OPU          384               0               907              2.36
+  SOFT_MAX         OPU          192               0              5809             30.26
+  ROPE             CPU          384               0              2325              6.05
+  UNARY            CPU            4               0             19443           4860.75
+    -> TANH        CPU            4               0             19443           4860.75
+  GLU              CPU          192               0             34274            178.51
 
 OPU Profiling Results:
 Profiler disabled
 
 
-real	25m21.126s
-user	33m4.822s
-sys	13m26.205s
+real	23m56.239s
+user	33m7.389s
+sys	13m19.453s
 EXIT_CODE=0
