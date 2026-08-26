@@ -14,7 +14,7 @@ Both built with `SDK_VERSION=0.4.24 source tsi-pkg-build.sh build-posix`. Same c
 | Tiny-Llama-v0.3-FP32-1.1B-F32.gguf | `My cat's name is Luna. She` | `My cat's name is Luna. She` | 3m0.9s | 3m10.5s | ✅ identical |
 | Llama3.2:1B-1.2B-F32.gguf | `My cat's name is "Bella` | `My cat's name is "Bella` | 9m50.8s | see log | ✅ identical |
 
-Full logs for each run are in this directory (`<tag>.log`, e.g. `new-tinyllama-5m.log`, `old-tinyllama-5m.log`) — click through to read the complete raw output.
+Full raw logs for each run are attached to PR #162's description rather than committed here (they're evidence for review, not permanent reference material) — see the PR for the complete raw output.
 
 ## Final re-verification, post all Gemma4 fixes (both cubic-dev-ai review batches, commit `50c227b17`)
 
@@ -23,7 +23,7 @@ The comparison above predates this PR's Gemma4 investigation (see
 and the three real bugs found and fixed along the way. To confirm those fixes don't
 regress the models already validated above, plus the two K-quant control models used
 during the Gemma4 investigation, all six were re-run against the final build
-(`final-<tag>.log` in this directory):
+(raw logs attached to PR #162's description):
 
 | Model | Result |
 |---|---|

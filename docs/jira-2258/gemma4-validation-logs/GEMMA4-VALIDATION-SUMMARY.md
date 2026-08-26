@@ -1,5 +1,10 @@
 # Gemma 4 validation — JIRA-2258
 
+Every `*.log` file named below (`old-gemma4-e2b.log`, `new-gemma4-12b-fixed.log`, etc.)
+is attached to PR #162's description, not committed to this directory — they're
+evidence for review, not permanent reference material. This doc quotes the relevant
+excerpts inline; the full raw logs are in the PR.
+
 Stated motivation for this sync (per the reporter): Gemma 4 doesn't work on the old
 fork but should work on the synced tree. Tested two tags from `ollama.com/library/gemma4`
 against both the old and new posix binaries.

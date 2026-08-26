@@ -1,5 +1,9 @@
 # tsisim validation — JIRA-2258
 
+Every `*.log` file named below is attached to PR #162's description, not committed to
+this directory — they're evidence for review, not permanent reference material. This
+doc quotes the relevant excerpts inline; the full raw logs are in the PR.
+
 Real TSI simulator (tsisim) runs of this sync's package (`tsi-ggml-0.4.24.tz`), via the
 production harness `run_llama_cli.sh`. Unlike the posix comparison, these are **not yet**
 a side-by-side old-vs-new capture — the reporter (akapoor) ran these against the new
@@ -10,11 +14,11 @@ this file will be updated with a full comparison table once those land.
 
 | Model | Result | txe_count (auto-detected) | user_dram_size_gb | Notes |
 |---|---|---|---|---|
-| Tiny-Llama-v0.3-FP32-1.1B-F32.gguf (run 1) | ✅ completes, generates `is Luna.` | 4 | 8 | see [new-tinyllama-1.1b-tsisim.log](new-tinyllama-1.1b-tsisim.log) |
-| Tiny-Llama-v0.3-FP32-1.1B-F32.gguf (run 2) | ✅ completes, generates `is Luna.` | 4 | 16 | see [new-tinyllama-1.1b-tsisim-run2.log](new-tinyllama-1.1b-tsisim-run2.log) |
-| tinyllama-vo-5m-para.gguf | ✅ completes, generates `was Tim. He loved` | 4 | 16 | see [new-tinyllama-5m-tsisim.log](new-tinyllama-5m-tsisim.log) |
-| Gemma3-270M-F32.gguf | ✅ completes, generates `is "cat" and` | 4 | 16 | see [new-gemma3-270m-tsisim.log](new-gemma3-270m-tsisim.log) |
-| Llama3.2:1B-1.2B-F32.gguf | ✅ completes, generates `is molly and she` | 4 | 16 | see [new-llama3.2-1b-tsisim.log](new-llama3.2-1b-tsisim.log) |
+| Tiny-Llama-v0.3-FP32-1.1B-F32.gguf (run 1) | ✅ completes, generates `is Luna.` | 4 | 8 | see `new-tinyllama-1.1b-tsisim.log` |
+| Tiny-Llama-v0.3-FP32-1.1B-F32.gguf (run 2) | ✅ completes, generates `is Luna.` | 4 | 16 | see `new-tinyllama-1.1b-tsisim-run2.log` |
+| tinyllama-vo-5m-para.gguf | ✅ completes, generates `was Tim. He loved` | 4 | 16 | see `new-tinyllama-5m-tsisim.log` |
+| Gemma3-270M-F32.gguf | ✅ completes, generates `is "cat" and` | 4 | 16 | see `new-gemma3-270m-tsisim.log` |
+| Llama3.2:1B-1.2B-F32.gguf | ✅ completes, generates `is molly and she` | 4 | 16 | see `new-llama3.2-1b-tsisim.log` |
 
 Both runs show real OPU dispatch (`MUL_MAT`, `ADD`, `MUL`, `RMS_NORM`, `GLU`, etc. hitting
 `OPU` in the `=== GGML Perf Summary ===` table, with `MUL_MAT` correctly split between a
@@ -51,7 +55,7 @@ direct hardware confirmation of the fix, not just posix.
 ## Update 2026-08-26: Gemma4-12b tested on real tsisim hardware, plus full reconfirmation
 
 Full raw session log:
-[new-tsisim-full-session-2026-08-26.log](new-tsisim-full-session-2026-08-26.log).
+`new-tsisim-full-session-2026-08-26.log`.
 Package built from this PR's final commit (`c56d67765`, both cubic-dev-ai review
 batches addressed).
 
