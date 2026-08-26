@@ -43,3 +43,8 @@ TXE::align_address(): Warning: Unaligned memory access 0x7f2468f8ae30 not 128-by
 TXE::align_address(): Warning: Unaligned memory access 0x7f2468f8ae30 not 128-byte aligned, aligning to 0x7f2468f8ae00
 
 [Process killed by tester (pkill) after ~10 minutes without completing 4-token generation -- open-ended runtime risk given the warning-print volume above, not a hang/crash. See PR description for analysis.]
+
+[BEFORE state, kept for comparison. This is the ORIGINAL unfixed run, before any of
+the fixes in this PR. See new-gemma4-12b-fixed.log for the AFTER state: same model,
+same prompt, all fixes applied -- completes in ~25 minutes, zero alignment warnings,
+coherent output.]

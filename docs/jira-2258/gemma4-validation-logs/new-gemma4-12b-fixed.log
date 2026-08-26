@@ -1,45 +1,40 @@
-=== new-gemma4-12b-FIXED ===
+=== gemma4-12b-FIXED: full completion, all 4 fixes applied (get_alignment, chunked-op padding, RMS_NORM row-loop, true-scalar-broadcast CPU fallback) ===
 
- TSI deploy yaml=/proj/work/akapoor/tmp/claude-100041/gemma4-test-config/tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=24 user_dram_size_bytes=25769803776 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
-My cat's name isTXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800104 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800104 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800108 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800108 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc80010c not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc80010c not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800110 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800110 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800114 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800114 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800118 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800118 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc80011c not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc80011c not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800120 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800120 not 128-byte aligned, aligning to 0x7fd3dc800100
-TXE::align_address(): Warning: Unaligned memory access 0x7fd3dc800124 not 128-byte aligned, aligning to 0x7fd3dc800100
+ TSI deploy yaml=tsavorite-model-deployment.yaml txe_count=1 multi_thread_enable=1 user_dram_size_gb=16 user_dram_size_bytes=17179869184 advanced_matmul_shape_offload=0 advanced_matmul_broadcast_offload=0 triton_matmul_small_n_transpose_opt=0
+My cat's name is **"Luna0
 
-... [warning lines omitted -- confirms the get_alignment() fix alone did not resolve Gemma4-12b's issue; full raw log was 69MB, not practical to check in] ...
 
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf96598 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf96598 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf9659c not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf9659c not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a0 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a0 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a4 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a4 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a8 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965a8 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965ac not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965ac not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b0 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b0 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b4 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b4 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b8 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965b8 not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965bc not 128-byte aligned, aligning to 0x7fd55cf96580
-TXE::align_address(): Warning: Unaligned memory access 0x7fd55cf965bc not 128-byte aligned, aligning to 0x7fd55cf96580
+llama_perf_context_print:        load time = 1478210.15 ms
+llama_perf_context_print: prompt eval time = 1478209.95 ms /     7 tokens (211172.85 ms per token,     0.00 tokens per second)
+llama_perf_context_print:        eval time =    9526.52 ms /     3 runs   ( 3175.51 ms per token,     0.31 tokens per second)
+llama_perf_context_print:       total time = 1487761.86 ms /    10 tokens
 
-[Process timed out and was killed after 10 minutes, same as the pre-fix run -- confirms the alignment fix in this commit did not resolve Gemma4-12b's issue on its own. See GEMMA4-VALIDATION-SUMMARY.md for the actual root cause (head_dim=240 not a multiple of 128).]
+=== GGML Perf Summary ===
+  Op               Target      Runs  TSI_KERNEL-RUN          Total us            Avg us
+  ADD              OPU          384             960            629048           1638.15
+  MUL              OPU         1348           12890          13994055          10381.35
+  RMS_NORM         CPU          192               0               474              2.47
+  RMS_NORM         OPU         1156            1156           3459075           2992.28
+  MUL_MAT          CPU         1556               0           1209198            777.12
+  MUL_MAT          OPU          144             144        1464237761       10168317.78
+  SCALE            CPU           12               0              3171            264.25
+  CONT             OPU          384               0            459567           1196.79
+  VIEW             OPU          768               0               224              0.29
+  PERMUTE          OPU          576               0               103              0.18
+  TRANSPOSE        OPU          192               0                53              0.28
+  GET_ROWS         OPU            8               0              5170            646.25
+  SET_ROWS         OPU          384               0               923              2.40
+  SOFT_MAX         OPU          192               0              6897             35.92
+  ROPE             CPU          384               0              3626              9.44
+  UNARY            CPU            4               0             48404          12101.00
+    -> TANH        CPU            4               0             48404          12101.00
+  GLU              CPU          192               0             34743            180.95
+
+OPU Profiling Results:
+Profiler disabled
+
+
+real	25m21.126s
+user	33m4.822s
+sys	13m26.205s
+EXIT_CODE=0

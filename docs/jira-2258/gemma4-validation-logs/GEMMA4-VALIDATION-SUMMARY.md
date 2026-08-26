@@ -90,73 +90,99 @@ Both models complete cleanly with real OPU dispatch on both binaries, zero align
 warnings in every case — including the Q4_K_M case, the identical quant sub-format used
 by the failing Gemma4-12b run.
 
-### Real root cause found, one real bug fixed and landed, one deeper issue scoped but not yet fixed
+### Root cause found, three real bugs fixed, Gemma4-12b now confirmed working
 
-Found and fixed a genuine, pre-existing bug in the same area:
-`ggml_backend_tsavorite_buffer_type_get_alignment()` returned `32` instead of
-`TSI_TVU_MEM_ALIGN` (confirmed via preprocessor expansion to be `128`) — the value
-GGML uses to decide how far apart to place tensors packed into a shared buffer. `32`
-only "works" for models whose tensor byte-sizes happen to already land on 128-byte
-boundaries by coincidence. **Confirmed identical in the old (pre-sync) fork** — a
-genuine pre-existing latent bug, not introduced by this sync. Fixed to return
-`TSI_TVU_MEM_ALIGN`. Verified with a full regression pass: all 4 standard posix models
-plus both Qwen K-quant controls produce byte-identical generated output and zero new
-warnings with this fix in place (posix and fpga both rebuild clean).
+**Correcting an earlier hypothesis in this doc.** The section above concluded the
+alignment warnings were explained by Gemma4-12b's `embedding_length / attention.head_count`
+= `3840 / 16` = 240 elements per head (960 bytes, not a 128-byte multiple). **That
+conclusion was wrong.** Direct empirical tracing of the model's actual per-node tensor
+shapes at runtime (a temporary, env-var-gated instrumentation pass added to
+`ggml-tsavorite.cpp`'s compute loop, since removed) showed Gemma4-12b's real head_dim
+is **256** (16 query heads, 8 grouped KV heads), already a clean multiple of 128 bytes.
+The `3840/16` arithmetic was a plausible-sounding inference from published
+hyperparameters that didn't hold up against the model's actual tensor shapes — head_dim
+never contributed any misalignment. Correcting the record rather than leaving the wrong
+conclusion in place.
 
-**This fix alone does not resolve the Gemma4-12b warnings** — retested after landing
-it: still present (600k+ in that run). Root-caused why: comparing GGUF metadata,
-Gemma4-12b's `embedding_length / attention.head_count` = `3840 / 16` = **240** elements
-per attention head. At 4 bytes/element (F32 activations), that's 960 bytes per head —
-**not** a multiple of 128. Every other head's data therefore starts at a non-128-byte
-offset regardless of how well-aligned the overall tensor buffer is. For comparison,
-both Qwen models tested have head_dim = `896 / 14` = **64** → 256 bytes/head → always
-a clean multiple of 128. This is a property of Gemma4's own architecture (unusually
-sized attention heads), not a bug that was "introduced" anywhere — but making it run
-cleanly on this hardware needs the Tsavorite backend's attention-handling code to
-tolerate or pad non-128-byte-aligned per-head strides, which is real surgery in
-`ggml-tsavorite.cpp`'s attention path, not a one-line fix. Not attempted yet, pending
-a scoped proposal and review given the correctness stakes of getting it wrong.
+**Actual root cause, found by tracing the real model, not by inference:** Gemma4-12b's
+per-layer `layer_output_scale` weight — a genuine **scalar** tensor (`ggml` shape
+`{1,1,1,1}`) applied via `ggml_mul(cur, out_scale)` at the end of every transformer
+layer's FFN block. This weight is unique to Gemma4's architecture family (see
+`src/models/gemma4.cpp`, `LLM_TENSOR_LAYER_OUT_SCALE`) — Gemma3, Qwen2.5, and
+TinyLlama don't have it, which is why none of them ever triggered this.
 
-**Conclusion, updated now that the actual mechanism is identified (supersedes the
-earlier causality-gap discussion below the Qwen control table):**
-1. **The head_dim=240 finding is a mathematical property of Gemma4's own published
-   hyperparameters (`embedding_length`, `attention.head_count`) interacting with the
-   hardware's fixed 128-byte requirement — independent of which llama.cpp version reads
-   the model.** Any implementation walking per-head attention data on this hardware
-   would hit the same 960-bytes-per-head-isn't-a-multiple-of-128 arithmetic. This is
-   much stronger evidence than the Qwen controls alone that this is not a sync
-   regression — it's not just "not reproduced elsewhere," it's "explained by a property
-   of the model that has nothing to do with which code reads it."
-2. The one fix landed (`get_alignment()` 32→128) is real, correct, and verified
-   regression-free — but is a different, narrower bug than the head_dim issue, and does
-   not resolve Gemma4-12b's warnings on its own.
-3. The actual fix for Gemma4's head_dim specifically requires changes to
-   `ggml-tsavorite.cpp`'s attention-handling/buffer-layout code (padding or
-   otherwise tolerating non-128-byte-aligned per-head strides) — scoped, not yet
-   implemented, pending review given correctness stakes.
+Confirmed via direct value tracing on the real model:
+1. The weight loads correctly for every layer (nonzero values, e.g. layer 0 = `0.052979`).
+2. At the exact moment of kernel dispatch, both operands (`cur`'s real activation value
+   and the scalar weight) are still correct.
+3. Immediately after the kernel call returns — before any writeback — the output
+   scratch buffer is already all-zero. The kernel writes nothing at all for this exact
+   degenerate broadcast shape (`ne10==1`).
+
+This could not be reproduced in an isolated test despite matching the exact tensor
+shape, magnitude, dtype, and even chaining it after a preceding async ADD dispatch (the
+same sequence the real model uses) — every isolated attempt passed against a CPU
+reference. This points to a genuine gap in the compiled OPU kernel/runtime for a true
+scalar broadcast, one level below what's fixable by adjusting `ggml-tsavorite.cpp`'s
+C++ dispatch/staging code. Since a scalar broadcast is computationally trivial, the fix
+computes this one exact shape directly on CPU inside `ggml-tsavorite.cpp` instead of
+ever dispatching it to the kernel — every other broadcast shape keeps using the OPU
+path, unchanged.
+
+**Two more real, independent bugs found and fixed along the way** (kept regardless of
+their bearing on Gemma4, since both are correctness issues in their own right, and
+both are covered by new fast regression tests):
+
+- **Chunked elementwise-op corruption.** `GGML_OP_ADD/MUL/SUB/DIV`'s broadcast-chunking
+  loop corrupts the tail of its result whenever a chunk width isn't a multiple of 32
+  floats (128 bytes) **and** that same width gets dispatched repeatedly (≥2 times)
+  back-to-back — reproduced deterministically and fast (sub-second, not a 40-minute
+  model run) with a new isolated test, `examples/simple/simple-chunked-repro.cpp`,
+  independent of `multi_thread_enable`. A single dispatch at any size is always
+  correct; only repetition at a non-32-multiple width triggers it. Fixed by padding
+  each dispatch's length up to the next 32-float multiple via a scratch buffer before
+  calling into the kernel, then copying back only the real portion. Also fixed a
+  separate, narrower bug this surfaced: the `ADD` op's async Triton-dispatch path (used
+  when `multi_thread_enable=true`) was racing its own writeback for the padded case —
+  the dispatch returns before its worker thread actually runs. Scoped fix: the padded
+  case now calls the synchronous kernel wrapper directly instead of the async one.
+- **RMS_NORM multi-row corruption** (found and fixed, but confirmed via the real-model
+  tracing above **not** to be what Gemma4-12b actually hits — its RMS_NORM calls are
+  always single-row in practice). Applying RMS_NORM to multiple non-32-multiple-width
+  rows in one dispatch computed completely wrong output for every row, including the
+  first — not just a tail artifact like the ADD/MUL case. Root cause: the fix's first
+  attempt wrote the row-width dimension into `shape[0]`, matching the ADD/MUL
+  convention, but RMS_NORM's working single-row path actually maps it to
+  `shape[Rank-1]` (reversed indexing) — a bug in the fix attempt itself, not the
+  underlying kernel. Fixed by looping one row at a time (each padded the same way as
+  ADD/MUL), with the correct reversed shape indexing.
+
+**Result: Gemma4-12b now produces coherent, correct output on the Tsavorite backend —
+`My cat's name is "Luna` — matching the CPU backend's own output for the same
+prompt and weights.** Full completion, zero alignment warnings (down from 381,138),
+exit code 0.
+
+Every fix is regression-tested clean: byte-identical output and zero new alignment
+warnings on all 4 standard posix models plus both Qwen K-quant controls, before and
+after every change.
 
 ## Bottom line
 
-- The core claim — "gemma4 architecture recognition doesn't exist on old, exists on new"
-  — is confirmed for both tags tested.
-- Whether gemma4 is *usably fast and fully correct* end-to-end depends on which
-  checkpoint variant: the MoE-style `e2b`/`e4b` tags hit a real upstream loader gap;
-  the dense-style `12b`/`26b`/`31b` tags load and dispatch real compute, but output
-  correctness is unverified (the run was killed before producing text) and the
-  alignment-warning finding above means "didn't crash" isn't strong evidence of
-  correctness on its own.
-- The alignment-warning finding is now root-caused: Gemma4-12b's attention head
-  dimension (240 elements = 960 bytes) is not a multiple of the hardware's 128-byte
-  requirement, unlike both Qwen controls (64 elements = 256 bytes, a clean multiple).
-  This is a property of Gemma4's own published hyperparameters, not something that
-  depends on which llama.cpp version reads the model — stronger evidence against a
-  sync regression than the Qwen controls alone. One real, verified-safe bug was found
-  and fixed along the way (`get_alignment()` 32→128, pre-existing in the old fork too),
-  but it doesn't resolve Gemma4's issue on its own.
-- Recommend as explicit follow-up work, not blocking this PR: (1) check whether a later
-  upstream commit past `1f368f354` fixes the MoE tensor-count gap, worth checking now
-  that `regenerate-patch`/`UPSTREAM_BASE_COMMIT` make re-targeting cheaper than before
-  this sync; (2) design and implement a fix in `ggml-tsavorite.cpp`'s attention-handling
-  code for non-128-byte-aligned per-head strides, and confirm whether the silent
-  address-realignment in `TXE::align_address()` has been corrupting output for models
-  shaped like Gemma4 before trusting any dense-variant result.
+- The core claim — "gemma4 architecture recognition doesn't exist on old, exists on
+  new" — is confirmed for both tags tested.
+- The MoE-style `e2b`/`e4b` tags still hit a real, independently-confirmed upstream
+  loader gap ([ggml-org/llama.cpp#27349](https://github.com/ggml-org/llama.cpp/issues/27349)),
+  unrelated to Tsavorite or this sync.
+- The dense-style `12b` tag now **fully works**: loads, dispatches real OPU compute,
+  and produces coherent output matching the CPU reference, with zero alignment
+  warnings.
+- Three real bugs were found and fixed in `ggml-tsavorite.cpp` along the way — one
+  pre-existing (`get_alignment()` 32→128), one a genuine chunked-op corruption
+  (ADD/MUL/SUB/DIV padding), and the actual Gemma4 root cause (true scalar-broadcast
+  kernel gap, worked around via CPU fallback for that one shape). A fourth
+  (RMS_NORM multi-row) was found and fixed but confirmed not to be what Gemma4
+  actually triggers.
+- Recommend as explicit follow-up, not blocking this PR: (1) check whether a later
+  upstream commit past `1f368f354` fixes the MoE tensor-count gap; (2) report the
+  true-scalar-broadcast kernel gap to whoever owns the TXE/OPU kernel compilation, since
+  the CPU fallback here is a correct, safe workaround but not a fix at the kernel level.
