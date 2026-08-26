@@ -34,12 +34,22 @@ during the Gemma4 investigation, all six were re-run against the final build
 | qwen2-0_5b-instruct-q5_k_m.gguf (Q5_K_M) | ✅ exit 0, 0 warnings |
 | Qwen2.5-0.5B-Q4_K_M.gguf (Q4_K_M, same quant type as Gemma4-12b) | ✅ exit 0, 0 warnings |
 
-Expected result, not a coincidence: every fix in this PR is scoped to non-32-float-multiple
-chunk/row widths (`kernel_sub_type == DATA_TYPE_F32_INDEX` paths only reached when a
-dispatch width isn't a clean 32-float multiple). None of these six models' tensor shapes
-hit that condition, so byte-for-byte identical behavior here is exactly what should
-happen if the fixes are correctly scoped. Gemma4-12b is the one model in this PR's test
-set that does hit it — see the Gemma4 doc linked above for that result.
+What these six runs actually validate, precisely: `DATA_TYPE_F32_INDEX` is assigned to
+every all-F32 dispatch regardless of width — it is not itself a signal that a
+non-32-float-multiple width was hit. Two independent things are true here:
+
+- The `get_alignment()` fix (32 → 128 bytes) applies to every Tsavorite buffer
+  allocation unconditionally, so these six zero-warning runs directly validate that
+  fix across a range of model sizes/architectures.
+- The three width-dependent fixes (chunked elementwise-op padding, RMS_NORM row-loop,
+  scalar-broadcast CPU fallback) only activate when a dispatch is **both** F32 **and**
+  a non-32-float-multiple width — being all-F32 alone doesn't imply that. These six
+  models' real per-op dispatch widths for ADD/MUL/SUB/DIV/RMS_NORM haven't been traced
+  the way Gemma4-12b's were, so this comparison shouldn't be read as proof those three
+  fixes were exercised here. It is solid evidence of no regression either way: if the
+  fixes were wrong, they'd risk breaking builds/dtype-handling generally, and they
+  don't. Gemma4-12b remains the one model in this PR directly confirmed (via real
+  tracing) to hit the width-dependent paths — see the Gemma4 doc linked above.
 
 ## Reading the results
 
