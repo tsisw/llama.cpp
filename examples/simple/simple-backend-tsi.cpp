@@ -549,7 +549,11 @@ static struct ggml_tensor * compute(const simple_model & model, ggml_gallocr_t a
     // allocate tensors
     ggml_gallocr_alloc_graph(allocr, gf);
 
-    ggml_backend_graph_compute(model.backend, gf);
+    enum ggml_status status = ggml_backend_graph_compute(model.backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "\ncompute failed: backend graph compute returned status=%d\n", (int)status);
+        return NULL;
+    }
 
     // in this case, the output tensor is the last one in the graph
     return ggml_graph_node(gf, -1);
@@ -581,8 +585,8 @@ enum ggml_tsavorite_kernel_type convert_testcase_to_ops_type (const char *testCa
         else if (!strcmp(testCase,"silu"))
             return GGML_TSAVORITE_KERNEL_TYPE_SILU;
 
-	fprintf(stderr, "\n un-supported test case %s hence running default test case which is add operation  \n", testCase);
-	return GGML_TSAVORITE_KERNEL_TYPE_ADD;
+	fprintf(stderr, "\n unrecognized test case '%s' -- rejecting rather than silently running 'add'\n", testCase);
+	exit(1);
 }
 
 const char* convert_ops_type_to_testcase(enum ggml_tsavorite_kernel_type ops_type) {
@@ -626,9 +630,13 @@ int main(int argc, char *argv[]) {
     bool test_case_flag = true;
     enum ggml_tsavorite_kernel_type ops_type;
     simple_model model;
-    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
+    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
+    // Unary ops never assign input2[ops_type] below (num_of_input_tensors ==
+    // NUM_INPUT_URINARY_TENSORS skips it in both branches), but it's still
+    // passed unconditionally to load_model() -- zero-init so unary ops pass
+    // nullptr instead of an indeterminate pointer.
+    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
+    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
     bool data_scale = false;
 
     int elements_A=0, elements_B=0;

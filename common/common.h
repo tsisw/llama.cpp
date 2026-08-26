@@ -465,13 +465,20 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-#ifdef GGML_TSAVORITE
+#if defined(GGML_TSAVORITE) || defined(GGML_USE_TSAVORITE)
     // fit_params (a new upstream feature) constructs a throwaway llama_context per
     // device purely to probe its free memory, which initializes that device's ggml
     // backend as a side effect. The Tsavorite backend's runtime layer assumes it is
     // initialized at most once per process; this probe-then-build pattern violates
     // that and segfaults inside tsi_alloc() during the probe. Default it off for
     // Tsavorite builds until/unless the backend is made safe for repeated init.
+    //
+    // Checks both macros: tsi-pkg-build.sh injects the bare GGML_TSAVORITE into
+    // CMAKE_C_FLAGS/CMAKE_CXX_FLAGS globally (reaching this file directly), while
+    // a plain `cmake -DGGML_TSAVORITE=ON` invocation only gets GGML_USE_TSAVORITE,
+    // which ggml_add_backend() attaches as a PUBLIC compile definition on the
+    // `ggml` target (propagated to linking consumers like this one) -- but only
+    // when GGML_BACKEND_DL is off. Neither macro alone covers every build path.
     bool    fit_params         = false; // whether to fit unset model/context parameters to free device memory
 #else
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory

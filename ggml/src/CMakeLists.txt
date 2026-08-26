@@ -222,7 +222,7 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
-if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+if (GGML_TSAVORITE AND "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
     message("Target is FPGA no GOMP linked")
     set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
 elseif (GGML_OPENMP)

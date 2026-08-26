@@ -46,8 +46,6 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
-#include "TestModel.h"
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

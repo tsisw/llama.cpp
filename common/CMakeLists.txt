@@ -176,11 +176,14 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 if (GGML_TSAVORITE)
-    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
+        # rpath-link for transitively-needed tsi_* symbols is handled globally via
+        # -DCMAKE_EXE_LINKER_FLAGS in tsi-pkg-build.sh (FPGA_TOOLBOX_LIB_DIR /
+        # FPGA_RUNTIME_LIB_DIR) -- no per-target linker flags needed here. A prior
+        # per-target attempt using CMAKE_FIND_ROOT_PATH (the ARM cross-toolchain's
+        # own sysroot search list, not the Tsavorite SDK lib dir) broke the FPGA
+        # link by expanding a 4-entry CMake list into bogus bare linker arguments.
         target_link_libraries     (${TARGET} PRIVATE ${TLIBS} PUBLIC llama Threads::Threads)
-	set(SYSROOT_PATH_FOR_LIBRARIES $ENV{CMAKE_FIND_ROOT_PATH}/lib)
-	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${SYSROOT_PATH_FOR_LIBRARIES} -Wl,-rpath-link,${SYSROOT_PATH_FOR_LIBRARIES}")
-	target_link_directories(${TARGET} PRIVATE ${SYSROOT_PATH_FOR_LIBRARIES})
     else()
         target_link_libraries     (${TARGET} PUBLIC llama Threads::Threads)
     endif()

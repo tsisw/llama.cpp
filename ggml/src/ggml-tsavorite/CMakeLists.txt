@@ -13,7 +13,7 @@ if(DEFINED MLIR_COMPILER_DIR)
 endif()
 
 
-if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+if (NOT "${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
 target_link_libraries(ggml-tsavorite PRIVATE ${TLIBS} dl rt)
 else()
 

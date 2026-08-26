@@ -277,6 +277,13 @@ export SDK_VERSION
 __TSI_SOURCED=0
 (return 0 2>/dev/null) && __TSI_SOURCED=1
 __TSI_OLD_SET="$(set +o)"
+# die() returns (rather than exits) when sourced, so its own failure must
+# propagate via errexit -- `cmd || die "msg"` puts die() last in that
+# OR-list, which errexit does NOT exempt (only the tested `cmd` is exempt),
+# so this correctly aborts the whole call chain instead of silently
+# continuing with invalid state. cleanup()'s trap restores this (and every
+# other shell option) via __TSI_OLD_SET on every return/exit path below.
+set -e
 __TSI_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 __TSI_SCRIPT_DIR="$(cd "$(dirname "${__TSI_SCRIPT_PATH}")" 2>/dev/null && pwd)"
 
@@ -1163,7 +1170,11 @@ build_fpga_impl() {
   # explicitly too, to resolve transitively-needed tsi_* symbols at their own
   # link step. Without it: "undefined reference to tsi_alloc" etc. on any
   # target that links llama-common, not just the ones with hand-added flags.
-  local FPGA_RUNTIME_LIB_DIR="/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/x86_64/fpga/runtime/lib"
+  # Keyed by the BUILD HOST's arch (matches CMakeLists.txt's own MLIR_SDK_ARCH,
+  # which is likewise derived from `uname -m`, not the FPGA cross-compile
+  # target's arch) -- a hardcoded "x86_64" here breaks on an aarch64 build host.
+  local host_arch; host_arch="$(select_arch)" || return $?
+  local FPGA_RUNTIME_LIB_DIR="/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${host_arch}/fpga/runtime/lib"
 
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
@@ -1410,7 +1421,7 @@ update_tsavorite_deployment_yaml_from_taos || exit 1
 
 tsi_kernels=(
   "add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu"
-  "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt" "sqr" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16"
+  "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16"
   "mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128"
 )
 

@@ -4377,6 +4377,21 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    llama_perf_context_print_tsavorite_summary(ctx);
+#endif /* GGML_PERF-related flags */
+}
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+// Tsavorite-only perf output (LLAMA_LOG_TSAVORITE-tagged lines + the GGML Perf
+// Summary table), split out of llama_perf_context_print() so callers that
+// already print the plain load/eval/total-time lines themselves (e.g.
+// common_perf_print() in common/sampling.cpp) can pull in just this part
+// without re-printing those lines a second time.
+void llama_perf_context_print_tsavorite_summary(const llama_context * ctx) {
+    const auto data = llama_perf_context(ctx);
+
+    const double t_end_ms = 1e-3 * ggml_time_us();
+
     LLAMA_LOG_TSAVORITE("\n%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
     LLAMA_LOG_TSAVORITE("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
@@ -4385,8 +4400,8 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_TSAVORITE("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
 
     ggml_perf_print_totals(const_cast<ggml_perf_totals *>(ctx->perf_totals));
-#endif /* GGML_PERF-related flags */
 }
+#endif /* GGML_PERF-related flags */
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();

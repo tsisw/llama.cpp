@@ -805,6 +805,12 @@ Change directory to top level llama.cpp
 cd ../../
 ```
 
+SDK_VERSION is mandatory for every cmake invocation below (CMakeLists.txt fails
+fast otherwise). Export it once before either build:
+```bash
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
+```
+
 Compile for posix with build-posix as a target folder
 ```bash
 cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
@@ -818,11 +824,15 @@ export CXX="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-g
 cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
 cmake --build build-fpga --config Release
 ```
-For easy build one can also use which creates a FPGA specific tar bundle tsi-ggml.tz
-If you want to release the build update the TSI-VERSION in the file tsi-pkg-build.sh and add Release as parameter
-when running ./tsi-pkg-build.sh (Note it will overwrite what exists in /proj/rel/sw/ggml so be sure you want to do
-it. Example ./tsi-pkg-build.sh release
+For an easier build, use `tsi-pkg-build.sh` instead, which builds both posix and
+fpga and creates a versioned FPGA package bundle `tsi-ggml-${SDK_VERSION}.tz`.
+It must be *sourced*, not executed, and `SDK_VERSION` is passed on the same
+line (there is no separate `TSI-VERSION` setting). Add `release` as a
+parameter to also install the result under `/proj/rel/sw/ggml` (this
+overwrites what's already there, so be sure before using it):
 
 ```bash
-./tsi-pkg-build.sh
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh
+# or, to also release:
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh release
 ```
