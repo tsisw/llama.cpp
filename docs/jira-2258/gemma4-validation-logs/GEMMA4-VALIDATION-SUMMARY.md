@@ -2,8 +2,13 @@
 
 Stated motivation for this sync (per the reporter): Gemma 4 doesn't work on the old
 fork but should work on the synced tree. Tested two tags from `ollama.com/library/gemma4`
-against both the old and new posix binaries. **Result: partially confirmed, with an
-honest and important caveat** — not a clean "it works now."
+against both the old and new posix binaries.
+
+**Final result: the dense-style `gemma4:12b` tag now fully works on the Tsavorite
+backend** — coherent output, matching the CPU backend, zero alignment warnings. The
+MoE-style `e2b`/`e4b` tags still hit a separate, unrelated upstream loader gap (not a
+Tsavorite or sync issue — see below). This was not a clean "it works now" on the first
+pass; getting there required finding and fixing three real bugs, detailed below.
 
 Both GGUFs pulled directly from the ollama registry (`registry.ollama.ai`), verified by
 sha256 against the registry manifest before use:
@@ -21,9 +26,9 @@ Confirms the reporter's premise — the old fork has no knowledge of the `gemma4
 architecture string at all, and fails the same way regardless of which tag. See
 `old-gemma4-e2b.log` / `old-gemma4-12b.log`.
 
-## New binary (this sync): mixed result — real progress, not full support
+## New binary (this sync)
 
-### gemma4:e2b (MoE-style, 2012 tensors) — fails, but with a precisely diagnosed cause
+### gemma4:e2b (MoE-style, 2012 tensors) — fails, but with a precisely diagnosed cause; not fixable in this sync
 
 The binary exits with no visible error text in its own log (see `new-gemma4-e2b.log`) —
 tracked down with `gdb` (breaking on `__cxa_throw`) to an actual thrown exception:
@@ -46,40 +51,56 @@ doesn't exist. Best-supported explanation, **not independently confirmed**: this
 specific MoE/matryoshka-style checkpoint uses a tensor layout (per-expert or nested
 sub-model tensors) that upstream's `gemma4` support doesn't yet fully consume as of our
 exact target commit — a gap in upstream itself, not something introduced by this sync
-or specific to Tsavorite.
+or specific to Tsavorite. **This is independently confirmed, not just this PR's own
+finding**: [ggml-org/llama.cpp#27349](https://github.com/ggml-org/llama.cpp/issues/27349),
+filed 2026-08-19, reports the identical error class on `gemma4:e4b` (expected 2131, got
+720) — same architecture family, different tag. That issue was closed for a procedural
+reason ("filed without prior authorization"), not because it was fixed, so this appears
+to still be open/unresolved upstream. Not something a Tsavorite-side fix can address;
+tracked as a follow-up to check against later upstream commits, not blocking this PR.
 
-### gemma4:12b (dense-style, 667 tensors) — loads and runs real OPU/TXE compute
+**Directly confirmed backend-independent**: re-ran `gemma4:e2b` with `--device none`
+(CPU only, no Tsavorite backend involved at all) and got the identical failure
+signature — exits with no visible error text, exit code 1, right after the same
+startup banner, no generated output. Since `llama_model_loader::done_getting_tensors()`
+runs before any backend-specific code path is reached, this is exactly what's expected
+if the cause is what it's diagnosed as: a model-loading issue, not a Tsavorite bug.
 
-This one gets much further: architecture recognized, hparams loaded, all 667 tensors
-matched with no `done_getting_tensors` mismatch, and it begins actual token generation
-with real dispatch to the Tsavorite backend. **Important caveat: "begins compute
-without crashing" is not the same as "confirmed correct output."** The run was killed
-after ~10 minutes without producing any generated text (see below) — treat this as
-"loads and dispatches," not as a verified-correct result.
+### gemma4:12b (dense-style, 667 tensors) — now fully working; here's how that was found
 
-This was also the first K-quantized (Q4_K_M) model tested anywhere in this validation
+Architecture recognized, hparams loaded, all 667 tensors matched with no
+`done_getting_tensors` mismatch, and it begins actual token generation with real
+dispatch to the Tsavorite backend. **The investigation below happened in stages — the
+early findings describe what was true partway through, superseded by the final section
+once the actual root cause was found.**
+
+**Stage 1 — first attempt: killed after ~10 minutes, no output, high-volume warning.**
+This was the first K-quantized (Q4_K_M) model tested anywhere in this validation
 exercise — every other model tested up to that point (tinyllama-5m, Gemma3-270M,
-TinyLlama-1.1B, Llama3.2-1B) was F32 or BF16. Running it surfaced a high-volume warning:
+TinyLlama-1.1B, Llama3.2-1B) was F32 or BF16. Running it surfaced:
 
 ```
 TXE::align_address(): Warning: Unaligned memory access 0x7f22e8800104 not 128-byte aligned, aligning to 0x7f22e8800100
 ```
 
-repeated **381,138 times** in the captured run (see `new-gemma4-12b-trimmed.log` for a
-head/tail excerpt — the full raw log was 45MB, kept locally, not checked in).
+repeated **381,138 times** in that run (see `new-gemma4-12b-trimmed.log` for a
+head/tail excerpt of the original, pre-fix run — the full raw log was 45MB, kept
+locally, not checked in).
 
 **Traced the actual mechanism** (`TXE::align_address()`, `tsisw/TXE-FFM`,
 `include/txe/txe.h`): it checks whether a memory address passed to a vector load/store
 is 128-byte aligned (the hardware's vector-register width). If not, it does **not**
 error — it silently rounds the address down to the nearest 128-byte boundary and
-proceeds with *that* address instead. No crash, no assertion raised. This means "the
-process didn't crash" is weak evidence of correctness here — a silently substituted
-address could mean wrong data was read or written, not just a performance cost.
+proceeds with *that* address instead. No crash, no assertion raised — so "didn't crash"
+alone is weak evidence of correctness; a silently substituted address could mean wrong
+data was read or written, not just a performance cost. This turned out to be true: the
+run really was producing wrong output at that stage (see Stage 3 below for what was
+actually wrong).
 
-**Follow-up question raised and answered: is this a Gemma4-specific characteristic, or
-a general K-quant issue — and did this sync cause it?** Tested two additional
-K-quantized, non-Gemma4 models on **both** the old and new binaries, using the exact
-same `TSAVORITE_MODEL_DEPLOYMENT_YAML` config as the Gemma4 runs:
+**Stage 2 — is this Gemma4-specific, or a general K-quant issue, and did this sync
+cause it?** Tested two additional K-quantized, non-Gemma4 models on **both** the old
+and new binaries, using the exact same `TSAVORITE_MODEL_DEPLOYMENT_YAML` config as the
+Gemma4 runs:
 
 | Model | Quant | Old binary | New binary |
 |---|---|---|---|
@@ -88,21 +109,25 @@ same `TSAVORITE_MODEL_DEPLOYMENT_YAML` config as the Gemma4 runs:
 
 Both models complete cleanly with real OPU dispatch on both binaries, zero alignment
 warnings in every case — including the Q4_K_M case, the identical quant sub-format used
-by the failing Gemma4-12b run.
+by the failing Gemma4-12b run. This ruled out "general K-quant issue" and "any K-quant
+model regresses on the synced tree," and (combined with the old binary failing to load
+Gemma4 at all) was the strongest evidence available *at that point* that this wasn't a
+sync regression — though, as the next stage found, it didn't yet identify the actual
+mechanism.
 
-### Root cause found, three real bugs fixed, Gemma4-12b now confirmed working
+**Stage 3 — root cause found, three real bugs fixed, Gemma4-12b confirmed working.**
 
-**Correcting an earlier hypothesis in this doc.** The section above concluded the
-alignment warnings were explained by Gemma4-12b's `embedding_length / attention.head_count`
-= `3840 / 16` = 240 elements per head (960 bytes, not a 128-byte multiple). **That
-conclusion was wrong.** Direct empirical tracing of the model's actual per-node tensor
-shapes at runtime (a temporary, env-var-gated instrumentation pass added to
-`ggml-tsavorite.cpp`'s compute loop, since removed) showed Gemma4-12b's real head_dim
-is **256** (16 query heads, 8 grouped KV heads), already a clean multiple of 128 bytes.
-The `3840/16` arithmetic was a plausible-sounding inference from published
-hyperparameters that didn't hold up against the model's actual tensor shapes — head_dim
-never contributed any misalignment. Correcting the record rather than leaving the wrong
-conclusion in place.
+*Correcting an earlier hypothesis from this stage of the investigation:* the
+alignment warnings were initially attributed to Gemma4-12b's `embedding_length /
+attention.head_count` = `3840 / 16` = 240 elements per head (960 bytes, not a
+128-byte multiple). **That conclusion was wrong.** Direct empirical tracing of the
+model's actual per-node tensor shapes at runtime (a temporary, env-var-gated
+instrumentation pass added to `ggml-tsavorite.cpp`'s compute loop, since removed)
+showed Gemma4-12b's real head_dim is **256** (16 query heads, 8 grouped KV heads),
+already a clean multiple of 128 bytes. The `3840/16` arithmetic was a
+plausible-sounding inference from published hyperparameters that didn't hold up
+against the model's actual tensor shapes — head_dim never contributed any
+misalignment. Correcting the record rather than leaving the wrong conclusion in place.
 
 **Actual root cause, found by tracing the real model, not by inference:** Gemma4-12b's
 per-layer `layer_output_scale` weight — a genuine **scalar** tensor (`ggml` shape
@@ -157,10 +182,18 @@ both are covered by new fast regression tests):
   underlying kernel. Fixed by looping one row at a time (each padded the same way as
   ADD/MUL), with the correct reversed shape indexing.
 
+One further pre-existing bug, unrelated to Gemma4's specific corruption but found and
+fixed in the same investigation: `ggml_backend_tsavorite_buffer_type_get_alignment()`
+returned `32` instead of `TSI_TVU_MEM_ALIGN` (128, confirmed via preprocessor
+expansion) — confirmed identical in the old fork, so pre-existing, not introduced by
+this sync.
+
 **Result: Gemma4-12b now produces coherent, correct output on the Tsavorite backend —
-`My cat's name is "Luna` — matching the CPU backend's own output for the same
-prompt and weights.** Full completion, zero alignment warnings (down from 381,138),
-exit code 0.
+`My cat's name is "Luna` — matching the CPU backend's own output for the same prompt
+and weights** (verified directly: ran the identical prompt/model with `--device none`
+as the CPU reference and compared). Full completion, zero alignment warnings (down
+from 381,138), exit code 0, confirmed on two independent from-scratch builds (dev
+workspace and the actual PR worktree).
 
 Every fix is regression-tested clean: byte-identical output and zero new alignment
 warnings on all 4 standard posix models plus both Qwen K-quant controls, before and
@@ -172,10 +205,9 @@ after every change.
   new" — is confirmed for both tags tested.
 - The MoE-style `e2b`/`e4b` tags still hit a real, independently-confirmed upstream
   loader gap ([ggml-org/llama.cpp#27349](https://github.com/ggml-org/llama.cpp/issues/27349)),
-  unrelated to Tsavorite or this sync.
-- The dense-style `12b` tag now **fully works**: loads, dispatches real OPU compute,
-  and produces coherent output matching the CPU reference, with zero alignment
-  warnings.
+  unrelated to Tsavorite or this sync. Not fixable here.
+- The dense-style `12b` tag **fully works**: loads, dispatches real OPU compute, and
+  produces coherent output matching the CPU reference, with zero alignment warnings.
 - Three real bugs were found and fixed in `ggml-tsavorite.cpp` along the way — one
   pre-existing (`get_alignment()` 32→128), one a genuine chunked-op corruption
   (ADD/MUL/SUB/DIV padding), and the actual Gemma4 root cause (true scalar-broadcast
