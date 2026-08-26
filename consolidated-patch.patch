@@ -546,10 +546,10 @@ index 567f7fbbb..cdf65e58a 100644
 +target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT} ${TLIBS})
  target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/simple/CMakeLists.txt b/examples/simple/CMakeLists.txt
-index 104ecabfd..207651b69 100644
+index 104ecabfd..47881941b 100644
 --- a/examples/simple/CMakeLists.txt
 +++ b/examples/simple/CMakeLists.txt
-@@ -1,5 +1,42 @@
+@@ -1,5 +1,44 @@
 +#
 +# simple-ctx
  set(TARGET llama-simple)
@@ -583,6 +583,7 @@ index 104ecabfd..207651b69 100644
 +    set(CHUNKED_REPRO_TARGET simple-chunked-repro)
 +    add_executable(${CHUNKED_REPRO_TARGET} simple-chunked-repro.cpp)
 +    target_link_libraries(${CHUNKED_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
++    target_compile_features(${CHUNKED_REPRO_TARGET} PRIVATE cxx_std_17)
 +
 +    #
 +    # simple-scalar-broadcast-2d-repro: regression test for the true
@@ -592,6 +593,7 @@ index 104ecabfd..207651b69 100644
 +    set(SCALAR2D_REPRO_TARGET simple-scalar-broadcast-2d-repro)
 +    add_executable(${SCALAR2D_REPRO_TARGET} simple-scalar-broadcast-2d-repro.cpp)
 +    target_link_libraries(${SCALAR2D_REPRO_TARGET} PRIVATE ggml ${TLIBS}  dl rt)
++    target_compile_features(${SCALAR2D_REPRO_TARGET} PRIVATE cxx_std_17)
 +endif()
 diff --git a/examples/simple/mat-mul-tsi-test-case.cpp b/examples/simple/mat-mul-tsi-test-case.cpp
 new file mode 100644
@@ -1785,18 +1787,22 @@ index 000000000..5e6aa415b
 +}
 diff --git a/examples/simple/simple-chunked-repro.cpp b/examples/simple/simple-chunked-repro.cpp
 new file mode 100644
-index 000000000..43b853537
+index 000000000..53af4beb9
 --- /dev/null
 +++ b/examples/simple/simple-chunked-repro.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,224 @@
 +// Standalone repro: does ggml_add's broadcast chunking (nr0 = ne00/ne10 > 1)
 +// produce correct results on the Tsavorite backend when ne10*sizeof(float)
-+// is NOT a multiple of 128 bytes (Gemma4's head_dim=240 pattern: 240*4=960
-+// bytes, 960 % 128 = 64, so successive chunks alternate 0/64-byte phase)?
++// is NOT a multiple of 128 bytes? The default width below (240) is chosen
++// only because it is NOT a 32-float/128-byte multiple (240*4=960 bytes,
++// 960 % 128 = 64, so successive chunks alternate 0/64-byte phase) -- it is
++// NOT Gemma4's real head_dim. Gemma4-12b's actual head_dim is 256 (16 query
++// heads, 8 grouped KV heads), already a clean 128-byte multiple; see
++// GEMMA4-VALIDATION-SUMMARY.md for how that was confirmed by direct tracing.
 +//
 +// The existing simple-backend-tsi.cpp harness never sets nr0 > 1 -- its
 +// "scale" test uses equal-sized A/B (nr0 always 1), so it never exercises
-+// this alternating-phase multi-chunk broadcast path that Gemma4 actually hits.
++// this alternating-phase multi-chunk broadcast path.
 +#include "ggml.h"
 +#include "ggml-alloc.h"
 +#include "ggml-backend.h"
@@ -1821,13 +1827,23 @@ index 000000000..43b853537
 +}
 +
 +int main(int argc, char *argv[]) {
-+    const int64_t HEAD = (argc > 2) ? atoll(argv[2]) : 240;   // Gemma4's head_dim by default
++    const int64_t HEAD = (argc > 2) ? atoll(argv[2]) : 240;   // intentionally not a 32-float multiple; NOT Gemma4's real head_dim (see header comment above)
 +    const int64_t NCHUNKS = (argc > 1) ? atoll(argv[1]) : 4;
++    if (HEAD <= 0 || NCHUNKS <= 0) {
++        fprintf(stderr, "invalid dimensions: HEAD=%ld NCHUNKS=%ld (both must be > 0)\n", (long)HEAD, (long)NCHUNKS);
++        return 1;
++    }
 +    const int64_t NA = HEAD * NCHUNKS;        // ne00
 +    const int64_t NB = HEAD;                  // ne10 -- broadcasts across NCHUNKS
 +    const char *op = (argc > 3) ? argv[3] : "add";
 +    const bool is_rms = !strcmp(op, "rms_norm");
 +    const bool is_rms_looped = !strcmp(op, "rms_norm_looped");
++    const bool is_known_op = is_rms || is_rms_looped ||
++        !strcmp(op, "add") || !strcmp(op, "mul") || !strcmp(op, "sub") || !strcmp(op, "div");
++    if (!is_known_op) {
++        fprintf(stderr, "unrecognized op '%s' (expected add|mul|sub|div|rms_norm|rms_norm_looped)\n", op);
++        return 1;
++    }
 +
 +    fprintf(stderr, "Repro: op=%s A=%ld elements, nr0-like=%ld chunks/rows of %ld floats (%ld bytes, mod128=%ld)\n",
 +            op, (long)NA, (long)NCHUNKS, (long)HEAD, (long)(HEAD*sizeof(float)), (long)((HEAD*sizeof(float)) % 128));
@@ -1908,15 +1924,22 @@ index 000000000..43b853537
 +        if (b) ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
 +    }
 +
-+    static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
-+    static std::vector<uint8_t> buf(buf_size);
++    // rms_norm_looped builds one graph node per row (NCHUNKS of them), which
++    // can exceed GGML_DEFAULT_GRAPH_SIZE (2048) for a large -c NCHUNKS -- size
++    // the graph (and its backing context) from NCHUNKS instead of assuming
++    // the default always fits.
++    const size_t graph_size = is_rms_looped
++        ? std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, (size_t)NCHUNKS + 8)
++        : GGML_DEFAULT_GRAPH_SIZE;
++    size_t buf_size = ggml_tensor_overhead()*graph_size + ggml_graph_overhead_custom(graph_size, false);
++    std::vector<uint8_t> buf(buf_size);
 +    struct ggml_init_params params0 = {
 +        /*.mem_size   =*/ buf_size,
 +        /*.mem_buffer =*/ buf.data(),
 +        /*.no_alloc   =*/ true,
 +    };
 +    struct ggml_context * ctx0 = ggml_init(params0);
-+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
++    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, graph_size, false);
 +
 +    std::vector<struct ggml_tensor *> row_results;
 +    struct ggml_tensor * result = nullptr;
@@ -1940,7 +1963,16 @@ index 000000000..43b853537
 +    ggml_gallocr_reserve(allocr, gf);
 +    ggml_gallocr_alloc_graph(allocr, gf);
 +
-+    ggml_backend_graph_compute(backend, gf);
++    ggml_status st = ggml_backend_graph_compute(backend, gf);
++    if (st != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "ggml_backend_graph_compute failed, status=%d\n", (int)st);
++        ggml_gallocr_free(allocr);
++        ggml_free(ctx0);
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++        ggml_backend_free(backend);
++        return 1;
++    }
 +
 +    std::vector<float> out_data(NA);
 +    if (is_rms_looped) {
@@ -1985,10 +2017,10 @@ index 000000000..43b853537
 +}
 diff --git a/examples/simple/simple-scalar-broadcast-2d-repro.cpp b/examples/simple/simple-scalar-broadcast-2d-repro.cpp
 new file mode 100644
-index 000000000..8a7f13ba4
+index 000000000..dfc5c763d
 --- /dev/null
 +++ b/examples/simple/simple-scalar-broadcast-2d-repro.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,121 @@
 +// Does ggml_mul(a, b) with a=[3840,N,1,1] and b=[1,1,1,1] (Gemma4's exact
 +// out_scale broadcast: N=7 tokens, scalar per-layer weight) compute
 +// correctly? Earlier chunked-repro testing only ever used a 1D tensor (N=1
@@ -2055,6 +2087,22 @@ index 000000000..8a7f13ba4
 +    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
 +    struct ggml_tensor * result = ggml_mul(ctx0, a, b);
 +    ggml_build_forward_expand(gf, result);
++
++    // GGML_OP_MUL is only compiled into ggml-tsavorite.cpp's dispatch under
++    // #ifdef TVU_SUPPORTED -- in a TMU-only build there's no code path for
++    // it at all, and calling ggml_backend_graph_compute() directly (bypassing
++    // the scheduler's normal per-op backend selection) would hit that gap
++    // instead of falling back to CPU like a real inference run would. Check
++    // support explicitly and skip cleanly rather than fail unpredictably.
++    if (!ggml_backend_supports_op(backend, result)) {
++        fprintf(stderr, "\nSKIPPED: GGML_OP_MUL not supported on this backend build "
++                "(e.g. TMU-only, no TVU_SUPPORTED) -- nothing to test here.\n");
++        ggml_free(ctx0);
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++        ggml_backend_free(backend);
++        return 0;
++    }
 +
 +    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 +    ggml_gallocr_reserve(allocr, gf);
@@ -2882,10 +2930,10 @@ index 000000000..d396a9ea8
 +endif()
 diff --git a/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
 new file mode 100644
-index 000000000..5e163ddbe
+index 000000000..d03cdcfaf
 --- /dev/null
 +++ b/ggml/src/ggml-tsavorite/ggml-tsavorite.cpp
-@@ -0,0 +1,8178 @@
+@@ -0,0 +1,8221 @@
 +// -----------------------------------------------------------------------------n
 +// Copyright (c) 2023 Tsavorite Scalable Intelligence, Inc . All rights reserved.
 +//
@@ -9575,8 +9623,11 @@ index 000000000..5e163ddbe
 +                // is computationally trivial, compute it directly on CPU
 +                // instead of dispatching to the kernel at all for this one
 +                // degenerate shape; every other ne10 value keeps using the
-+                // OPU kernel path below unchanged.
-+                if (ne10 == 1) {
++                // OPU kernel path below unchanged. Scoped to F32: this reads/
++                // writes raw `float` pointers, which would misinterpret F16
++                // (2-byte) elements as 4-byte floats -- F16 keeps using the
++                // unmodified kernel path below instead.
++                if (ne10 == 1 && kernel_sub_type == DATA_TYPE_F32_INDEX) {
 +                    const float scalar_val = *(const float *)src1_ptr;
 +                    for (int64_t r = 0; r < nr0; ++r) {
 +                        float a = src0_ptr[r];
@@ -9606,9 +9657,14 @@ index 000000000..5e163ddbe
 +                // tried and failed previously) avoids the buggy tail path
 +                // entirely -- the kernel only ever sees clean, full-register
 +                // vector lengths.
++                // Scoped to F32 for the same reason as the ne10==1 case above:
++                // the scratch buffers below are sized/copied in units of
++                // sizeof(float); F16 elements would be misread/miswritten as
++                // 4-byte floats. F16 falls through to the unmodified path.
 +                const int64_t ne10_padded =
 +                    ((ne10 + 31) / 32) * 32;
-+                const bool need_pad = (ne10_padded != ne10);
++                const bool need_pad =
++                    (ne10_padded != ne10) && (kernel_sub_type == DATA_TYPE_F32_INDEX);
 +
 +                for (int64_t r = 0; r < nr0; ++r) {
 +                   memset(srcP0, 0, sizeof(MemRefDescriptor<Rank>));
@@ -9743,14 +9799,18 @@ index 000000000..5e163ddbe
 +#if TRITON_ADD
 +                    }
 +#endif /* TRITON_ADD */
-+                    // NOTE: for the TRITON_ADD async-dispatch branch above, with
-+                    // multi_thread_enable=true this writeback can race the
-+                    // worker thread that actually performs the computation
-+                    // (dispatch returns before the worker runs) -- a separate,
-+                    // already-identified bug from the ADD-specific Triton path.
-+                    // Not yet handled here; this padding fix is scoped to
-+                    // proving/fixing the tail-corruption bug first.
++                    // The ADD-specific TRITON_ADD async-dispatch branch above is
++                    // handled by routing its need_pad case through the
++                    // synchronous kernel wrapper (see above). For every other
++                    // path reaching here (MUL/SUB/DIV, and any kernel variant
++                    // whose "_host"/"_host_new" implementation dispatches
++                    // asynchronously under multi_thread_enable=true in ways not
++                    // visible from this file), join_all_workers() before the
++                    // writeback is a no-op when nothing is pending and a
++                    // correctness requirement when something is -- cheap
++                    // insurance against a race this file can't fully rule out.
 +                    if (need_pad) {
++                        join_all_workers();
 +                        memcpy(real_dst, use_dst, (size_t)ne10 * sizeof(float));
 +                    }
 +                    ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
@@ -9854,8 +9914,12 @@ index 000000000..5e163ddbe
 +            const int64_t rms_row_width = src0->ne[0];
 +            int64_t rms_n_rows = 1;
 +            for (int d = 1; d < GGML_MAX_DIMS; ++d) rms_n_rows *= src0->ne[d];
++            // Scoped to F32: the row-padding scratch buffers below are sized
++            // in units of sizeof(float); F16 rows would be misread/miswritten
++            // as 4-byte floats. F16 falls through to the unmodified path.
 +            const bool rms_need_row_loop =
-+                (rms_row_width % 32 != 0) && (rms_n_rows > 1);
++                (rms_row_width % 32 != 0) && (rms_n_rows > 1) &&
++                (kernel_sub_type == DATA_TYPE_F32_INDEX);
 +
 +            if (rms_need_row_loop) {
 +                // Repeated back-to-back dispatch of the SAME non-32-multiple
@@ -9926,10 +9990,21 @@ index 000000000..5e163ddbe
 +
 +                    ctx->kernels[kernel_type].pipeline->_mlir_fptr_2_input[kernel_sub_type](row_srcP0, row_nodeP, glob_buf);
 +
++                    // join_all_workers() before reading pad_out: a no-op when
++                    // nothing is pending, a correctness requirement if this
++                    // kernel variant ever dispatches asynchronously under
++                    // multi_thread_enable=true.
++                    join_all_workers();
 +                    memcpy(node_row, pad_out, rms_row_bytes);
 +                    tsi_dealloc(row_srcP0);
 +                    tsi_dealloc(row_nodeP);
 +                }
++                // This branch dispatches rms_n_rows real kernel calls (one per
++                // row), but the common ++num_of_kernel_call/++tsi_kernel_runs
++                // below this if/else only accounts for 1 -- add the rest here
++                // so the reported kernel/device-call counts match reality.
++                device->stats.op_run_count[kernel_type].num_of_kernel_call += rms_n_rows - 1;
++                node->tsi_kernel_runs += rms_n_rows - 1;
 +            } else {
 +                int max_dim_index = GGML_MAX_DIMS -1;
 +                int strides = 1;
@@ -10339,6 +10414,22 @@ index 000000000..5e163ddbe
 +  ggml_tsavorite_disp_stats(ctx, ctx_dev->device);
 +
 +  ggml_backend_tsavorite_device_rel(ctx_dev);
++
++  // The chunk-padding scratch buffers (g_align_scratch[]) are tsi_alloc'd
++  // against this runtime, so they must be torn down BEFORE
++  // ggml_tsavorite_free(ctx) -- that call ends with tsi_finalize(), and
++  // tsi_dealloc() on a pointer allocated against an already-finalized
++  // runtime is a use-after-finalize. Without freeing them at all, the next
++  // backend init in the same process would also see a "large enough" cached
++  // capacity and reuse the stale pointer instead of reallocating.
++  for (int slot = 0; slot < TSI_ALIGN_SLOT_COUNT; ++slot) {
++      if (g_align_scratch[slot]) {
++          tsi_dealloc(g_align_scratch[slot]);
++          g_align_scratch[slot] = nullptr;
++      }
++      g_align_scratch_cap[slot] = 0;
++  }
++
 +  ggml_tsavorite_free(ctx);
 +
 +  free(backend);
