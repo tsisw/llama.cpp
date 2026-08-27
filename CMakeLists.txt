@@ -85,6 +85,20 @@ if (GGML_TSAVORITE)
         set(ARCH_FLAGS -march=armv8-a)
         file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${RUNTIME_DIR}/../utils/lib/TsavRTShimCAPI.cpp.o")
         message("Setting target as fpga")
+
+        # rpath-link for transitively-needed tsi_* symbols, for every executable
+        # target in this tree (add_link_options applies to this directory and
+        # everything add_subdirectory'd after this point). Set once here, on the
+        # CMake side, so it's present whether this is configured via
+        # tsi-pkg-build.sh (which also sets the same paths via
+        # -DCMAKE_EXE_LINKER_FLAGS -- duplicate -L/-rpath-link flags are harmless)
+        # or via the manual "cmake -B build-fpga ..." flow documented in
+        # README.md/docs/build.md, which never went through tsi-pkg-build.sh at all.
+        set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
+        add_link_options(
+            "-L${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}" "-Wl,-rpath-link,${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}"
+            "-L${RUNTIME_DIR}/lib" "-Wl,-rpath-link,${RUNTIME_DIR}/lib"
+        )
     elseif ("${GGML_TSAVORITE_TARGET}" STREQUAL "posix")
         file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "${MLIR_COMPILER_DIR}/lib/libTsavRTPosixShimCAPI.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-c-native.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-cpp.so" "${MLIR_COMPILER_DIR}/lib/libtvu_fau_full.so")
         message("Setting target as posix for tsavorite")

@@ -143,23 +143,29 @@ The `tsi-pkg-build.sh` script handles all steps automatically:
 git clone git@github.com:tsisw/llama.cpp.git
 cd llama.cpp
 
-# SDK_VERSION is mandatory for every invocation (fails fast otherwise)
+# SDK_VERSION is mandatory for every invocation (fails fast otherwise). It is
+# the only input parse_args() needs -- on every run it explicitly unsets
+# MLIR_COMPILER_DIR/TOOLBOX_DIR/MLIR_SDK_VERSION first so a stale path from a
+# previous SDK version's run can't leak into this one, then re-derives all
+# three from SDK_VERSION. So exporting MLIR_SDK_VERSION/MLIR_COMPILER_DIR/
+# TOOLBOX_DIR yourself before sourcing (as older revisions of this doc showed)
+# has no effect -- they get unset before they're read. If you genuinely need
+# a non-default SDK layout, pass explicit paths positionally instead (Option
+# 2 below), which bypasses env-var resolution entirely.
 export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
 
-# Option 1: Using SDK path (derives TOOLBOX_DIR and MLIR_COMPILER_DIR automatically)
-export MLIR_SDK_VERSION=/proj/rel/sw/sdk-r.0.2.2
+# Option 1 (recommended): let SDK_VERSION derive everything
 source tsi-pkg-build.sh
 
-# Option 2: Explicit paths
+# Option 2: explicit paths, for a non-standard SDK layout
 source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
 
-# Option 3: Environment variables
-export MLIR_COMPILER_DIR=/path/to/mlir-compiler/install
-export TOOLBOX_DIR=/path/to/toolbox/install
-./tsi-pkg-build.sh
+# Sourcing is recommended (keeps this shell's env consistent via the
+# save/restore-on-return trap), but direct execution is also supported:
+# SDK_VERSION=0.4.1 ./tsi-pkg-build.sh
 
 # For release build (copies to /proj/rel/sw/ggml)
-./tsi-pkg-build.sh release
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh release
 ```
 
 ##### Manual build steps
