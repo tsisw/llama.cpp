@@ -277,13 +277,18 @@ export SDK_VERSION
 __TSI_SOURCED=0
 (return 0 2>/dev/null) && __TSI_SOURCED=1
 __TSI_OLD_SET="$(set +o)"
-# die() returns (rather than exits) when sourced, so its own failure must
-# propagate via errexit -- `cmd || die "msg"` puts die() last in that
-# OR-list, which errexit does NOT exempt (only the tested `cmd` is exempt),
-# so this correctly aborts the whole call chain instead of silently
-# continuing with invalid state. cleanup()'s trap restores this (and every
-# other shell option) via __TSI_OLD_SET on every return/exit path below.
-set -e
+# NOTE: do NOT put a global `set -e` here. Verified empirically: when this
+# script is sourced, an ordinary command failure anywhere (not just a `die()`
+# call) trips errexit, which terminates the CALLER'S shell outright rather
+# than just unwinding this script -- and does so without running cleanup(),
+# since only a RETURN trap is registered for the sourced case (line ~1813),
+# and an errexit-triggered process exit never fires a RETURN trap (only an
+# EXIT trap would, and that's only registered for the non-sourced/exec case).
+# The narrower problem this was meant to fix -- `cmd || die "msg"` not
+# aborting the whole call chain when die() returns 1 instead of exiting --
+# is a real but much lower-severity gap than "sourcing this can kill your
+# terminal"; leaving it as a known follow-up rather than reintroducing global
+# errexit to patch it.
 __TSI_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 __TSI_SCRIPT_DIR="$(cd "$(dirname "${__TSI_SCRIPT_PATH}")" 2>/dev/null && pwd)"
 

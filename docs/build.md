@@ -826,8 +826,10 @@ cmake --build build-fpga --config Release
 ```
 For an easier build, use `tsi-pkg-build.sh` instead, which builds both posix and
 fpga and creates a versioned FPGA package bundle `tsi-ggml-${SDK_VERSION}.tz`.
-It must be *sourced*, not executed, and `SDK_VERSION` is passed on the same
-line (there is no separate `TSI-VERSION` setting). Add `release` as a
+Source it (recommended -- keeps this shell's env consistent via the
+save/restore-on-return trap; direct execution is also supported), and
+`SDK_VERSION` is passed on the same line (there is no separate `TSI-VERSION`
+setting). Add `release` as a
 parameter to also install the result under `/proj/rel/sw/ggml` (this
 overwrites what's already there, so be sure before using it):
 
