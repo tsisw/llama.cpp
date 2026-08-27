@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -508,8 +509,19 @@ int cli_context::run() {
             buffer.pop_back();
         }
 
-        // skip empty messages
+        // skip empty messages -- unless this is genuine end-of-input on a
+        // non-interactive stdin (piped/redirected, no TTY), not a blank line
+        // submitted interactively. Without this check, read_input() returns
+        // an empty buffer instantly and forever once stdin hits EOF (getwchar()
+        // never blocks again), spinning this loop at 100% CPU writing the
+        // prompt indefinitely -- observed running any single-shot -p invocation
+        // (e.g. model-rerun.py, or any script capturing output via a pipe)
+        // through llama-cli, previously untested since llama-cli was never
+        // buildable under GGML_TSAVORITE before this sync.
         if (buffer.empty()) {
+            if (std::feof(stdin)) {
+                break;
+            }
             continue;
         }
 
