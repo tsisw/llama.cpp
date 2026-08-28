@@ -94,7 +94,17 @@ if (GGML_TSAVORITE)
         # -DCMAKE_EXE_LINKER_FLAGS -- duplicate -L/-rpath-link flags are harmless)
         # or via the manual "cmake -B build-fpga ..." flow documented in
         # README.md/docs/build.md, which never went through tsi-pkg-build.sh at all.
-        set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
+        # README.md's manual flow `export`s TOOLBOX_DIR before invoking cmake (it's
+        # never passed as -DTOOLBOX_DIR to this particular cmake call, only to the
+        # separate ggml-tsi-kernel blob build), so prefer that env var when present
+        # and only fall back to deriving it from MLIR_COMPILER_DIR otherwise.
+        if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
+            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${TOOLBOX_DIR}/lib")
+        elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
+            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "$ENV{TOOLBOX_DIR}/lib")
+        else()
+            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
+        endif()
         add_link_options(
             "-L${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}" "-Wl,-rpath-link,${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}"
             "-L${RUNTIME_DIR}/lib" "-Wl,-rpath-link,${RUNTIME_DIR}/lib"

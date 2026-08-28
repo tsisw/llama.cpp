@@ -160,8 +160,10 @@ source tsi-pkg-build.sh
 # Option 2: explicit paths, for a non-standard SDK layout
 source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
 
-# Sourcing is recommended (keeps this shell's env consistent via the
-# save/restore-on-return trap), but direct execution is also supported:
+# Sourcing is recommended -- it leaves the derived SDK paths (MLIR_COMPILER_DIR,
+# TOOLBOX_DIR, etc.) set in this shell afterward, handy for further manual
+# cmake/build commands. Direct execution is also supported; it just runs in a
+# child process, so those variables don't outlive it:
 # SDK_VERSION=0.4.1 ./tsi-pkg-build.sh
 
 # For release build (copies to /proj/rel/sw/ggml)

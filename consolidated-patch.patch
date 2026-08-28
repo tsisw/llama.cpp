@@ -60,10 +60,10 @@ index e69de29bb..ff1b6feda 100644
 +	path = ggml-tsi-kernel
 +	url = git@github.com:tsisw/ggml-tsi-kernel.git
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b2092d12d..310988883 100644
+index b2092d12d..992204a22 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -25,6 +25,96 @@ message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
+@@ -25,6 +25,106 @@ message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
  #set(CMAKE_WARN_DEPRECATED YES)
  set(CMAKE_WARN_UNUSED_CLI YES)
  
@@ -136,7 +136,17 @@ index b2092d12d..310988883 100644
 +        # -DCMAKE_EXE_LINKER_FLAGS -- duplicate -L/-rpath-link flags are harmless)
 +        # or via the manual "cmake -B build-fpga ..." flow documented in
 +        # README.md/docs/build.md, which never went through tsi-pkg-build.sh at all.
-+        set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
++        # README.md's manual flow `export`s TOOLBOX_DIR before invoking cmake (it's
++        # never passed as -DTOOLBOX_DIR to this particular cmake call, only to the
++        # separate ggml-tsi-kernel blob build), so prefer that env var when present
++        # and only fall back to deriving it from MLIR_COMPILER_DIR otherwise.
++        if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
++            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${TOOLBOX_DIR}/lib")
++        elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
++            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "$ENV{TOOLBOX_DIR}/lib")
++        else()
++            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
++        endif()
 +        add_link_options(
 +            "-L${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}" "-Wl,-rpath-link,${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}"
 +            "-L${RUNTIME_DIR}/lib" "-Wl,-rpath-link,${RUNTIME_DIR}/lib"
@@ -160,7 +170,7 @@ index b2092d12d..310988883 100644
  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
  
  if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
-@@ -34,6 +124,13 @@ endif()
+@@ -34,6 +134,13 @@ endif()
  
  message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
  
@@ -174,7 +184,7 @@ index b2092d12d..310988883 100644
  # Add path to modules
  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
  
-@@ -229,7 +326,15 @@ if (LLAMA_BUILD_COMMON)
+@@ -229,7 +336,15 @@ if (LLAMA_BUILD_COMMON)
      add_subdirectory(vendor/cpp-httplib)
  endif()
  
@@ -192,10 +202,10 @@ index b2092d12d..310988883 100644
      add_subdirectory(tests)
  endif()
 diff --git a/README.md b/README.md
-index 1b341e7fb..0e36f9f99 100644
+index 1b341e7fb..060699ed1 100644
 --- a/README.md
 +++ b/README.md
-@@ -123,3 +123,111 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
+@@ -123,3 +123,113 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
  - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
  - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
  - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
@@ -236,8 +246,10 @@ index 1b341e7fb..0e36f9f99 100644
 +# Option 2: explicit paths, for a non-standard SDK layout
 +source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
 +
-+# Sourcing is recommended (keeps this shell's env consistent via the
-+# save/restore-on-return trap), but direct execution is also supported:
++# Sourcing is recommended -- it leaves the derived SDK paths (MLIR_COMPILER_DIR,
++# TOOLBOX_DIR, etc.) set in this shell afterward, handy for further manual
++# cmake/build commands. Direct execution is also supported; it just runs in a
++# child process, so those variables don't outlive it:
 +# SDK_VERSION=0.4.1 ./tsi-pkg-build.sh
 +
 +# For release build (copies to /proj/rel/sw/ggml)
@@ -402,10 +414,10 @@ index 06dea1e1c..72be01219 100644
  }
  
 diff --git a/docs/build.md b/docs/build.md
-index ca086a0be..06aa3ba61 100644
+index ca086a0be..150d92d04 100644
 --- a/docs/build.md
 +++ b/docs/build.md
-@@ -763,3 +763,78 @@ The GPU may still be used to accelerate some parts of the computation even when
+@@ -763,3 +763,81 @@ The GPU may still be used to accelerate some parts of the computation even when
  In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
  
  Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
@@ -472,10 +484,13 @@ index ca086a0be..06aa3ba61 100644
 +```
 +For an easier build, use `tsi-pkg-build.sh` instead, which builds both posix and
 +fpga and creates a versioned FPGA package bundle `tsi-ggml-${SDK_VERSION}.tz`.
-+Source it (recommended -- keeps this shell's env consistent via the
-+save/restore-on-return trap; direct execution is also supported), and
-+`SDK_VERSION` is passed on the same line (there is no separate `TSI-VERSION`
-+setting). Add `release` as a
++Source it (recommended -- leaves the SDK paths it derives, like
++`MLIR_COMPILER_DIR`/`TOOLBOX_DIR`, set in this shell afterward, useful if you
++want to run further manual `cmake`/build commands without re-deriving them.
++Direct execution is also supported; there the script runs in a child process,
++so those variables simply don't outlive it -- either way, nothing needs
++manual unsetting). `SDK_VERSION` is passed on the same line (there is no
++separate `TSI-VERSION` setting). Add `release` as a
 +parameter to also install the result under `/proj/rel/sw/ggml` (this
 +overwrites what's already there, so be sure before using it):
 +
@@ -12427,10 +12442,10 @@ index 8449cdbaf..362cda14b 100644
  
  if(LLAMA_TOOLS_INSTALL)
 diff --git a/tools/cli/cli-context.cpp b/tools/cli/cli-context.cpp
-index 3d801b73d..6fe30973b 100644
+index 3d801b73d..a638e328a 100644
 --- a/tools/cli/cli-context.cpp
 +++ b/tools/cli/cli-context.cpp
-@@ -11,6 +11,7 @@
+@@ -11,11 +11,18 @@
  
  #include <algorithm>
  #include <cctype>
@@ -12438,22 +12453,56 @@ index 3d801b73d..6fe30973b 100644
  #include <filesystem>
  #include <fstream>
  #include <map>
-@@ -508,8 +509,19 @@ int cli_context::run() {
+ #include <set>
+ 
++#if defined(_WIN32)
++#    include <io.h>
++#else
++#    include <unistd.h>
++#endif
++
+ using json = nlohmann::ordered_json;
+ 
+ struct cli_context_impl {
+@@ -461,6 +468,23 @@ int cli_context::run() {
+     // interactive loop
+     std::string cur_msg;
+ 
++    // Whether stdin is an interactive terminal, checked once up front rather
++    // than detected reactively via feof(stdin) inside the loop below. Reactive
++    // EOF detection is not portable: readline_advanced()'s Windows path
++    // (ReadConsoleInputW) hits its own end_of_stream condition on redirected
++    // input without ever setting the C stdin EOF flag, so a feof(stdin) check
++    // silently fails to catch it there even though it works on the
++    // getwchar()-based POSIX path. Checking isatty() once up front is
++    // portable across both and avoids the discrepancy entirely: a redirected/
++    // piped/non-interactive stdin should never have entered "wait for the
++    // next interactive turn" in the first place, independent of how or when
++    // the underlying platform surfaces EOF.
++#if defined(_WIN32)
++    const bool stdin_is_interactive = _isatty(_fileno(stdin)) != 0;
++#else
++    const bool stdin_is_interactive = isatty(fileno(stdin)) != 0;
++#endif
++
+     auto add_text_file = [&](const std::string & fname) -> bool {
+         std::ifstream file(fname, std::ios::binary);
+         if (!file) {
+@@ -508,8 +532,18 @@ int cli_context::run() {
              buffer.pop_back();
          }
  
 -        // skip empty messages
-+        // skip empty messages -- unless this is genuine end-of-input on a
-+        // non-interactive stdin (piped/redirected, no TTY), not a blank line
-+        // submitted interactively. Without this check, read_input() returns
-+        // an empty buffer instantly and forever once stdin hits EOF (getwchar()
-+        // never blocks again), spinning this loop at 100% CPU writing the
-+        // prompt indefinitely -- observed running any single-shot -p invocation
++        // skip empty messages -- unless stdin isn't interactive, in which case
++        // there is no "next turn" coming and continuing would spin this loop
++        // at 100% CPU rewriting the prompt forever (read_input() returns an
++        // empty buffer instantly and permanently once a piped/redirected
++        // stdin hits EOF). Observed running any single-shot -p invocation
 +        // (e.g. model-rerun.py, or any script capturing output via a pipe)
 +        // through llama-cli, previously untested since llama-cli was never
 +        // buildable under GGML_TSAVORITE before this sync.
          if (buffer.empty()) {
-+            if (std::feof(stdin)) {
++            if (!stdin_is_interactive) {
 +                break;
 +            }
              continue;
