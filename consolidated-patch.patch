@@ -380,6 +380,87 @@ index b16bd3bb6..495327846 100644
      bool    fit_params_print   = false; // print the estimated required memory to run the model
      int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
  
+diff --git a/common/console.cpp b/common/console.cpp
+index 36f645f33..ee2682420 100644
+--- a/common/console.cpp
++++ b/common/console.cpp
+@@ -750,7 +750,7 @@ namespace console {
+         }
+     } history;
+ 
+-    static bool readline_advanced(std::string & line, bool multiline_input) {
++    static bool readline_advanced(std::string & line, bool multiline_input, bool * eof) {
+         if (out != stdout) {
+             fflush(stdout);
+         }
+@@ -1040,15 +1040,24 @@ namespace console {
+         }
+ 
+         fflush(out);
++        if (eof) {
++            *eof = end_of_stream;
++        }
+         return has_more;
+     }
+ 
+-    static bool readline_simple(std::string & line, bool multiline_input) {
++    static bool readline_simple(std::string & line, bool multiline_input, bool * eof) {
++        if (eof) {
++            *eof = false;
++        }
+ #if defined(_WIN32)
+         std::wstring wline;
+         if (!std::getline(std::wcin, wline)) {
+             // Input stream is bad or EOF received
+             line.clear();
++            if (eof) {
++                *eof = true;
++            }
+             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+             return false;
+         }
+@@ -1060,6 +1069,9 @@ namespace console {
+         if (!std::getline(std::cin, line)) {
+             // Input stream is bad or EOF received
+             line.clear();
++            if (eof) {
++                *eof = true;
++            }
+             return false;
+         }
+ #endif
+@@ -1080,11 +1092,11 @@ namespace console {
+         return multiline_input;
+     }
+ 
+-    bool readline(std::string & line, bool multiline_input) {
++    bool readline(std::string & line, bool multiline_input, bool * eof) {
+         if (simple_io) {
+-            return readline_simple(line, multiline_input);
++            return readline_simple(line, multiline_input, eof);
+         }
+-        return readline_advanced(line, multiline_input);
++        return readline_advanced(line, multiline_input, eof);
+     }
+ 
+     void set_completion_callback(completion_callback cb) {
+diff --git a/common/console.h b/common/console.h
+index 72781bea6..7591c97a9 100644
+--- a/common/console.h
++++ b/common/console.h
+@@ -21,7 +21,11 @@ namespace console {
+     void init(bool use_simple_io, bool use_advanced_display);
+     void cleanup();
+     void set_display(display_type display);
+-    bool readline(std::string & line, bool multiline_input);
++    // eof, when non-null, is set to true only on genuine end-of-input (e.g.
++    // Ctrl+D or a closed pipe) -- never for an ordinary blank line, which is
++    // reported as a successful empty read (the return value still governs
++    // whether the caller should keep accumulating for multiline input).
++    bool readline(std::string & line, bool multiline_input, bool * eof = nullptr);
+ 
+     using completion_callback = std::function<std::vector<std::pair<std::string, size_t>>(std::string_view, size_t)>;
+     void set_completion_callback(completion_callback cb);
 diff --git a/common/log.h b/common/log.h
 index 45d82f4dd..3d9b848c9 100644
 --- a/common/log.h
@@ -12450,10 +12531,10 @@ index 8449cdbaf..362cda14b 100644
  
  if(LLAMA_TOOLS_INSTALL)
 diff --git a/tools/cli/cli-context.cpp b/tools/cli/cli-context.cpp
-index 3d801b73d..a638e328a 100644
+index 3d801b73d..f1b7808f3 100644
 --- a/tools/cli/cli-context.cpp
 +++ b/tools/cli/cli-context.cpp
-@@ -11,11 +11,18 @@
+@@ -11,6 +11,7 @@
  
  #include <algorithm>
  #include <cctype>
@@ -12461,61 +12542,79 @@ index 3d801b73d..a638e328a 100644
  #include <filesystem>
  #include <fstream>
  #include <map>
- #include <set>
+@@ -478,11 +479,12 @@ int cli_context::run() {
  
-+#if defined(_WIN32)
-+#    include <io.h>
-+#else
-+#    include <unistd.h>
-+#endif
-+
- using json = nlohmann::ordered_json;
+     while (true) {
+         std::string buffer;
++        bool eof = false;
+         {
+             ui::user_turn user_turn;
  
- struct cli_context_impl {
-@@ -461,6 +468,23 @@ int cli_context::run() {
-     // interactive loop
-     std::string cur_msg;
- 
-+    // Whether stdin is an interactive terminal, checked once up front rather
-+    // than detected reactively via feof(stdin) inside the loop below. Reactive
-+    // EOF detection is not portable: readline_advanced()'s Windows path
-+    // (ReadConsoleInputW) hits its own end_of_stream condition on redirected
-+    // input without ever setting the C stdin EOF flag, so a feof(stdin) check
-+    // silently fails to catch it there even though it works on the
-+    // getwchar()-based POSIX path. Checking isatty() once up front is
-+    // portable across both and avoids the discrepancy entirely: a redirected/
-+    // piped/non-interactive stdin should never have entered "wait for the
-+    // next interactive turn" in the first place, independent of how or when
-+    // the underlying platform surfaces EOF.
-+#if defined(_WIN32)
-+    const bool stdin_is_interactive = _isatty(_fileno(stdin)) != 0;
-+#else
-+    const bool stdin_is_interactive = isatty(fileno(stdin)) != 0;
-+#endif
-+
-     auto add_text_file = [&](const std::string & fname) -> bool {
-         std::ifstream file(fname, std::ios::binary);
-         if (!file) {
-@@ -508,8 +532,18 @@ int cli_context::run() {
+             if (params.prompt.empty()) {
+-                buffer = user_turn.read_input(params.multiline_input);
++                buffer = user_turn.read_input(params.multiline_input, nullptr, &eof);
+             } else {
+                 // process input prompt from args
+                 for (auto & fname : params.image) {
+@@ -508,8 +510,20 @@ int cli_context::run() {
              buffer.pop_back();
          }
  
 -        // skip empty messages
-+        // skip empty messages -- unless stdin isn't interactive, in which case
-+        // there is no "next turn" coming and continuing would spin this loop
-+        // at 100% CPU rewriting the prompt forever (read_input() returns an
-+        // empty buffer instantly and permanently once a piped/redirected
-+        // stdin hits EOF). Observed running any single-shot -p invocation
-+        // (e.g. model-rerun.py, or any script capturing output via a pipe)
-+        // through llama-cli, previously untested since llama-cli was never
-+        // buildable under GGML_TSAVORITE before this sync.
++        // skip empty messages -- unless we've genuinely hit end-of-input, in
++        // which case there is no "next turn" coming and continuing would spin
++        // this loop at 100% CPU rewriting the prompt forever. eof is tracked
++        // separately from the input text itself (see console::readline), so
++        // an ordinary blank line -- interactively, or a blank line embedded
++        // in piped input -- correctly keeps reading instead of being confused
++        // for the stream actually ending. Observed running any single-shot -p
++        // invocation (e.g. model-rerun.py, or any script capturing output via
++        // a pipe) through llama-cli, previously untested since llama-cli was
++        // never buildable under GGML_TSAVORITE before this sync.
          if (buffer.empty()) {
-+            if (!stdin_is_interactive) {
++            if (eof) {
 +                break;
 +            }
              continue;
          }
  
+diff --git a/tools/cli/cli-ui.h b/tools/cli/cli-ui.h
+index 43aaba6f8..8e4e0d333 100644
+--- a/tools/cli/cli-ui.h
++++ b/tools/cli/cli-ui.h
+@@ -163,18 +163,30 @@ namespace ui {
+                 console::log("\n> %s\n", buffer.c_str());
+             }
+         }
+-        std::string read_input(bool multiline_input, const char * prompt = nullptr) {
++        // eof, when non-null, is set to true only on genuine end-of-input --
++        // never for an ordinary blank line (see console::readline).
++        std::string read_input(bool multiline_input, const char * prompt = nullptr, bool * eof = nullptr) {
+             if (prompt) {
+                 console::log("%s", prompt);
+             } else {
+                 console::log("\n> ");
+             }
++            if (eof) {
++                *eof = false;
++            }
+             std::string buffer;
+             std::string line;
+             bool another_line = true;
+             do {
+-                another_line = console::readline(line, multiline_input);
++                bool line_eof = false;
++                another_line = console::readline(line, multiline_input, &line_eof);
+                 buffer += line;
++                if (line_eof) {
++                    if (eof) {
++                        *eof = true;
++                    }
++                    break;
++                }
+             } while (another_line);
+             return buffer;
+         }
 diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
 index dcdb6aeac..667e41c54 100644
 --- a/tools/cli/cli.cpp
