@@ -2459,7 +2459,7 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
 // leading to use-after-finalize on teardown. See tools/completion/
 // completion.cpp and tools/server/server.cpp for the RAII-guard pattern
 // that enforces this ordering on every return path.
-void ggml_backend_cleanup()
+void ggml_backend_cleanup(void)
 {
     #ifdef GGML_TSAVORITE
         tsi_cleanup();
