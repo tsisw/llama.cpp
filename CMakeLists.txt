@@ -79,6 +79,18 @@ if (GGML_TSAVORITE)
        set (GGML_TSI_KERNEL_DIR ${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/${GGML_TSAVORITE_TARGET})
     endif()
 
+    # Resolved once, ahead of the fpga/posix branch below, so both the linker's
+    # -L/-rpath-link paths and the compiler's include_directories() below always
+    # point at the same toolbox install (same TOOLBOX_DIR override, if any) --
+    # otherwise a non-default TOOLBOX_DIR would link against one toolbox build
+    # while compiling against another's headers.
+    if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
+        set(TSAVORITE_TOOLBOX_ROOT "${TOOLBOX_DIR}")
+    elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
+        set(TSAVORITE_TOOLBOX_ROOT "$ENV{TOOLBOX_DIR}")
+    else()
+        set(TSAVORITE_TOOLBOX_ROOT "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}")
+    endif()
 
     if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
         set(CMAKE_CROSSCOMPILING ON)
@@ -97,14 +109,10 @@ if (GGML_TSAVORITE)
         # README.md's manual flow `export`s TOOLBOX_DIR before invoking cmake (it's
         # never passed as -DTOOLBOX_DIR to this particular cmake call, only to the
         # separate ggml-tsi-kernel blob build), so prefer that env var when present
-        # and only fall back to deriving it from MLIR_COMPILER_DIR otherwise.
-        if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
-            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${TOOLBOX_DIR}/lib")
-        elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
-            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "$ENV{TOOLBOX_DIR}/lib")
-        else()
-            set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/lib")
-        endif()
+        # and only fall back to deriving it from MLIR_COMPILER_DIR otherwise. Uses
+        # TSAVORITE_TOOLBOX_ROOT (set above) so this always matches the toolbox
+        # root the include_directories() call below compiles against.
+        set(TSAVORITE_FPGA_TOOLBOX_LIB_DIR "${TSAVORITE_TOOLBOX_ROOT}/lib")
         add_link_options(
             "-L${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}" "-Wl,-rpath-link,${TSAVORITE_FPGA_TOOLBOX_LIB_DIR}"
             "-L${RUNTIME_DIR}/lib" "-Wl,-rpath-link,${RUNTIME_DIR}/lib"
@@ -121,7 +129,7 @@ if (GGML_TSAVORITE)
     include_directories(${TSAVORITE_INCLUDE_DIR})
     include_directories(${MLIR_COMPILER_DIR}/include/tsi-rt/shim)
     include_directories(${RUNTIME_DIR}/include)
-    include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/include)
+    include_directories(${TSAVORITE_TOOLBOX_ROOT}/include)
     message("tsavorite backend is enabled")
 endif()
 
