@@ -60,10 +60,10 @@ index e69de29bb..ff1b6feda 100644
 +	path = ggml-tsi-kernel
 +	url = git@github.com:tsisw/ggml-tsi-kernel.git
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b2092d12d..3e6d0e12f 100644
+index b2092d12d..e0acd34a9 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -25,6 +25,114 @@ message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
+@@ -25,6 +25,117 @@ message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
  #set(CMAKE_WARN_DEPRECATED YES)
  set(CMAKE_WARN_UNUSED_CLI YES)
  
@@ -125,13 +125,16 @@ index b2092d12d..3e6d0e12f 100644
 +    # -L/-rpath-link paths and the compiler's include_directories() below always
 +    # point at the same toolbox install (same TOOLBOX_DIR override, if any) --
 +    # otherwise a non-default TOOLBOX_DIR would link against one toolbox build
-+    # while compiling against another's headers.
++    # while compiling against another's headers. Normalized to an absolute
++    # path: a relative TOOLBOX_DIR would otherwise resolve against whatever
++    # directory the compiler/linker each happen to run from, which need not
++    # match CMAKE_SOURCE_DIR.
 +    if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
-+        set(TSAVORITE_TOOLBOX_ROOT "${TOOLBOX_DIR}")
++        get_filename_component(TSAVORITE_TOOLBOX_ROOT "${TOOLBOX_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
 +    elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
-+        set(TSAVORITE_TOOLBOX_ROOT "$ENV{TOOLBOX_DIR}")
++        get_filename_component(TSAVORITE_TOOLBOX_ROOT "$ENV{TOOLBOX_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
 +    else()
-+        set(TSAVORITE_TOOLBOX_ROOT "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}")
++        get_filename_component(TSAVORITE_TOOLBOX_ROOT "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
 +    endif()
 +
 +    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
@@ -178,7 +181,7 @@ index b2092d12d..3e6d0e12f 100644
  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
  
  if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
-@@ -34,6 +142,13 @@ endif()
+@@ -34,6 +145,13 @@ endif()
  
  message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
  
@@ -192,7 +195,7 @@ index b2092d12d..3e6d0e12f 100644
  # Add path to modules
  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
  
-@@ -229,7 +344,15 @@ if (LLAMA_BUILD_COMMON)
+@@ -229,7 +347,15 @@ if (LLAMA_BUILD_COMMON)
      add_subdirectory(vendor/cpp-httplib)
  endif()
  
