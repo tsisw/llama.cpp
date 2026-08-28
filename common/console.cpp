@@ -750,7 +750,7 @@ namespace console {
         }
     } history;
 
-    static bool readline_advanced(std::string & line, bool multiline_input) {
+    static bool readline_advanced(std::string & line, bool multiline_input, bool * eof) {
         if (out != stdout) {
             fflush(stdout);
         }
@@ -1040,15 +1040,24 @@ namespace console {
         }
 
         fflush(out);
+        if (eof) {
+            *eof = end_of_stream;
+        }
         return has_more;
     }
 
-    static bool readline_simple(std::string & line, bool multiline_input) {
+    static bool readline_simple(std::string & line, bool multiline_input, bool * eof) {
+        if (eof) {
+            *eof = false;
+        }
 #if defined(_WIN32)
         std::wstring wline;
         if (!std::getline(std::wcin, wline)) {
             // Input stream is bad or EOF received
             line.clear();
+            if (eof) {
+                *eof = true;
+            }
             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
             return false;
         }
@@ -1060,6 +1069,9 @@ namespace console {
         if (!std::getline(std::cin, line)) {
             // Input stream is bad or EOF received
             line.clear();
+            if (eof) {
+                *eof = true;
+            }
             return false;
         }
 #endif
@@ -1080,11 +1092,11 @@ namespace console {
         return multiline_input;
     }
 
-    bool readline(std::string & line, bool multiline_input) {
+    bool readline(std::string & line, bool multiline_input, bool * eof) {
         if (simple_io) {
-            return readline_simple(line, multiline_input);
+            return readline_simple(line, multiline_input, eof);
         }
-        return readline_advanced(line, multiline_input);
+        return readline_advanced(line, multiline_input, eof);
     }
 
     void set_completion_callback(completion_callback cb) {
