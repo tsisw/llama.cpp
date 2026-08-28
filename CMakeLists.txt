@@ -83,13 +83,16 @@ if (GGML_TSAVORITE)
     # -L/-rpath-link paths and the compiler's include_directories() below always
     # point at the same toolbox install (same TOOLBOX_DIR override, if any) --
     # otherwise a non-default TOOLBOX_DIR would link against one toolbox build
-    # while compiling against another's headers.
+    # while compiling against another's headers. Normalized to an absolute
+    # path: a relative TOOLBOX_DIR would otherwise resolve against whatever
+    # directory the compiler/linker each happen to run from, which need not
+    # match CMAKE_SOURCE_DIR.
     if (DEFINED TOOLBOX_DIR AND NOT "${TOOLBOX_DIR}" STREQUAL "")
-        set(TSAVORITE_TOOLBOX_ROOT "${TOOLBOX_DIR}")
+        get_filename_component(TSAVORITE_TOOLBOX_ROOT "${TOOLBOX_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
     elseif (DEFINED ENV{TOOLBOX_DIR} AND NOT "$ENV{TOOLBOX_DIR}" STREQUAL "")
-        set(TSAVORITE_TOOLBOX_ROOT "$ENV{TOOLBOX_DIR}")
+        get_filename_component(TSAVORITE_TOOLBOX_ROOT "$ENV{TOOLBOX_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
     else()
-        set(TSAVORITE_TOOLBOX_ROOT "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}")
+        get_filename_component(TSAVORITE_TOOLBOX_ROOT "${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
     endif()
 
     if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
