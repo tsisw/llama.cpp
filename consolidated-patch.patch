@@ -2598,7 +2598,7 @@ index 000000000..76f14fc5f
 +}
 +#endif
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 5cb49d0ee..a6421a739 100644
+index 5cb49d0ee..20e718663 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -355,6 +355,14 @@ extern "C" {
@@ -2677,7 +2677,7 @@ index 5cb49d0ee..a6421a739 100644
 +const char * ggml_backend_type(enum ggml_compute_backend_type backend);
 +
 +#endif /* GML_PERF-related flags */
-+GGML_API void ggml_backend_cleanup();
++GGML_API void ggml_backend_cleanup(void);
 +
  #ifdef  __cplusplus
  }
@@ -2760,7 +2760,7 @@ index e59594670..325c64f88 100644
      ggml_backend_load_best("sycl", silent, dir_path);
      ggml_backend_load_best("vulkan", silent, dir_path);
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..a460925e6 100644
+index f6fb91798..c083434a6 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -27,6 +27,10 @@
@@ -2836,7 +2836,7 @@ index f6fb91798..a460925e6 100644
 +// leading to use-after-finalize on teardown. See tools/completion/
 +// completion.cpp and tools/server/server.cpp for the RAII-guard pattern
 +// that enforces this ordering on every return path.
-+void ggml_backend_cleanup()
++void ggml_backend_cleanup(void)
 +{
 +    #ifdef GGML_TSAVORITE
 +        tsi_cleanup();
