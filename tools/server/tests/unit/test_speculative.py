@@ -5,15 +5,16 @@ from utils import *
 
 server = ServerPreset.stories15m_moe()
 
-MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf"
+MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
 
 def create_server():
     global server
     server = ServerPreset.stories15m_moe()
     # set default values
     server.model_draft = download_file(MODEL_DRAFT_FILE_URL)
-    server.draft_min = 4
-    server.draft_max = 8
+    server.spec_type = "draft-simple"
+    server.spec_draft_n_min = 4
+    server.spec_draft_n_max = 8
     server.fa = "off"
 
 
@@ -24,29 +25,32 @@ def fixture_create_server():
 
 def test_with_and_without_draft():
     global server
-    server.model_draft = None  # disable draft model
-    server.start()
-    res = server.make_request("POST", "/completion", data={
+    request = {
         "prompt": "I believe the meaning of life is",
-        "temperature": 0.0,
-        "top_k": 1,
-    })
+        "temperature": 0.2,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 16,
+        "return_tokens": True,
+    }
+
+    server.model_draft = None  # disable draft model
+    server.spec_type = None
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
-    content_no_draft = res.body["content"]
+    tokens_no_draft = res.body["tokens"]
     server.stop()
 
     # create new server with draft model
     create_server()
     server.start()
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "I believe the meaning of life is",
-        "temperature": 0.0,
-        "top_k": 1,
-    })
+    res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
-    content_draft = res.body["content"]
+    assert res.body["timings"]["draft_n"] > 0
+    tokens_draft = res.body["tokens"]
 
-    assert content_no_draft == content_draft
+    assert tokens_no_draft == tokens_draft
 
 
 def test_different_draft_min_draft_max():
@@ -61,13 +65,14 @@ def test_different_draft_min_draft_max():
     last_content = None
     for draft_min, draft_max in test_values:
         server.stop()
-        server.draft_min = draft_min
-        server.draft_max = draft_max
+        server.spec_draft_n_min = draft_min
+        server.spec_draft_n_max = draft_max
         server.start()
         res = server.make_request("POST", "/completion", data={
             "prompt": "I believe the meaning of life is",
             "temperature": 0.0,
             "top_k": 1,
+            "n_predict": 16,
         })
         assert res.status_code == 200
         if last_content is not None:
@@ -77,10 +82,10 @@ def test_different_draft_min_draft_max():
 
 def test_slot_ctx_not_exceeded():
     global server
-    server.n_ctx = 64
+    server.n_ctx = 256
     server.start()
     res = server.make_request("POST", "/completion", data={
-        "prompt": "Hello " * 56,
+        "prompt": "Hello " * 248,
         "temperature": 0.0,
         "top_k": 1,
         "speculative.p_min": 0.0,
@@ -91,19 +96,19 @@ def test_slot_ctx_not_exceeded():
 
 def test_with_ctx_shift():
     global server
-    server.n_ctx = 64
+    server.n_ctx = 256
     server.enable_ctx_shift = True
     server.start()
     res = server.make_request("POST", "/completion", data={
-        "prompt": "Hello " * 56,
+        "prompt": "Hello " * 248,
         "temperature": 0.0,
         "top_k": 1,
-        "n_predict": 64,
+        "n_predict": 256,
         "speculative.p_min": 0.0,
     })
     assert res.status_code == 200
     assert len(res.body["content"]) > 0
-    assert res.body["tokens_predicted"] == 64
+    assert res.body["tokens_predicted"] == 256
     assert res.body["truncated"] == True
 
 

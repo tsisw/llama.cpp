@@ -420,4 +420,3 @@ int matmul_tsi_test(int argc, char **argv) {
 }
 
 #endif // MAT_MUL_TSI_TEST_CASE_CPP
-

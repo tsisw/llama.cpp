@@ -487,22 +487,22 @@ static struct ggml_cgraph * build_graph(const simple_model& model, enum ggml_tsa
     struct ggml_tensor * result;
     switch(ops_type) {
 	    case GGML_TSAVORITE_KERNEL_TYPE_ADD:
-    		result = ggml_add(ctx0, model.a, model.b);
+		result = ggml_add(ctx0, model.a, model.b);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_SUB:
-    		result = ggml_sub(ctx0, model.a, model.b);
+		result = ggml_sub(ctx0, model.a, model.b);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_MULT:
-    		result = ggml_mul(ctx0, model.a, model.b);
+		result = ggml_mul(ctx0, model.a, model.b);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_DIV:
-    		result = ggml_div(ctx0, model.a, model.b);
+		result = ggml_div(ctx0, model.a, model.b);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_SQRT:
-    		result = ggml_sqrt(ctx0, model.a);
+		result = ggml_sqrt(ctx0, model.a);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_SQR:
-    		result = ggml_sqr(ctx0, model.a);
+		result = ggml_sqr(ctx0, model.a);
 		break;
 	    case GGML_TSAVORITE_KERNEL_TYPE_NEG:
                 result = ggml_neg(ctx0, model.a);
@@ -523,8 +523,8 @@ static struct ggml_cgraph * build_graph(const simple_model& model, enum ggml_tsa
                 result = ggml_silu(ctx0, model.a);
 		break;
 	     default:
-    		ggml_free(ctx0);
-    		fprintf(stderr, "\n Non Supported Operation \n");
+		ggml_free(ctx0);
+		fprintf(stderr, "\n Non Supported Operation \n");
 		return NULL;
     }
     // build operations nodes
@@ -549,7 +549,11 @@ static struct ggml_tensor * compute(const simple_model & model, ggml_gallocr_t a
     // allocate tensors
     ggml_gallocr_alloc_graph(allocr, gf);
 
-    ggml_backend_graph_compute(model.backend, gf);
+    enum ggml_status status = ggml_backend_graph_compute(model.backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "\ncompute failed: backend graph compute returned status=%d\n", (int)status);
+        return NULL;
+    }
 
     // in this case, the output tensor is the last one in the graph
     return ggml_graph_node(gf, -1);
@@ -581,8 +585,8 @@ enum ggml_tsavorite_kernel_type convert_testcase_to_ops_type (const char *testCa
         else if (!strcmp(testCase,"silu"))
             return GGML_TSAVORITE_KERNEL_TYPE_SILU;
 
-    	fprintf(stderr, "\n un-supported test case %s hence running default test case which is add operation  \n", testCase);
-	return GGML_TSAVORITE_KERNEL_TYPE_ADD;
+	fprintf(stderr, "\n unrecognized test case '%s' -- rejecting rather than silently running 'add'\n", testCase);
+	exit(1);
 }
 
 const char* convert_ops_type_to_testcase(enum ggml_tsavorite_kernel_type ops_type) {
@@ -626,9 +630,13 @@ int main(int argc, char *argv[]) {
     bool test_case_flag = true;
     enum ggml_tsavorite_kernel_type ops_type;
     simple_model model;
-    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
-    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT];
+    float *input1[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
+    // Unary ops never assign input2[ops_type] below (num_of_input_tensors ==
+    // NUM_INPUT_URINARY_TENSORS skips it in both branches), but it's still
+    // passed unconditionally to load_model() -- zero-init so unary ops pass
+    // nullptr instead of an indeterminate pointer.
+    float *input2[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
+    float *result_data[GGML_TSAVORITE_KERNEL_TYPE_COUNT] = {};
     bool data_scale = false;
 
     int elements_A=0, elements_B=0;
@@ -641,12 +649,12 @@ int main(int argc, char *argv[]) {
             return matmul_tsi_test(argc, argv);
         }
 
-    	ops_type = convert_testcase_to_ops_type(argv[1]);
+	ops_type = convert_testcase_to_ops_type(argv[1]);
 	if (argc > 2 && !strcmp(argv[2], "scale"))
 		data_scale = true;
     } else {
 	// Default Case
-    	ops_type = convert_testcase_to_ops_type("add");
+	ops_type = convert_testcase_to_ops_type("add");
     }
     if (ops_type == GGML_TSAVORITE_KERNEL_TYPE_SQRT ||
 		    ops_type == GGML_TSAVORITE_KERNEL_TYPE_SQR ||
@@ -690,14 +698,14 @@ int main(int argc, char *argv[]) {
     allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
 
     if (!allocr) {
-    	fprintf(stderr, "\n\n TEST CASE FAILED \n\n");
+	fprintf(stderr, "\n\n TEST CASE FAILED \n\n");
 	return -1;
     }
 
     // create the worst case graph for memory usage estimation
     struct ggml_cgraph * gf = build_graph(model, ops_type);
     if (!gf) {
-    	fprintf(stderr, "\n\n TEST CASE FAILED \n\n");
+	fprintf(stderr, "\n\n TEST CASE FAILED \n\n");
 	return -1;
     }
     ggml_gallocr_reserve(allocr, gf);
@@ -735,7 +743,7 @@ int main(int argc, char *argv[]) {
 		continue;
 	}
 	test_case_flag = false;
-    	fprintf(stderr, "\n result for index %d is not matching expected %f got %f \n", i, result_data[ops_type][i], out_data[i]);
+	fprintf(stderr, "\n result for index %d is not matching expected %f got %f \n", i, result_data[ops_type][i], out_data[i]);
     }
 
     if (test_case_flag == false) {

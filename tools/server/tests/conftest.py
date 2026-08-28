@@ -13,3 +13,9 @@ def stop_server_after_each_test():
     )  # copy the set to prevent 'Set changed size during iteration'
     for server in instances:
         server.stop()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def load_server_presets():
+    # this will be run once per test session, before any tests
+    ServerPreset.load_all()

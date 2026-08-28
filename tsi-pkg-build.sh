@@ -166,6 +166,23 @@
 # clean : rm -rf build-* (llama.cpp) and kernel build dirs in ggml-tsi-kernel
 # clean-all : clean + remove python venv blob-creation
 #
+# Consolidated Tsavorite patch (see JIRA-2258 for background):
+#   On every run, this script applies consolidated-patch.patch automatically
+#   the first time it detects an unpatched upstream vendor checkout
+#   (ggml-tsavorite.cpp missing), then never again -- same idempotent,
+#   one-time pattern as the blob-creation venv setup. Day-to-day development
+#   (editing ggml-tsavorite.cpp, llama-context.cpp, etc.) never touches this
+#   patch machinery: git add/commit/push those files normally.
+#
+# no-apply-patch : skip the automatic consolidated-patch.patch apply check
+#                  for this run (rarely needed; mainly for debugging the
+#                  apply step itself)
+# regenerate-patch : maintenance action for preparing the *next* upstream
+#                  sync -- regenerates consolidated-patch.patch from
+#                  UPSTREAM_BASE_COMMIT to current HEAD. See the doc comment
+#                  above do_regenerate_patch() in this file for the full
+#                  next-sync workflow.
+#
 # Coverage:
 # enable_coverage : adds -DENABLE_COVERAGE=ON
 #
@@ -260,6 +277,18 @@ export SDK_VERSION
 __TSI_SOURCED=0
 (return 0 2>/dev/null) && __TSI_SOURCED=1
 __TSI_OLD_SET="$(set +o)"
+# NOTE: do NOT put a global `set -e` here. Verified empirically: when this
+# script is sourced, an ordinary command failure anywhere (not just a `die()`
+# call) trips errexit, which terminates the CALLER'S shell outright rather
+# than just unwinding this script -- and does so without running cleanup(),
+# since only a RETURN trap is registered for the sourced case (line ~1813),
+# and an errexit-triggered process exit never fires a RETURN trap (only an
+# EXIT trap would, and that's only registered for the non-sourced/exec case).
+# The narrower problem this was meant to fix -- `cmd || die "msg"` not
+# aborting the whole call chain when die() returns 1 instead of exiting --
+# is a real but much lower-severity gap than "sourcing this can kill your
+# terminal"; leaving it as a known follow-up rather than reintroducing global
+# errexit to patch it.
 __TSI_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 __TSI_SCRIPT_DIR="$(cd "$(dirname "${__TSI_SCRIPT_PATH}")" 2>/dev/null && pwd)"
 
@@ -351,6 +380,64 @@ submodule_self_heal_if_needed() {
   return 0
 }
 
+# -------------------------
+# Consolidated Tsavorite patch (see "CONSOLIDATED PATCH WORKFLOW" docs at
+# the top of this file for the full explanation of why this exists)
+# -------------------------
+apply_consolidated_patch() {
+  if [ "${SKIP_PATCH_APPLY}" -eq 1 ]; then
+    log_info "no-apply-patch: skipping consolidated-patch.patch check"
+    return 0
+  fi
+
+  # Idempotency check: look at the actual tree content, not a marker file.
+  # A marker file can go stale (e.g. someone manually reverts Tsavorite
+  # changes but forgets to remove the marker); checking for real,
+  # substantial Tsavorite content that only exists once the patch has
+  # actually been applied is self-verifying instead.
+  if [ -f "ggml/src/ggml-tsavorite/ggml-tsavorite.cpp" ]; then
+    log_info "consolidated-patch.patch already applied (ggml-tsavorite.cpp present), skipping"
+    return 0
+  fi
+
+  log_info "Tsavorite content not found -- this looks like a fresh upstream" \
+           "vendor checkout. Applying consolidated-patch.patch..."
+
+  [ -f "consolidated-patch.patch" ] || die \
+    "ggml-tsavorite.cpp is missing AND consolidated-patch.patch is missing." \
+    "Cannot bootstrap a fresh vendor checkout without it. If you intended to" \
+    "build an already-patched tree, something is wrong with this checkout;" \
+    "if you intended to bootstrap a fresh one, restore consolidated-patch.patch" \
+    "(and this script itself, since it can't run at all without existing first --" \
+    "see 'CONSOLIDATED PATCH WORKFLOW' docs above for the one manual step" \
+    "needed before this script exists in the tree to help)."
+
+  run git apply --check consolidated-patch.patch || die \
+    "consolidated-patch.patch does not apply cleanly to this checkout." \
+    "This usually means the checkout isn't actually at the exact upstream" \
+    "commit the patch was built against (see the header comment in" \
+    "consolidated-patch.patch, or this script's own git history, for which" \
+    "commit that is). Resolve the conflict manually; this script will not" \
+    "attempt a partial/forced apply."
+
+  run git apply consolidated-patch.patch || return 1
+
+  # A plain patch file can't carry a gitlink (submodule pointer) -- git
+  # apply silently creates an empty directory at that path instead. Stage
+  # it as a real gitlink explicitly. This exact SHA must be kept in sync
+  # with whatever ggml-tsi-kernel commit the patch was actually built
+  # against; if that ever changes, update it here too.
+  if [ -d "ggml-tsi-kernel" ] && [ ! -e "ggml-tsi-kernel/.git" ]; then
+    run git update-index --add --cacheinfo \
+      160000,067617c71b51af6aa5a1f7ea4c340a7e66784659,ggml-tsi-kernel || return 1
+    log_info "registered ggml-tsi-kernel gitlink -- run 'git submodule update --init'" \
+             "next to actually populate it before building"
+  fi
+
+  log_info "consolidated-patch.patch applied successfully."
+  return 0
+}
+
 ensure_submodules() {
   local want_update="$1" # 0/1 from user flag
   local force=0
@@ -397,6 +484,10 @@ parse_args() {
   TOOLBOX_DIR_IN=""
   ENABLE_COVERAGE_FLAG=""
 
+  # consolidated Tsavorite patch (see apply_consolidated_patch() /
+  # "CONSOLIDATED PATCH WORKFLOW" docs above for the full explanation)
+  SKIP_PATCH_APPLY=0
+
   # submodules
   GIT_SUBMODULE_PULL=0
 
@@ -420,6 +511,9 @@ parse_args() {
   # cleanup
   DO_CLEAN=0
   DO_CLEAN_ALL=0
+
+  # regenerate consolidated-patch.patch (next-sync maintenance action)
+  DO_REGENERATE_PATCH=0
 
   # cleaning build dirs before build (default ON)
   DO_CLEAN_BUILD_DIRS=1
@@ -527,6 +621,10 @@ parse_args() {
         OVERWRITE_VENV=1
         log_info "overwrite-venv detected"
         ;;
+      no-apply-patch)
+        SKIP_PATCH_APPLY=1
+        log_info "no-apply-patch detected: will not check/apply consolidated-patch.patch"
+        ;;
       no-auto-blobs)
         AUTO_BLOBS=0
         log_info "no-auto-blobs detected"
@@ -616,6 +714,10 @@ parse_args() {
       clean-all)
         DO_CLEAN_ALL=1
         log_info "clean-all selected"
+        ;;
+      regenerate-patch)
+        DO_REGENERATE_PATCH=1
+        log_info "regenerate-patch selected"
         ;;
       *)
         # positional paths
@@ -977,7 +1079,14 @@ build_posix_impl() {
   # only one of them being explicit about which toolbox flavor it needs.
   resolve_toolbox_dir_for_target posix || return 1
 
-  local common="-DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DGGML_NATIVE=ON -DGGML_AMX_TILE=OFF -DGGML_AMX_INT8=OFF -DGGML_AMX_BF16=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF"
+  # LLAMA_BUILD_APP=OFF: upstream's unified "llama" app binary (added since our
+  # last sync) links unconditionally against every tool's "-impl" library
+  # (server/cli/bench/quantize/...), including ones our GGML_TSAVORITE guards
+  # in tools/CMakeLists.txt intentionally skip building -- leaving those
+  # libraries undefined and the link failing. Disabling the app entirely
+  # matches this fork's existing pattern of skipping non-essential tooling
+  # for Tsavorite builds.
+  local common="-DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix -DGGML_NATIVE=ON -DGGML_AMX_TILE=OFF -DGGML_AMX_INT8=OFF -DGGML_AMX_BF16=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF -DLLAMA_BUILD_APP=OFF"
 
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
@@ -1022,15 +1131,15 @@ EOL
     chmod +x "${build_dir}/bin/simple-backend-tsi" || return 1
   fi
 
-  if [ -f "${build_dir}/bin/llama-cli" ] && [ ! -f "${build_dir}/bin/llama-cli-original" ]; then
-    mv "${build_dir}/bin/llama-cli" "${build_dir}/bin/llama-cli-original" || return 1
-    cat > "${build_dir}/bin/llama-cli" <<'EOL'
+  if [ -f "${build_dir}/bin/llama-completion" ] && [ ! -f "${build_dir}/bin/llama-completion-original" ]; then
+    mv "${build_dir}/bin/llama-completion" "${build_dir}/bin/llama-completion-original" || return 1
+    cat > "${build_dir}/bin/llama-completion" <<'EOL'
 #!/bin/bash
 export LD_LIBRARY_PATH="__HOST_GCC_LIB64__:$LD_LIBRARY_PATH"
-exec "$(dirname "$0")/llama-cli-original" "$@"
+exec "$(dirname "$0")/llama-completion-original" "$@"
 EOL
-    sed -i "s|__HOST_GCC_LIB64__|${HOST_GCC_DIR}/lib64|g" "${build_dir}/bin/llama-cli" || return 1
-    chmod +x "${build_dir}/bin/llama-cli" || return 1
+    sed -i "s|__HOST_GCC_LIB64__|${HOST_GCC_DIR}/lib64|g" "${build_dir}/bin/llama-completion" || return 1
+    chmod +x "${build_dir}/bin/llama-completion" || return 1
   fi
 
   return 0
@@ -1057,6 +1166,20 @@ build_fpga_impl() {
 
   local ARM_TOOLCHAIN_FILE="${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake"
   local FPGA_TOOLBOX_LIB_DIR="${TOOLBOX_DIR}/lib"
+  # Same RUNTIME_DIR formula as the top-level CMakeLists.txt uses for TLIBS
+  # (file(GLOB TLIBS "${RUNTIME_DIR}/lib/*.so" ...)). ggml-tsavorite.cpp's own
+  # shared library links these directly and resolves fine, but upstream split
+  # `common` from a static library (which used to transitively propagate this
+  # path to every final executable's own link command "for free") into a
+  # shared llama-common -- so downstream executables/tests now need this path
+  # explicitly too, to resolve transitively-needed tsi_* symbols at their own
+  # link step. Without it: "undefined reference to tsi_alloc" etc. on any
+  # target that links llama-common, not just the ones with hand-added flags.
+  # Keyed by the BUILD HOST's arch (matches CMakeLists.txt's own MLIR_SDK_ARCH,
+  # which is likewise derived from `uname -m`, not the FPGA cross-compile
+  # target's arch) -- a hardcoded "x86_64" here breaks on an aarch64 build host.
+  local host_arch; host_arch="$(select_arch)" || return $?
+  local FPGA_RUNTIME_LIB_DIR="/proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${host_arch}/fpga/runtime/lib"
 
   local supported=""
   [ "${want_tmu}" -eq 1 ] && supported="${supported} -DTMU_SUPPORTED"
@@ -1066,11 +1189,11 @@ build_fpga_impl() {
 
   run cmake -B "${build_dir}" \
     -DCMAKE_TOOLCHAIN_FILE="${ARM_TOOLCHAIN_FILE}" \
-    -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DLLAMA_CURL=OFF \
+    -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga -DLLAMA_CURL=OFF -DLLAMA_BUILD_APP=OFF \
     -DCMAKE_C_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
     -DCMAKE_CXX_FLAGS="${PERF_DEF} ${DBG_DEFS} -DGGML_TSAVORITE ${supported} ${triton_defs}" \
--DCMAKE_EXE_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -lomp" \
--DCMAKE_SHARED_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -lomp" \
+-DCMAKE_EXE_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -L${FPGA_RUNTIME_LIB_DIR} -Wl,-rpath-link,${FPGA_RUNTIME_LIB_DIR} -lomp" \
+-DCMAKE_SHARED_LINKER_FLAGS="-L${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath-link,${FPGA_TOOLBOX_LIB_DIR} -Wl,-rpath,${FPGA_TOOLBOX_LIB_DIR} -L${FPGA_RUNTIME_LIB_DIR} -Wl,-rpath-link,${FPGA_RUNTIME_LIB_DIR} -lomp" \
     ${ENABLE_COVERAGE_FLAG} || return 1
 
   run cmake --build "${build_dir}" --config Release || return 1
@@ -1083,14 +1206,14 @@ build_fpga_tmu_disable() { build_fpga_impl "build-fpga-tmu-disable" 0 1; }
 
 choose_existing_fpga_build_dir_for_package() {
   # If user explicitly selected a package build dir, prefer it.
-  if [ -n "${PACKAGE_FPGA_BUILD_DIR}" ] && [ -f "${PACKAGE_FPGA_BUILD_DIR}/bin/llama-cli" ]; then
+  if [ -n "${PACKAGE_FPGA_BUILD_DIR}" ] && [ -f "${PACKAGE_FPGA_BUILD_DIR}/bin/llama-completion" ]; then
     echo "${PACKAGE_FPGA_BUILD_DIR}"
     return 0
   fi
   # Otherwise, pick the first viable build dir in priority order.
   local d
   for d in build-fpga build-fpga-tmu-only build-fpga-tmu-disable; do
-    if [ -f "${d}/bin/llama-cli" ]; then
+    if [ -f "${d}/bin/llama-completion" ]; then
       echo "${d}"
       return 0
     fi
@@ -1114,7 +1237,7 @@ bundle_fpga() {
 
   TSI_BLOB_INSTALL_DIR="$(pwd)/${GGML_TSI_INSTALL_DIR}/fpga-kernel/build-fpga"
 
-  [ -f "${build_dir}/bin/llama-cli" ] || die "package requested but ${build_dir}/bin/llama-cli not found. Run an FPGA build first."
+  [ -f "${build_dir}/bin/llama-completion" ] || die "package requested but ${build_dir}/bin/llama-completion not found. Run an FPGA build first."
 
   mkdir -p "${TSI_GGML_BUNDLE_INSTALL_DIR}"
   rm -f "${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh"
@@ -1160,7 +1283,8 @@ update_one_tsavorite_deployment_yaml() {
   local advanced_matmul_shape_offload="false"
   local advanced_matmul_broadcast_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
-local user_dram_size_gb="8"
+  local multi_thread_enable="true"
+local user_dram_size_gb="16"
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1168,11 +1292,13 @@ local user_dram_size_gb="8"
     local existing_advanced
     local existing_broadcast
     local existing_small_n_opt
+    local existing_multi_thread_enable
 local existing_user_dram_size_gb
 
     existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
     existing_broadcast="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_broadcast_offload")"
     existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
+    existing_multi_thread_enable="$(extract_deployment_yaml_value "${deployment_yaml_path}" "multi_thread_enable")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
@@ -1184,9 +1310,12 @@ local existing_user_dram_size_gb
     if [ -n "${existing_small_n_opt}" ]; then
       triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
     fi
+    if [ -n "${existing_multi_thread_enable}" ]; then
+      multi_thread_enable="${existing_multi_thread_enable}"
+    fi
   fi
 
-  
+
 existing_user_dram_size_gb="$(
     awk -F: '
     /^[[:space:]]*user_dram_size_gb[[:space:]]*:/ {
@@ -1204,7 +1333,7 @@ fi
 cat > "${deployment_yaml_path}" <<EOF
 # Tsavorite deployment config
 txe_count: ${txe_count}
-multi_thread_enable: true
+multi_thread_enable: ${multi_thread_enable}
 
 ## Runtime user DRAM size in GiB.
 ## Example: 1 = 1GB, 2 = 2GB.
@@ -1229,7 +1358,7 @@ advanced_matmul_broadcast_offload: ${advanced_matmul_broadcast_offload}
 triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}; preserved multi_thread_enable:${multi_thread_enable}, advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}, user_dram_size_gb:${user_dram_size_gb}"
   return 0
 }
 
@@ -1297,7 +1426,7 @@ update_tsavorite_deployment_yaml_from_taos || exit 1
 
 tsi_kernels=(
   "add" "sub" "mult" "div" "abs" "inv" "neg" "sin" "sqrt" "sqr" "sigmoid" "silu" "rms_norm" "swiglu"
-  "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt" "sqr" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16"
+  "add_16" "sub_16" "mult_16" "div_16" "abs_16" "inv_16" "neg_16" "sin_16" "sqrt_16" "sqr_16" "sigmoid_16" "silu_16" "rms_norm_16" "swiglu_16"
   "mul_mat_tile_f32_k32" "mul_mat_tile_f32_k64" "mul_mat_tile_f32_k128"
 )
 
@@ -1332,9 +1461,29 @@ EOL
   chmod +x "./${TSI_GGML_BUNDLE_INSTALL_DIR}/ggml.sh" || return 1
 
   cp "${GGML_TSI_INSTALL_DIR}/fpga/blobs" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" -r || return 1
-  cp "${build_dir}/bin/llama-cli" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
-  cp "${build_dir}/bin/libggml"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
-  cp "${build_dir}/bin/libllama"*.so "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  cp "${build_dir}/bin/llama-completion" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  # llama-cli/llama-server only build when LLAMA_BUILD_SERVER is ON (the
+  # default) -- copy them if present rather than requiring them, since
+  # llama-completion is still the one guaranteed target for this package.
+  for extra_bin in llama-cli llama-server; do
+    if [ -f "${build_dir}/bin/${extra_bin}" ]; then
+      cp "${build_dir}/bin/${extra_bin}" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+    fi
+  done
+  # -P (no-dereference) + "*.so*" (not just "*.so"): upstream's move of `common`
+  # from a static lib to a shared llama-common means these are now real
+  # versioned .so.MAJOR.MINOR.PATCH files behind a two-level SONAME symlink
+  # chain (e.g. libllama-common.so -> libllama-common.so.0 ->
+  # libllama-common.so.0.1.0). Binaries have libllama-common.so.0 baked in as
+  # their SONAME and look it up by that exact name at runtime -- copying only
+  # the bare "*.so" dev-symlink name (dereferenced into a same-named real
+  # file, dropping the ".0" suffix entirely) leaves that lookup unresolvable:
+  # "error while loading shared libraries: libllama-common.so.0: cannot open
+  # shared object file". Preserving the symlink chain as-is (rather than
+  # dereferencing into 3 duplicate copies) is both correct and avoids bloating
+  # the package.
+  cp -P "${build_dir}/bin/libggml"*.so* "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
+  cp -P "${build_dir}/bin/libllama"*.so* "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
   cp "${build_dir}/bin/simple-backend-tsi" "${TSI_GGML_BUNDLE_INSTALL_DIR}/" || return 1
 
 if [ ! -f "./tsavorite-model-deployment.yaml" ]; then
@@ -1365,6 +1514,91 @@ log_info "included ./tsavorite-model-deployment.yaml in FPGA package"
 # -------------------------
 # Cleanup commands
 # -------------------------
+# ============================================================================
+# NEXT-SYNC MAINTENANCE: regenerating consolidated-patch.patch
+# ============================================================================
+# Day-to-day development (e.g. editing ggml-tsavorite.cpp, llama-context.cpp,
+# or any other tracked file) needs NONE of this: just edit, git add, commit,
+# push, open a PR -- exactly like any other file in the repo.
+# consolidated-patch.patch is not involved in normal work at all; it only
+# matters when preparing the *next* upstream sync (the kind of multi-thousand
+# -commit jump JIRA-2258 did). At that point:
+#
+#   1. Before vendoring the new upstream commit, run:
+#        source tsi-pkg-build.sh regenerate-patch
+#      This diffs the commit recorded in UPSTREAM_BASE_COMMIT (the commit
+#      consolidated-patch.patch currently corresponds to) against the current
+#      tsisw HEAD, excluding ggml-tsi-kernel, tsi-pkg-build.sh, and docs/
+#      (PR-evidence directories like docs/jira-2258/ are documentation, not
+#      Tsavorite source -- they don't belong in a patch meant to be re-applied
+#      to a fresh vendor checkout), and overwrites consolidated-patch.patch.
+#      This captures every Tsavorite change merged since the last sync --
+#      including ordinary day-to-day edits landed in between -- not just what
+#      was true back when the patch was last cut.
+#   2. Review the regenerated consolidated-patch.patch like any other diff
+#      before trusting it.
+#   3. Pick the new upstream target commit and vendor it into a fresh
+#      branch/worktree -- do not do this in a working tree you still need for
+#      anything else (see JIRA-2258 for the git-worktree-isolation pattern).
+#   4. Apply the regenerated patch to that fresh vendor checkout
+#      (git apply --check first, then git apply for real). Expect to resolve
+#      real conflicts by hand wherever upstream restructured a file the patch
+#      touches -- this was the bulk of the JIRA-2258 effort and will not be
+#      fully automatable by this script.
+#   5. Re-register the ggml-tsi-kernel gitlink: a plain patch can't carry a
+#      submodule pointer.
+#        git update-index --add --cacheinfo 160000,<sha>,ggml-tsi-kernel
+#   6. Port tsi-pkg-build.sh changes by hand -- it's excluded from the patch
+#      on purpose, since it's a real tracked file, not patch content.
+#   7. Build and test posix and fpga, old vs new, the same way JIRA-2258 did.
+#   8. Update UPSTREAM_BASE_COMMIT to the new upstream target SHA -- this is
+#      what regenerate-patch will diff against next time.
+# ============================================================================
+do_regenerate_patch() {
+  local base_commit
+  local patch_file="consolidated-patch.patch"
+  local base_file="UPSTREAM_BASE_COMMIT"
+
+  [ -f "${base_file}" ] || die "regenerate-patch: ${base_file} not found -- can't determine what to diff against"
+
+  base_commit="$(grep -v '^#' "${base_file}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+  [ -n "${base_commit}" ] || die "regenerate-patch: could not read a commit SHA from ${base_file}"
+
+  git cat-file -e "${base_commit}^{commit}" 2>/dev/null || \
+    die "regenerate-patch: ${base_commit} (from ${base_file}) is not a known commit in this repo -- fetch upstream first"
+
+  # NOTE: docs/build.md carries real Tsavorite-authored content (the "TSI
+  # compilation steps" section) and must stay IN the patch -- do not exclude
+  # docs/ wholesale. Only PR-evidence subdirectories (validation logs/
+  # summaries checked in purely for reviewers, e.g. docs/jira-2258/) should be
+  # excluded. If a future sync adds another such directory under a different
+  # JIRA number, add it to PATCH_EXCLUDE_PATHS below rather than broadening
+  # this to a glob -- a wrong guess here silently drops real doc content from
+  # every future regenerated patch, the way an early version of this function
+  # almost did.
+  local PATCH_EXCLUDE_PATHS=(
+    ':!ggml-tsi-kernel'
+    ':!tsi-pkg-build.sh'
+    ':!docs/jira-2258'
+    ":!${patch_file}"
+    ":!${base_file}"
+  )
+
+  log_info "regenerate-patch: diffing ${base_commit} against current HEAD (excluding: ${PATCH_EXCLUDE_PATHS[*]})"
+
+  run git diff "${base_commit}" HEAD -- . "${PATCH_EXCLUDE_PATHS[@]}" \
+    > "${patch_file}.new" || return 1
+
+  if [ ! -s "${patch_file}.new" ]; then
+    rm -f "${patch_file}.new"
+    die "regenerate-patch: diff came back empty -- check that ${base_file}'s commit is actually the right base"
+  fi
+
+  mv "${patch_file}.new" "${patch_file}"
+  log_info "regenerate-patch: wrote ${patch_file} ($(wc -l < "${patch_file}") lines). Review the diff, then continue with the next-sync steps documented above this function."
+  return 0
+}
+
 do_clean() {
   log_info "clean: removing build directories"
   rm -rf \
@@ -1412,6 +1646,22 @@ main() {
     cd "${ORIG_PWD}" >/dev/null 2>&1 || true
     return 0
   fi
+
+  if [ "${DO_REGENERATE_PATCH}" -eq 1 ]; then
+    do_regenerate_patch
+    local __rc=$?
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return "${__rc}"
+  fi
+
+  # Must run before ensure_submodules(): on a fresh, unpatched upstream
+  # vendor checkout, .gitmodules doesn't have the ggml-tsi-kernel entry at
+  # all yet (that entry is itself part of the patch) -- ensure_submodules()
+  # would have nothing to find/init until this has run.
+  apply_consolidated_patch || {
+    cd "${ORIG_PWD}" >/dev/null 2>&1 || true
+    return 1
+  }
 
   resolve_paths "$arch" || {
     cd "${ORIG_PWD}" >/dev/null 2>&1 || true

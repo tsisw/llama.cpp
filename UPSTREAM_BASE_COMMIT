@@ -1,0 +1,9 @@
+# The upstream ggml-org/llama.cpp commit that consolidated-patch.patch is
+# generated against. consolidated-patch.patch = git diff <this commit>..<tsisw
+# HEAD when it was regenerated>, restricted to Tsavorite-relevant paths.
+#
+# Update this file's SHA every time consolidated-patch.patch is regenerated
+# for a new sync (see "regenerate-patch" in tsi-pkg-build.sh). Keeping this
+# in sync with the patch is what lets the next sync run the regeneration
+# diff correctly instead of guessing which commit to diff against.
+1f368f354d9edcfea9fd6a1e0989b3e7335a050f

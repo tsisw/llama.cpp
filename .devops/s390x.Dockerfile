@@ -1,8 +1,11 @@
 ARG GCC_VERSION=15.2.0
 ARG UBUNTU_VERSION=24.04
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
 
 ### Build Llama.cpp stage
-FROM gcc:${GCC_VERSION} AS build
+FROM docker.io/gcc:${GCC_VERSION} AS build
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -11,7 +14,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt install -y --no-install-recommends \
         git cmake ccache ninja-build \
         # WARNING: Do not use libopenblas-openmp-dev. libopenblas-dev is faster.
-        libopenblas-dev libcurl4-openssl-dev && \
+        libopenblas-dev libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,8 +27,9 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DGGML_BACKEND_DL=OFF \
         -DGGML_NATIVE=OFF \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU_ALL_VARIANTS=ON \
         -DGGML_BLAS=ON \
         -DGGML_BLAS_VENDOR=OpenBLAS && \
     cmake --build build --config Release -j $(nproc) && \
@@ -33,6 +37,7 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 COPY *.py             /opt/llama.cpp/bin
 COPY .devops/tools.sh /opt/llama.cpp/bin
+COPY conversion       /opt/llama.cpp/conversion
 
 COPY gguf-py          /opt/llama.cpp/gguf-py
 COPY requirements.txt /opt/llama.cpp/gguf-py
@@ -43,13 +48,27 @@ COPY requirements     /opt/llama.cpp/gguf-py/requirements
 FROM scratch AS collector
 
 # Copy llama.cpp binaries and libraries
-COPY --from=build /opt/llama.cpp/bin     /llama.cpp/bin
-COPY --from=build /opt/llama.cpp/lib     /llama.cpp/lib
-COPY --from=build /opt/llama.cpp/gguf-py /llama.cpp/gguf-py
+COPY --from=build /opt/llama.cpp/bin        /llama.cpp/bin
+COPY --from=build /opt/llama.cpp/lib        /llama.cpp/lib
+COPY --from=build /opt/llama.cpp/gguf-py    /llama.cpp/gguf-py
+COPY --from=build /opt/llama.cpp/conversion /llama.cpp/conversion
 
 
 ### Base image
-FROM ubuntu:${UBUNTU_VERSION} AS base
+FROM docker.io/ubuntu:${UBUNTU_VERSION} AS base
+
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -90,6 +109,7 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 
 COPY --from=collector /llama.cpp/bin /app
 COPY --from=collector /llama.cpp/gguf-py /app/gguf-py
+COPY --from=collector /llama.cpp/conversion /app/conversion
 
 RUN pip install --no-cache-dir --break-system-packages \
         -r /app/gguf-py/requirements.txt
@@ -103,7 +123,8 @@ FROM base AS light
 WORKDIR /llama.cpp/bin
 
 # Copy llama.cpp binaries and libraries
-COPY --from=collector /llama.cpp/bin/llama-cli /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/*.so /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/llama /llama.cpp/bin/llama-cli /llama.cpp/bin/llama-completion /llama.cpp/bin
 
 ENTRYPOINT [ "/llama.cpp/bin/llama-cli" ]
 
@@ -116,7 +137,8 @@ ENV LLAMA_ARG_HOST=0.0.0.0
 WORKDIR /llama.cpp/bin
 
 # Copy llama.cpp binaries and libraries
-COPY --from=collector /llama.cpp/bin/llama-server /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/*.so /llama.cpp/bin
+COPY --from=collector /llama.cpp/bin/llama /llama.cpp/bin/llama-server /llama.cpp/bin
 
 EXPOSE 8080
 

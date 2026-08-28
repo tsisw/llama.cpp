@@ -6,6 +6,8 @@ llama_add_compile_flags()
 
 # llama
 
+file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
+
 add_library(llama
             ../include/llama.h
             llama.cpp
@@ -22,20 +24,36 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-dsa.cpp
+            llama-kv-cache-msa.cpp
+            llama-kv-cache-dsv4.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
+            llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
-            llama-sampling.cpp
+            llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            ${LLAMA_MODELS_SOURCES}
             )
+
+set_target_properties(llama PROPERTIES
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
+    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
+target_compile_definitions(llama PRIVATE
+    LLAMA_VERSION="${LLAMA_VERSION}"
+    LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
+)
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)

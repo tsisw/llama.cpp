@@ -1,15 +1,26 @@
 # llama.cpp for OpenCL
 
-- [Background](#background)
-- [OS](#os)
-- [Hardware](#hardware)
-- [DataType Supports](#datatype-supports)
-- [Model Preparation](#model-preparation)
-- [CMake Options](#cmake-options)
-- [Android](#android)
-- [Windows 11 Arm64](#windows-11-arm64)
-- [Known Issue](#known-issues)
-- [TODO](#todo)
+- [llama.cpp for OpenCL](#llamacpp-for-opencl)
+  - [Background](#background)
+    - [Llama.cpp + OpenCL](#llamacpp--opencl)
+  - [OS](#os)
+  - [Hardware](#hardware)
+    - [Adreno GPU](#adreno-gpu)
+  - [DataType Supports](#datatype-supports)
+  - [Model Preparation](#model-preparation)
+  - [Binary Kernel Library](#binary-kernel-library)
+  - [CMake Options](#cmake-options)
+  - [Android](#android)
+    - [I. Setup Environment](#i-setup-environment)
+    - [II. Build llama.cpp](#ii-build-llamacpp)
+  - [Windows 11 Arm64](#windows-11-arm64)
+    - [I. Setup Environment](#i-setup-environment-1)
+    - [II. Build llama.cpp](#ii-build-llamacpp-1)
+  - [Linux](#linux)
+    - [I. Setup Environment](#i-setup-environment-2)
+    - [II. Build llama.cpp](#ii-build-llamacpp-2)
+  - [Known Issues](#known-issues)
+  - [TODO](#todo)
 
 ## Background
 
@@ -17,7 +28,7 @@ OpenCL (Open Computing Language) is an open, royalty-free standard for cross-pla
 
 ### Llama.cpp + OpenCL
 
-The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adreno GPU** firstly via OpenCL. Thanks to the portabilty of OpenCL, the OpenCL backend can also run on certain Intel GPUs although the performance is not optimal.
+The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adreno GPU** firstly via OpenCL. Thanks to the portabilty of OpenCL, the OpenCL backend can also run on certain Intel GPUs such as those that do not have [SYCL](/docs/backend/SYCL.md) support although the performance is not optimal.
 
 ## OS
 
@@ -33,39 +44,77 @@ The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adren
 
 **Verified devices**
 
-| Adreno GPU                           | Status  |
-|:------------------------------------:|:-------:|
-| Adreno 750 (Snapdragon 8 Gen 3)      | Support |
-| Adreno 830 (Snapdragon 8 Elite)      | Support |
-| Adreno X85 (Snapdragon X Elite)      | Support |
+| Adreno GPU                            | Status  |
+|:-------------------------------------:|:-------:|
+| Adreno 750 (Snapdragon 8 Gen 3)       | Support |
+| Adreno 810 (Snapdragon 7s Gen 3)      | Support |
+| Adreno 830 (Snapdragon 8 Elite)       | Support |
+| Adreno 840 (Snapdragon 8 Elite Gen 5) | Support |
+| Adreno X1-85 (Snapdragon X Elite)     | Support |
+| Adreno X2-90 (Snapdragon X2 Elite)    | Support |
+
+> A6x GPUs with a recent driver and compiler are supported; they are usually found in IoT platforms.
+However, A6x GPUs in phones are likely not supported due to the outdated driver and compiler.
 
 ## DataType Supports
 
 | DataType               | Status                     |
 |:----------------------:|:--------------------------:|
+| Q1_0                   | Support                    |
 | Q4_0                   | Support                    |
-| Q6_K                   | Support, but not optimized |
+| Q4_1                   | Support                    |
+| Q5_0                   | Support                    |
+| Q5_1                   | Support                    |
+| Q8_0                   | Support                    |
+| Q4_K                   | Support                    |
+| Q5_K                   | Support                    |
+| Q6_K                   | Support                    |
+| MXFP4                  | Support                    |
+| IQ4_NL                 | Support                    |
 
 ## Model Preparation
 
-You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model prepration.
+Since common quantizations are supported now, it is recommanded to download GGUF models directly from Huggingface.
 
-Currently we support `Q4_0` quantization and have optimize for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize`. For example,
+## Binary Kernel Library
 
-```sh
-./llama-quantize --pure ggml-model-qwen2.5-3b-f16.gguf ggml-model-qwen-3b-Q4_0.gguf Q4_0
-```
+A prebuilt binary kernel library has been introduced for Adreno GPUs.
+It currently targets X2 GPUs (X2-90, X2-85 and X2-45) found in Snapdragon X2 SoC.
+The library currently contains kernels for MUL_MAT_ID with Q4_0, Q4_1, Q4_K, MXFP4.
+The library must be manually downloaded from https://softwarecenter.qualcomm.com/catalog/item/Adreno_Kernel_Library_GGML.
 
-Since `Q6_K` is also supported, `Q4_0` quantization without `--pure` will also work. However, the performance will be worse compared to pure `Q4_0` quantization.
+To allow using the kernel library, add `-DGGML_OPENCL_USE_ADRENO_BIN_KERNELS=ON` when configuring with CMake.
+Then, extract `adreno-opencl-kernels.dll` from the zip file downloaded from the above URL and put it alongside the executables.
+If kernels compatible with the current GPU are found in the library, they will be loaded and used.
+
 
 ## CMake Options
 
 The OpenCL backend has the following CMake options that control the behavior of the backend.
 
-| CMake options                     | Default value  | Description                               |
-|:---------------------------------:|:--------------:|:------------------------------------------|
-| `GGML_OPENCL_EMBED_KERNELS`       | `ON`           | Embed OpenCL kernels into the executable. |
-| `GGML_OPENCL_USE_ADRENO_KERNELS`  | `ON`           | Use kernels optimized for Adreno.         |
+| CMake options                        | Default value  | Description                               |
+|:------------------------------------:|:--------------:|:------------------------------------------|
+| `GGML_OPENCL_EMBED_KERNELS`          | `ON`           | Embed OpenCL kernels into the executable. |
+| `GGML_OPENCL_USE_ADRENO_KERNELS`     | `ON`           | Use kernels optimized for Adreno.         |
+| `GGML_OPENCL_USE_ADRENO_BIN_KERNELS` | `OFF`          | Allow using binary kernel lib for Adreno. |
+
+## Program Binary Cache
+
+Compiled `cl_program` binaries are cached on disk, so subsequent runs skip the expensive
+compile-from-source step when nothing relevant has changed (kernel source, compile options,
+device, driver, or platform version).
+
+The cache is controlled with the `GGML_OPENCL_KERNEL_CACHE_DIR` environment variable:
+
+| Value                                  | Behavior                                       |
+|:---------------------------------------|:-----------------------------------------------|
+| unset / empty / `1` / `default`        | Enabled in the platform default cache directory: `%LOCALAPPDATA%\llama.cpp\cl-cache` (Windows), `~/Library/Caches/llama.cpp/cl-cache` (macOS), `<temp dir>/llama.cpp/cl-cache` elsewhere. |
+| `0` / `off` / `none` / `disable(d)`    | Disabled.                                      |
+| any other value                        | Used verbatim as the cache directory path.     |
+
+If the chosen directory cannot be created or used, the cache disables itself for the process
+and kernels are compiled from source as usual. Set `GGML_OPENCL_KERNEL_CACHE_DEBUG=1` to
+print a HIT/MISS/SAVE trace to stderr.
 
 ## Android
 
@@ -146,9 +195,12 @@ A Snapdragon X Elite device with Windows 11 Arm64 is used. Make sure the followi
 * Ninja
 * Visual Studio 2022
 * Powershell 7
+* Python
 
 Visual Studio provides necessary headers and libraries although it is not directly used for building.
 Alternatively, Visual Studio Build Tools can be installed instead of the full Visual Studio.
+
+> Note that building using Visual Studio's cl compiler is not supported. Clang must be used. Clang depends on libraries provided by Visual Studio to work. Therefore, Visual Studio must be installed. Alternatively, Visual Studio Build Tools can be installed instead of the full Visual Studio.
 
 Powershell 7 is used for the following commands.
 If an older version of Powershell is used, these commands may not work as they are.
@@ -199,11 +251,63 @@ cmake .. -G Ninja `
 ninja
 ```
 
+## Linux
+
+The two steps just above also apply to Linux. When building for linux, the commands are mostly the same as those for PowerShell on Windows, but in the second step they do not have the `-DCMAKE_TOOLCHAIN_FILE` parameter, and then in both steps the backticks are replaced with back slashes.
+
+If not installed already, install Git, CMake, Clang, Ninja and Python, then run in the terminal the following:
+
+### I. Setup Environment
+
+1. **Install OpenCL Headers and Library**
+
+```bash
+mkdir -p ~/dev/llm
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-Headers && cd OpenCL-Headers
+mkdir build && cd build
+cmake .. -G Ninja \
+  -DBUILD_TESTING=OFF \
+  -DOPENCL_HEADERS_BUILD_TESTING=OFF \
+  -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF \
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader && cd OpenCL-ICD-Loader
+mkdir build && cd build
+cmake .. -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+```
+
+### II. Build llama.cpp
+
+```bash
+mkdir -p ~/dev/llm
+cd ~/dev/llm
+
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+mkdir build && cd build
+
+cmake .. -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_OPENCL=ON
+ninja
+```
+
 ## Known Issues
 
-- Currently OpenCL backend does not work on Adreno 6xx GPUs.
+- Flash attention does not always improve performance.
+- Currently OpenCL backend works on A6xx GPUs with recent drivers and compilers (usually found in IoT platforms).
+  However, it does not work on A6xx GPUs found in phones with old drivers and compilers.
 
 ## TODO
 
-- Optimization for Q6_K
-- Support and optimization for Q4_K
+- Improve flash attention
+- Improve OpenCL C kernels performance
