@@ -763,3 +763,81 @@ The GPU may still be used to accelerate some parts of the computation even when 
 In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
 
 Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
+
+
+## TSI compilation steps
+
+Following are the instructions to compile for TSI FPGA and Posix backend
+
+```bash
+Pull the repo frim tsisw as follows
+git clone git@github.com:tsisw/llama.cpp.git -b FIR-699
+```
+
+Ensure prerequisites are met as follows
+```bash
+cd llama.cpp/
+git submodule update --recursive --init
+cd ggml-tsi-kernel/
+module load tsi4 gcc/13.3.0
+python3 -m venv blob-creation
+source blob-creation/bin/activate
+pip install -r /proj/rel/sw/sdk-r.0.1.3/compiler/python/requirements-common.txt
+pip install /proj/rel/sw/sdk-r.0.1.3/compiler/python/mlir_external_packages-1.3.0-py3-none-any.whl
+pip install onnxruntime-training
+```
+
+build TSI kernels for the Tsavorite backend
+First for FPGA
+```bash
+cd fpga-kernel
+cmake -B build-fpga
+./create-all-kernels.sh
+```
+The for Posix Use cases
+```bash
+cd ../posix-kernel/
+./create-all-kernels.sh
+```
+
+Change directory to top level llama.cpp
+```bash
+cd ../../
+```
+
+SDK_VERSION is mandatory for every cmake invocation below (CMakeLists.txt fails
+fast otherwise). Export it once before either build:
+```bash
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
+```
+
+Compile for posix with build-posix as a target folder
+```bash
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
+cmake --build build-posix --config Release
+```
+
+Compile for fpga with build-fpga as a target folder
+```bash
+export CC="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc"
+export CXX="/proj/rel/sw/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++"
+cmake -B build-fpga -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=fpga
+cmake --build build-fpga --config Release
+```
+For an easier build, use `tsi-pkg-build.sh` instead, which builds both posix and
+fpga and creates a versioned FPGA package bundle `tsi-ggml-${SDK_VERSION}.tz`.
+Source it (recommended -- leaves the SDK paths it derives, like
+`MLIR_COMPILER_DIR`/`TOOLBOX_DIR`, set in this shell afterward, useful if you
+want to run further manual `cmake`/build commands without re-deriving them.
+Direct execution is also supported; there the script runs in a child process,
+so those variables simply don't outlive it -- either way, nothing needs
+manual unsetting). `SDK_VERSION` is passed on the same line (there is no
+separate `TSI-VERSION` setting). Add `release` as a
+parameter to also install the result under `/proj/rel/sw/ggml` (this
+overwrites what's already there, so be sure before using it):
+
+```bash
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh
+# or, to also release:
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh release
+```

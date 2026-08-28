@@ -123,3 +123,113 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+## References
+
+#### TSI compilation steps
+
+##### Prerequisites
+
+- **TOOLBOX_DIR**: Path to installed toolbox (contains ARM/Xtensa toolchains and common libraries)
+- **MLIR_COMPILER_DIR**: Path to MLIR compiler installation (for blob compilation)
+- Or use **MLIR_SDK_VERSION** which contains both (e.g., `/proj/rel/sw/sdk-r.0.2.2`)
+
+##### Quick build (recommended)
+
+The `tsi-pkg-build.sh` script handles all steps automatically:
+
+```bash
+# Clone the repo
+git clone git@github.com:tsisw/llama.cpp.git
+cd llama.cpp
+
+# SDK_VERSION is mandatory for every invocation (fails fast otherwise). It is
+# the only input parse_args() needs -- on every run it explicitly unsets
+# MLIR_COMPILER_DIR/TOOLBOX_DIR/MLIR_SDK_VERSION first so a stale path from a
+# previous SDK version's run can't leak into this one, then re-derives all
+# three from SDK_VERSION. So exporting MLIR_SDK_VERSION/MLIR_COMPILER_DIR/
+# TOOLBOX_DIR yourself before sourcing (as older revisions of this doc showed)
+# has no effect -- they get unset before they're read. If you genuinely need
+# a non-default SDK layout, pass explicit paths positionally instead (Option
+# 2 below), which bypasses env-var resolution entirely.
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
+
+# Option 1 (recommended): let SDK_VERSION derive everything
+source tsi-pkg-build.sh
+
+# Option 2: explicit paths, for a non-standard SDK layout
+source tsi-pkg-build.sh "" /path/to/mlir-compiler/install /path/to/toolbox/install
+
+# Sourcing is recommended -- it leaves the derived SDK paths (MLIR_COMPILER_DIR,
+# TOOLBOX_DIR, etc.) set in this shell afterward, handy for further manual
+# cmake/build commands. Direct execution is also supported; it just runs in a
+# child process, so those variables don't outlive it:
+# SDK_VERSION=0.4.1 ./tsi-pkg-build.sh
+
+# For release build (copies to /proj/rel/sw/ggml)
+SDK_VERSION=0.4.1 source tsi-pkg-build.sh release
+```
+
+##### Manual build steps
+
+```bash
+# Clone and setup
+git clone git@github.com:tsisw/llama.cpp.git
+cd llama.cpp
+git submodule update --recursive --init
+
+# Set paths (adjust as needed)
+export MLIR_COMPILER_DIR=/proj/rel/sw/sdk-r.0.2.2/compiler
+export TOOLBOX_DIR=/proj/rel/sw/sdk-r.0.2.2/toolbox/build/install
+
+# SDK_VERSION is mandatory for every cmake invocation below (fails fast
+# otherwise) -- exporting it once here covers all of them via CMakeLists.txt's
+# ENV{SDK_VERSION} fallback, so it doesn't need to be repeated as -D on each line.
+export SDK_VERSION=0.4.1  # substitute the SDK version you're building against
+
+# Create Python virtual environment for blob compilation
+cd ggml-tsi-kernel/
+/proj/local/Python-3.11.12/bin/python3 -m venv blob-creation
+source blob-creation/bin/activate
+pip install --upgrade pip torch==2.7.0
+pip install -r ${MLIR_COMPILER_DIR}/python/requirements-common.txt
+pip install ${MLIR_COMPILER_DIR}/python/mlir_external_packages-*.whl
+pip install onnxruntime-training
+
+# Build FPGA kernels (blobs)
+cd fpga-kernel
+cmake -B build-fpga \
+  -DTOOLBOX_DIR=${TOOLBOX_DIR} \
+  -DCOMPILER_INSTALL_DIR=${MLIR_COMPILER_DIR}
+./create-all-kernels.sh
+
+# Build Posix kernels
+cd ../posix-kernel/
+./create-all-kernels.sh
+cd ../../
+
+# Build llama.cpp for Posix (x86_64)
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix
+cmake --build build-posix --config Release
+
+# Build llama.cpp for FPGA (ARM cross-compilation using toolbox toolchain)
+cmake -B build-fpga \
+  -DCMAKE_TOOLCHAIN_FILE=${TOOLBOX_DIR}/lib/cmake/toolchains/arm.cmake \
+  -DGGML_TSAVORITE=ON \
+  -DGGML_TSAVORITE_TARGET=fpga \
+  -DLLAMA_CURL=OFF
+cmake --build build-fpga --config Release
+```
+
+##### Build variants
+
+```bash
+# Debug build with detailed performance logging
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix \
+  -DCMAKE_C_FLAGS="-DGGML_PERF_DETAIL" -DCMAKE_CXX_FLAGS="-DGGML_PERF_DETAIL"
+
+# Release build with performance metrics
+cmake -B build-posix -DGGML_TSAVORITE=ON -DGGML_TSAVORITE_TARGET=posix \
+  -DCMAKE_C_FLAGS="-DGGML_PERF_RELEASE" -DCMAKE_CXX_FLAGS="-DGGML_PERF_RELEASE"
+```
+

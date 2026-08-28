@@ -27,6 +27,12 @@ static void signal_handler(int) {
 }
 #endif
 
+static void my_logger(ggml_log_level level, const char *text, void *user_data) {
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
+    }
+}
+
 // satisfies -Wmissing-declarations
 int llama_cli(int argc, char ** argv);
 
@@ -38,8 +44,13 @@ int llama_cli(int argc, char ** argv) {
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
+        ggml_backend_cleanup();
         return 1;
     }
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    llama_log_set(my_logger, nullptr);
+#endif /* GGML_PERF-related flags */
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     struct sigaction sigint_action;
@@ -58,6 +69,7 @@ int llama_cli(int argc, char ** argv) {
     cli_context ctx_cli(params);
 
     if (!ctx_cli.init()) {
+        ggml_backend_cleanup();
         return 1;
     }
 

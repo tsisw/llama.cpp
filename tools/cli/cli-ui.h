@@ -163,18 +163,30 @@ namespace ui {
                 console::log("\n> %s\n", buffer.c_str());
             }
         }
-        std::string read_input(bool multiline_input, const char * prompt = nullptr) {
+        // eof, when non-null, is set to true only on genuine end-of-input --
+        // never for an ordinary blank line (see console::readline).
+        std::string read_input(bool multiline_input, const char * prompt = nullptr, bool * eof = nullptr) {
             if (prompt) {
                 console::log("%s", prompt);
             } else {
                 console::log("\n> ");
             }
+            if (eof) {
+                *eof = false;
+            }
             std::string buffer;
             std::string line;
             bool another_line = true;
             do {
-                another_line = console::readline(line, multiline_input);
+                bool line_eof = false;
+                another_line = console::readline(line, multiline_input, &line_eof);
                 buffer += line;
+                if (line_eof) {
+                    if (eof) {
+                        *eof = true;
+                    }
+                    break;
+                }
             } while (another_line);
             return buffer;
         }

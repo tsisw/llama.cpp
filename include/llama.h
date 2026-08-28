@@ -474,6 +474,9 @@ extern "C" {
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
+    // Call once at the end of the program to log profile
+    LLAMA_API void llama_backend_log_profile(void);
+
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
@@ -1583,6 +1586,13 @@ extern "C" {
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    // Tsavorite-only perf summary (LLAMA_LOG_TSAVORITE lines + GGML Perf Summary
+    // table), without the plain load/eval/total-time lines llama_perf_context_print()
+    // also prints. For callers that already print those lines themselves.
+    LLAMA_API void                           llama_perf_context_print_tsavorite_summary(const struct llama_context * ctx);
+#endif
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

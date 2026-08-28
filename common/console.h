@@ -21,7 +21,11 @@ namespace console {
     void init(bool use_simple_io, bool use_advanced_display);
     void cleanup();
     void set_display(display_type display);
-    bool readline(std::string & line, bool multiline_input);
+    // eof, when non-null, is set to true only on genuine end-of-input (e.g.
+    // Ctrl+D or a closed pipe) -- never for an ordinary blank line, which is
+    // reported as a successful empty read (the return value still governs
+    // whether the caller should keep accumulating for multiline input).
+    bool readline(std::string & line, bool multiline_input, bool * eof = nullptr);
 
     using completion_callback = std::function<std::vector<std::pair<std::string, size_t>>(std::string_view, size_t)>;
     void set_completion_callback(completion_callback cb);

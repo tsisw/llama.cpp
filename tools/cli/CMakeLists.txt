@@ -20,6 +20,9 @@ set(TARGET llama-cli)
 
 add_executable(${TARGET} main.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-cli-impl)
+# rpath-link for transitively-needed tsi_* symbols on FPGA builds is handled
+# globally via -DCMAKE_EXE_LINKER_FLAGS in tsi-pkg-build.sh (FPGA_TOOLBOX_LIB_DIR /
+# FPGA_RUNTIME_LIB_DIR) -- no per-target linker flags needed here.
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)

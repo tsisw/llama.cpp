@@ -38,6 +38,12 @@ static common_params            * g_params;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
+static void my_logger(ggml_log_level level, const char *text, void *user_data) {
+    if (level == GGML_LOG_LEVEL_TSAVORITE) {
+        fprintf(stderr, "%s", text);  // only show warnings or errors
+    }
+}
+
 static void print_usage(int argc, char ** argv) {
     (void) argc;
 
@@ -91,6 +97,18 @@ int llama_completion(int argc, char ** argv) {
 
     common_init();
 
+    // Ensures ggml_backend_cleanup() runs only after every backend-dependent
+    // local (llama_init, chat_templates, etc. -- all declared below this
+    // point) has already been destroyed. C++ destroys locals in reverse
+    // declaration order, so declaring this guard first means it runs last,
+    // on every return path uniformly -- previously, explicit
+    // ggml_backend_cleanup() calls scattered through this function ran
+    // *before* llama_init's destructor (which frees the model/context using
+    // the backend), finalizing the backend while it was still owned.
+    struct BackendCleanupGuard {
+        ~BackendCleanupGuard() { ggml_backend_cleanup(); }
+    } backend_cleanup_guard;
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
         return 1;
     }
@@ -123,6 +141,9 @@ int llama_completion(int argc, char ** argv) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
+#if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
+    llama_log_set(my_logger, nullptr);
+#endif /* GGML_PERF-related flags */
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
@@ -988,13 +1009,18 @@ int llama_completion(int argc, char ** argv) {
 
     }
 
+    // Ensure all prompt response output is fully completed before printing profiling data.
+    // Free threadpools first to guarantee all worker threads have finished processing and output.
+    // This prevents interleaving of prompt response and profiling output, ensuring correct order.
+    // fflush(stdout) is called to flush any remaining output before printing profiling stats.
+    ggml_threadpool_free_fn(threadpool);
+    ggml_threadpool_free_fn(threadpool_batch);
+
     LOG("\n\n");
+    fflush(stdout);
     common_perf_print(ctx, smpl);
 
     llama_backend_free();
-
-    ggml_threadpool_free_fn(threadpool);
-    ggml_threadpool_free_fn(threadpool_batch);
 
     return 0;
 }

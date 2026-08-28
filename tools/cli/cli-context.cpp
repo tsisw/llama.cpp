@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -478,11 +479,12 @@ int cli_context::run() {
 
     while (true) {
         std::string buffer;
+        bool eof = false;
         {
             ui::user_turn user_turn;
 
             if (params.prompt.empty()) {
-                buffer = user_turn.read_input(params.multiline_input);
+                buffer = user_turn.read_input(params.multiline_input, nullptr, &eof);
             } else {
                 // process input prompt from args
                 for (auto & fname : params.image) {
@@ -508,8 +510,20 @@ int cli_context::run() {
             buffer.pop_back();
         }
 
-        // skip empty messages
+        // skip empty messages -- unless we've genuinely hit end-of-input, in
+        // which case there is no "next turn" coming and continuing would spin
+        // this loop at 100% CPU rewriting the prompt forever. eof is tracked
+        // separately from the input text itself (see console::readline), so
+        // an ordinary blank line -- interactively, or a blank line embedded
+        // in piped input -- correctly keeps reading instead of being confused
+        // for the stream actually ending. Observed running any single-shot -p
+        // invocation (e.g. model-rerun.py, or any script capturing output via
+        // a pipe) through llama-cli, previously untested since llama-cli was
+        // never buildable under GGML_TSAVORITE before this sync.
         if (buffer.empty()) {
+            if (eof) {
+                break;
+            }
             continue;
         }
 
