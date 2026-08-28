@@ -17,6 +17,12 @@
 #include <map>
 #include <set>
 
+#if defined(_WIN32)
+#    include <io.h>
+#else
+#    include <unistd.h>
+#endif
+
 using json = nlohmann::ordered_json;
 
 struct cli_context_impl {
@@ -462,6 +468,23 @@ int cli_context::run() {
     // interactive loop
     std::string cur_msg;
 
+    // Whether stdin is an interactive terminal, checked once up front rather
+    // than detected reactively via feof(stdin) inside the loop below. Reactive
+    // EOF detection is not portable: readline_advanced()'s Windows path
+    // (ReadConsoleInputW) hits its own end_of_stream condition on redirected
+    // input without ever setting the C stdin EOF flag, so a feof(stdin) check
+    // silently fails to catch it there even though it works on the
+    // getwchar()-based POSIX path. Checking isatty() once up front is
+    // portable across both and avoids the discrepancy entirely: a redirected/
+    // piped/non-interactive stdin should never have entered "wait for the
+    // next interactive turn" in the first place, independent of how or when
+    // the underlying platform surfaces EOF.
+#if defined(_WIN32)
+    const bool stdin_is_interactive = _isatty(_fileno(stdin)) != 0;
+#else
+    const bool stdin_is_interactive = isatty(fileno(stdin)) != 0;
+#endif
+
     auto add_text_file = [&](const std::string & fname) -> bool {
         std::ifstream file(fname, std::ios::binary);
         if (!file) {
@@ -509,17 +532,16 @@ int cli_context::run() {
             buffer.pop_back();
         }
 
-        // skip empty messages -- unless this is genuine end-of-input on a
-        // non-interactive stdin (piped/redirected, no TTY), not a blank line
-        // submitted interactively. Without this check, read_input() returns
-        // an empty buffer instantly and forever once stdin hits EOF (getwchar()
-        // never blocks again), spinning this loop at 100% CPU writing the
-        // prompt indefinitely -- observed running any single-shot -p invocation
+        // skip empty messages -- unless stdin isn't interactive, in which case
+        // there is no "next turn" coming and continuing would spin this loop
+        // at 100% CPU rewriting the prompt forever (read_input() returns an
+        // empty buffer instantly and permanently once a piped/redirected
+        // stdin hits EOF). Observed running any single-shot -p invocation
         // (e.g. model-rerun.py, or any script capturing output via a pipe)
         // through llama-cli, previously untested since llama-cli was never
         // buildable under GGML_TSAVORITE before this sync.
         if (buffer.empty()) {
-            if (std::feof(stdin)) {
+            if (!stdin_is_interactive) {
                 break;
             }
             continue;
