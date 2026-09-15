@@ -14,6 +14,7 @@
 #include <vector>
 #include <math.h>
 #include <float.h>
+#include <thread>
 
 // --- BEGIN TSI_REMOTE_TXE_POC ---
 // Cross-TSISIM-instance remote TXE dispatch proof-of-concept.
@@ -82,6 +83,32 @@ static bool tsi_send_all(int fd, const void *buf, size_t n) {
 //             on THIS process's own local TXE runtime)
 #define TSI_REMOTE_TXE_MAGIC 0x54584552u
 
+// Round 3: the worker now accepts *concurrent* client connections (one
+// std::thread per connection, see tsi_run_remote_worker() below), each of
+// which can call ggml_backend_graph_compute() independently. But
+// ggml-tsavorite.cpp's TXE dispatch state (the `workers` vector of
+// in-flight blob-execution threads, `device_free[]`, `device_mutex`,
+// `workers_mutex`, packed_args[]/scalar_*_args[]) is process-global and was
+// only ever designed for ONE top-level graph_compute() call to be in
+// flight at a time -- a normal local llama-cli inference loop only ever
+// calls it that way. Two concurrent graph_compute() calls both pushing
+// into and join()-ing the *same* global `workers` vector via
+// join_all_workers() can cross-join each other's row-tile threads (one
+// call's join_all_workers() silently reaping and waiting on a *different*
+// call's threads), which was observed directly during real-model testing
+// as a genuine hang: worker threads piled up (44 live threads for what
+// should have been at most ~20 local + a handful of connection handlers),
+// worker CPU dropped to idle, and client connections sat blocked in
+// recv() forever with no forward progress. Serializing worker-side
+// dispatch with this mutex trades away worker-side request-level overlap
+// (the worker still parallelizes *within* one request across its own
+// local TXEs via ggml-tsavorite.cpp's own multi-TXE row-splitting; only
+// concurrent *separate* MAT_MUL/ADD requests from different connections
+// are now queued rather than run concurrently) for correctness, which is
+// the right tradeoff for this POC given the shared global state was never
+// built for multi-caller concurrency.
+static std::mutex g_worker_compute_mutex;
+
 // Runs one real ADD op through the Tsavorite backend for the given already
 // TXE-runtime-initialized `backend`, on tensors of length n. This is the
 // same load_model()+build_graph()+compute() pattern used by the rest of
@@ -89,6 +116,7 @@ static bool tsi_send_all(int fd, const void *buf, size_t n) {
 // network path, it is the identical local dispatch mechanism.
 static bool tsi_remote_worker_run_add(ggml_backend_t backend, const std::vector<float> &A,
                                        const std::vector<float> &B, std::vector<float> &C) {
+    std::lock_guard<std::mutex> lk(g_worker_compute_mutex);
     const int64_t n = (int64_t)A.size();
 
     struct ggml_init_params params {
@@ -140,37 +168,155 @@ static bool tsi_remote_worker_run_add(ggml_backend_t backend, const std::vector<
     return ok;
 }
 
+// TSI_REMOTE_TXE_POC (MAT_MUL extension, round 3): same wire-framing idea as
+// the ADD protocol above, generalized to a real MAT_MUL. Wire protocol:
+//   request:  uint32 magic (0x4d4d5458 'XTMM'), int64 M_valid, int64 N, int64 K,
+//             float[M_valid*K] A_rows (row-major, M_valid rows of K),
+//             float[N*K]       B_rows (row-major, N rows of K -- this is
+//                               exactly ggml's own byte layout for a
+//                               [ne0=K, ne1=N] F32 tensor)
+//   response: uint32 magic,   float[M_valid*N] C (row-major [M_valid, N])
+//
+// The compute itself reuses the identical local dispatch mechanism as the
+// ADD case above: a real ggml_mul_mat() graph run through
+// ggml_backend_graph_compute() against THIS process's own already-
+// initialized local ggml_backend_tsavorite runtime. Nothing here
+// special-cases the network path or reimplements any part of the Triton
+// MAT_MUL kernel dispatch -- it is the same call sequence a real llama-cli
+// MUL_MAT node uses, and (if M_valid is large enough) will even trigger
+// this worker's OWN internal multi-TXE row-splitting across its own local
+// TXEs, exactly like a normal local inference run would.
+#define TSI_REMOTE_TXE_MAGIC_MATMUL 0x4d4d5458u
+
+static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
+                                           const std::vector<float> &A_rows, int64_t M_valid,
+                                           const std::vector<float> &B_rows, int64_t N,
+                                           int64_t K,
+                                           std::vector<float> &C_out) {
+    // See g_worker_compute_mutex's comment above tsi_remote_worker_run_add():
+    // ggml-tsavorite.cpp's TXE dispatch state is process-global and not
+    // safe for concurrent top-level graph_compute() calls.
+    std::lock_guard<std::mutex> lk(g_worker_compute_mutex);
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context *ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "[remote-worker] ggml_init failed\n");
+        return false;
+    }
+
+    // ne0=K, ne1=M_valid / ne1=N -- matches ggml's own mul_mat convention
+    // (A: [K,M], B: [K,N], result: [M,N]), and matches exactly how the
+    // client packed A_rows/B_rows on the wire.
+    struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M_valid);
+    struct ggml_tensor *tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+
+    struct ggml_backend_buffer *buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        fprintf(stderr, "[remote-worker] ggml_backend_alloc_ctx_tensors failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(ta, A_rows.data(), 0, ggml_nbytes(ta));
+    ggml_backend_tensor_set(tb, B_rows.data(), 0, ggml_nbytes(tb));
+
+    static size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
+    std::vector<uint8_t> gbuf(buf_size);
+    struct ggml_init_params params0 { buf_size, gbuf.data(), true };
+    struct ggml_context *ctx0 = ggml_init(params0);
+    struct ggml_cgraph *gf = ggml_new_graph(ctx0);
+    struct ggml_tensor *result = ggml_mul_mat(ctx0, ta, tb);
+    ggml_build_forward_expand(gf, result);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = allocr && ggml_gallocr_alloc_graph(allocr, gf);
+    if (ok) {
+        ggml_backend_graph_compute(backend, gf);
+        C_out.resize((size_t)(M_valid * N));
+        ggml_backend_tensor_get(result, C_out.data(), 0, ggml_nbytes(result));
+    } else {
+        fprintf(stderr, "[remote-worker] MAT_MUL graph alloc failed\n");
+    }
+
+    if (allocr) ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return ok;
+}
+
 // Serves requests on one accepted connection until the peer disconnects.
+// Handles both the original ADD protocol and the newer MAT_MUL protocol on
+// the same port, dispatched by the leading magic value.
 static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
     for (;;) {
-        uint32_t magic = 0, n = 0;
+        uint32_t magic = 0;
         if (!tsi_recv_all(fd, &magic, sizeof(magic))) break;
-        if (magic != TSI_REMOTE_TXE_MAGIC) {
-            fprintf(stderr, "[remote-worker] bad magic 0x%08x, dropping connection\n", magic);
-            break;
+
+        if (magic == TSI_REMOTE_TXE_MAGIC) {
+            uint32_t n = 0;
+            if (!tsi_recv_all(fd, &n, sizeof(n))) break;
+            if (n == 0 || n > (1u << 20)) {
+                fprintf(stderr, "[remote-worker] bad n=%u, dropping connection\n", n);
+                break;
+            }
+
+            std::vector<float> A(n), B(n), C;
+            if (!tsi_recv_all(fd, A.data(), (size_t)n * sizeof(float))) break;
+            if (!tsi_recv_all(fd, B.data(), (size_t)n * sizeof(float))) break;
+
+            fprintf(stderr, "[remote-worker] ADD request: n=%u A[0]=%g B[0]=%g -- dispatching real ADD to local TXE runtime\n",
+                    n, A[0], B[0]);
+
+            if (!tsi_remote_worker_run_add(backend, A, B, C)) {
+                fprintf(stderr, "[remote-worker] local TXE dispatch failed, dropping connection\n");
+                break;
+            }
+
+            fprintf(stderr, "[remote-worker] result: C[0]=%g (expected %g)\n", C[0], A[0] + B[0]);
+
+            if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
+            if (!tsi_send_all(fd, C.data(), (size_t)n * sizeof(float))) break;
+            continue;
         }
-        if (!tsi_recv_all(fd, &n, sizeof(n))) break;
-        if (n == 0 || n > (1u << 20)) {
-            fprintf(stderr, "[remote-worker] bad n=%u, dropping connection\n", n);
-            break;
+
+        if (magic == TSI_REMOTE_TXE_MAGIC_MATMUL) {
+            int64_t hdr[3] = {0, 0, 0};
+            if (!tsi_recv_all(fd, hdr, sizeof(hdr))) break;
+            const int64_t M_valid = hdr[0], N = hdr[1], K = hdr[2];
+            if (M_valid <= 0 || N <= 0 || K <= 0 ||
+                M_valid > (1 << 20) || N > (1 << 20) || K > (1 << 20)) {
+                fprintf(stderr, "[remote-worker] bad MAT_MUL header M=%ld N=%ld K=%ld, dropping connection\n",
+                        (long)M_valid, (long)N, (long)K);
+                break;
+            }
+
+            std::vector<float> A_rows((size_t)(M_valid * K)), B_rows((size_t)(N * K)), C;
+            if (!tsi_recv_all(fd, A_rows.data(), A_rows.size() * sizeof(float))) break;
+            if (!tsi_recv_all(fd, B_rows.data(), B_rows.size() * sizeof(float))) break;
+
+            fprintf(stderr, "[remote-worker] MAT_MUL request: M_valid=%ld N=%ld K=%ld -- dispatching real ggml_mul_mat to local TXE runtime\n",
+                    (long)M_valid, (long)N, (long)K);
+
+            if (!tsi_remote_worker_run_mul_mat(backend, A_rows, M_valid, B_rows, N, K, C)) {
+                fprintf(stderr, "[remote-worker] local MAT_MUL TXE dispatch failed, dropping connection\n");
+                break;
+            }
+
+            fprintf(stderr, "[remote-worker] MAT_MUL result: C[0]=%g (M_valid*N=%zu floats)\n",
+                    C.empty() ? 0.0f : C[0], C.size());
+
+            if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
+            if (!tsi_send_all(fd, C.data(), C.size() * sizeof(float))) break;
+            continue;
         }
 
-        std::vector<float> A(n), B(n), C;
-        if (!tsi_recv_all(fd, A.data(), (size_t)n * sizeof(float))) break;
-        if (!tsi_recv_all(fd, B.data(), (size_t)n * sizeof(float))) break;
-
-        fprintf(stderr, "[remote-worker] request: n=%u A[0]=%g B[0]=%g -- dispatching real ADD to local TXE runtime\n",
-                n, A[0], B[0]);
-
-        if (!tsi_remote_worker_run_add(backend, A, B, C)) {
-            fprintf(stderr, "[remote-worker] local TXE dispatch failed, dropping connection\n");
-            break;
-        }
-
-        fprintf(stderr, "[remote-worker] result: C[0]=%g (expected %g)\n", C[0], A[0] + B[0]);
-
-        if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
-        if (!tsi_send_all(fd, C.data(), (size_t)n * sizeof(float))) break;
+        fprintf(stderr, "[remote-worker] bad magic 0x%08x, dropping connection\n", magic);
+        break;
     }
 }
 
@@ -217,9 +363,21 @@ static int tsi_run_remote_worker(int port) {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         fprintf(stderr, "[remote-worker] connection from %s:%d\n",
                 inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
-        tsi_remote_worker_serve_conn(fd, backend);
-        close(fd);
-        fprintf(stderr, "[remote-worker] connection closed, awaiting next connection\n");
+        // Round 3: one thread per accepted connection, so multiple
+        // concurrent MAT_MUL row-tile dispatches from the initiator's own
+        // local multi-TXE loop (up to txe_count in flight, bounded by its
+        // own remote-slot semaphore) are genuinely served in parallel here,
+        // matching how many real local TXEs this instance actually has.
+        // ggml_backend_graph_compute() against this shared `backend` handle
+        // is safe to call concurrently: it is the same underlying
+        // acquire_device_blocking()/release_device()-guarded dispatch the
+        // local multi-TXE path already uses concurrently within one graph.
+        std::thread([fd, backend, cli]() {
+            tsi_remote_worker_serve_conn(fd, backend);
+            close(fd);
+            fprintf(stderr, "[remote-worker] connection from %s:%d closed\n",
+                    inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
+        }).detach();
     }
     // unreachable
     return 0;
