@@ -15,6 +15,217 @@
 #include <math.h>
 #include <float.h>
 
+// --- BEGIN TSI_REMOTE_TXE_POC ---
+// Cross-TSISIM-instance remote TXE dispatch proof-of-concept.
+//
+// Goal: prove that a real ADD op can be dispatched from a process on ONE
+// TSISIM instance and genuinely executed on ANOTHER TSISIM instance's local
+// (simulated) TXE hardware, over the network, with a numerically verified
+// correct result.
+//
+// Architectural constraint this design respects (confirmed by reading
+// ensure_tsi_runtime_initialized()'s call chain in ggml-tsavorite.cpp):
+// TXE allocation goes through tsi-apc-mgr (RSM) over a local Unix domain
+// socket, and physical/virtual address mapping comes from the local
+// txe-driver kernel driver. Both are strictly local to whichever machine
+// the process runs on -- there is no way to reach instance 2's RSM socket
+// or txe-driver from a process on instance 1. So instance 2 must run its
+// OWN real process that does its OWN local ensure_tsi_runtime_initialized()
+// bring-up (via the normal ggml_backend_tsavorite_init() call below --
+// exactly the same call load_model() already makes for the local test
+// cases in this same file), and then serve remote dispatch requests using
+// its own already-initialized local backend/runtime. This file adds that
+// worker mode ("remote-worker") plus nothing else -- the request/response
+// wire protocol below is intentionally minimal.
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdint>
+
+static bool tsi_recv_all(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
+        if (r == 0) return false; // peer closed
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static bool tsi_send_all(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t r = send(fd, p + sent, n - sent, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        sent += (size_t)r;
+    }
+    return true;
+}
+
+// Wire protocol (native byte order -- both instances are aarch64 little
+// endian, so no htonl/ntohl needed for the payload itself):
+//   request:  uint32_t magic (0x54584552 'TXER'), uint32_t n, float[n] A, float[n] B
+//   response: uint32_t magic (0x54584552),          float[n] C  (C = A + B, computed
+//             by a real ggml_add() graph dispatched through ggml_backend_tsavorite
+//             on THIS process's own local TXE runtime)
+#define TSI_REMOTE_TXE_MAGIC 0x54584552u
+
+// Runs one real ADD op through the Tsavorite backend for the given already
+// TXE-runtime-initialized `backend`, on tensors of length n. This is the
+// same load_model()+build_graph()+compute() pattern used by the rest of
+// this file's local test cases -- nothing here is special-cased for the
+// network path, it is the identical local dispatch mechanism.
+static bool tsi_remote_worker_run_add(ggml_backend_t backend, const std::vector<float> &A,
+                                       const std::vector<float> &B, std::vector<float> &C) {
+    const int64_t n = (int64_t)A.size();
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context *ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "[remote-worker] ggml_init failed\n");
+        return false;
+    }
+
+    struct ggml_tensor *ta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    struct ggml_tensor *tb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+    struct ggml_backend_buffer *buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        fprintf(stderr, "[remote-worker] ggml_backend_alloc_ctx_tensors failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(ta, A.data(), 0, ggml_nbytes(ta));
+    ggml_backend_tensor_set(tb, B.data(), 0, ggml_nbytes(tb));
+
+    static size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
+    std::vector<uint8_t> gbuf(buf_size);
+    struct ggml_init_params params0 { buf_size, gbuf.data(), true };
+    struct ggml_context *ctx0 = ggml_init(params0);
+    struct ggml_cgraph *gf = ggml_new_graph(ctx0);
+    struct ggml_tensor *result = ggml_add(ctx0, ta, tb);
+    ggml_build_forward_expand(gf, result);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = allocr && ggml_gallocr_alloc_graph(allocr, gf);
+    if (ok) {
+        ggml_backend_graph_compute(backend, gf);
+        C.resize(n);
+        ggml_backend_tensor_get(result, C.data(), 0, ggml_nbytes(result));
+    } else {
+        fprintf(stderr, "[remote-worker] graph alloc failed\n");
+    }
+
+    if (allocr) ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return ok;
+}
+
+// Serves requests on one accepted connection until the peer disconnects.
+static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
+    for (;;) {
+        uint32_t magic = 0, n = 0;
+        if (!tsi_recv_all(fd, &magic, sizeof(magic))) break;
+        if (magic != TSI_REMOTE_TXE_MAGIC) {
+            fprintf(stderr, "[remote-worker] bad magic 0x%08x, dropping connection\n", magic);
+            break;
+        }
+        if (!tsi_recv_all(fd, &n, sizeof(n))) break;
+        if (n == 0 || n > (1u << 20)) {
+            fprintf(stderr, "[remote-worker] bad n=%u, dropping connection\n", n);
+            break;
+        }
+
+        std::vector<float> A(n), B(n), C;
+        if (!tsi_recv_all(fd, A.data(), (size_t)n * sizeof(float))) break;
+        if (!tsi_recv_all(fd, B.data(), (size_t)n * sizeof(float))) break;
+
+        fprintf(stderr, "[remote-worker] request: n=%u A[0]=%g B[0]=%g -- dispatching real ADD to local TXE runtime\n",
+                n, A[0], B[0]);
+
+        if (!tsi_remote_worker_run_add(backend, A, B, C)) {
+            fprintf(stderr, "[remote-worker] local TXE dispatch failed, dropping connection\n");
+            break;
+        }
+
+        fprintf(stderr, "[remote-worker] result: C[0]=%g (expected %g)\n", C[0], A[0] + B[0]);
+
+        if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
+        if (!tsi_send_all(fd, C.data(), (size_t)n * sizeof(float))) break;
+    }
+}
+
+static int tsi_run_remote_worker(int port) {
+    fprintf(stderr, "[remote-worker] initializing Tsavorite backend locally on THIS instance...\n");
+    ggml_backend_t backend = ggml_backend_tsavorite_init();
+    if (!backend) {
+        fprintf(stderr, "[remote-worker] ggml_backend_tsavorite_init() failed\n");
+        return -1;
+    }
+    fprintf(stderr, "[remote-worker] local Tsavorite/TXE runtime initialized successfully. "
+                     "Serving remote ADD dispatch on port %d\n", port);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { perror("[remote-worker] socket"); return -1; }
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[remote-worker] bind");
+        return -1;
+    }
+    if (listen(listen_fd, 8) < 0) {
+        perror("[remote-worker] listen");
+        return -1;
+    }
+    fprintf(stderr, "[remote-worker] listening on 0.0.0.0:%d\n", port);
+
+    for (;;) {
+        struct sockaddr_in cli {};
+        socklen_t cli_len = sizeof(cli);
+        int fd = accept(listen_fd, (struct sockaddr *)&cli, &cli_len);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            perror("[remote-worker] accept");
+            continue;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        fprintf(stderr, "[remote-worker] connection from %s:%d\n",
+                inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
+        tsi_remote_worker_serve_conn(fd, backend);
+        close(fd);
+        fprintf(stderr, "[remote-worker] connection closed, awaiting next connection\n");
+    }
+    // unreachable
+    return 0;
+}
+// --- END TSI_REMOTE_TXE_POC ---
+
 #define NUM_INPUT_TENSORS 2
 #define NUM_INPUT_URINARY_TENSORS 1
 #define  NUM_ELEMENTS 32
@@ -623,6 +834,18 @@ const char* convert_ops_type_to_testcase(enum ggml_tsavorite_kernel_type ops_typ
 
 int main(int argc, char *argv[]) {
     ggml_time_init();
+
+    // TSI_REMOTE_TXE_POC: cross-instance remote TXE dispatch worker mode.
+    // Usage: simple-backend-tsi remote-worker [port]   (default port 29511)
+    // Initializes the real Tsavorite backend locally (same as every other
+    // mode below) and then serves remote ADD dispatch requests instead of
+    // running a local test case. See the TSI_REMOTE_TXE_POC block above
+    // main() for the wire protocol and design rationale.
+    if (argc > 1 && !strcmp(argv[1], "remote-worker")) {
+        int port = (argc > 2) ? atoi(argv[2]) : 29511;
+        return tsi_run_remote_worker(port);
+    }
+
     bool test_case_flag = true;
     enum ggml_tsavorite_kernel_type ops_type;
     simple_model model;

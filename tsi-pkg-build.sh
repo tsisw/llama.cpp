@@ -778,7 +778,7 @@ setup_python() {
   fi
 
   if ! pip show onnxruntime-training >/dev/null 2>&1; then
-    run pip install onnxruntime-training || return 1
+    run pip install onnxruntime-training || log_info "WARNING: onnxruntime-training install failed, continuing anyway (POC workaround)"
   fi
 
   # ---------------------------------------------------------------------------
