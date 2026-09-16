@@ -6003,35 +6003,40 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     // this is byte-for-byte the original active_txes = num_of_txes path.
     const int64_t active_txes =
         multi_node_enable ? (int64_t)num_of_txes * 2 : (int64_t)num_of_txes;
-    const int64_t rows_per_txe_unaligned =
-        (M + (int64_t)num_of_txes - 1) / (int64_t)num_of_txes;
-    const int64_t rows_per_txe =
-        tsi_round_up_i64(rows_per_txe_unaligned, txe_shape.m_dim);
 
-    // ROUND 5 FINDING (2026-09-16, documentation only -- NOT changed here,
-    // needs a design decision before it's touched): this formula makes the
-    // remote lane range [num_of_txes, active_txes) BELOW mathematically
-    // UNREACHABLE for any M. Proof: rows_per_txe >= ceil(M/num_of_txes) by
-    // construction (ceil, then rounded UP further to txe_shape.m_dim), so
-    // num_of_txes * rows_per_txe >= M always, i.e. tiles_needed =
-    // ceil(M/rows_per_txe) <= num_of_txes always -- the tile loop's
-    // `tile_m0 >= M` break (below) is ALWAYS hit at or before t==num_of_txes,
-    // so the `t >= num_of_txes` remote-dispatch branch can never execute,
-    // regardless of M, num_of_txes, or txe_shape.m_dim. Confirmed both by
-    // this proof and empirically: a real TinyLlama 1.1B multi-node run
-    // against this exact code (multi_node_enable=true, same model/prompt/
-    // settings Round 4 used) produced 1700 total MUL_MAT OPU TSI_KERNEL-RUN
-    // dispatches, ALL local (0 reached the remote worker -- verified via
-    // instance 2's own worker.log showing zero MAT_MUL requests for that
-    // run's entire ~54-minute duration), contradicting Round 4's own
-    // documented claim of 69 real remote dispatches with -- ostensibly --
-    // this same formula. This needs investigation/a fix before any further
-    // multi-node wall-clock comparisons (including this round's own attempt)
-    // can be trusted; see ROUND 5 section of tsisim-multinode-poc-llamacpp.md
-    // for the full writeup. Left unfixed here deliberately -- fixing the
-    // tile-sizing/wave-splitting algorithm is a separate, non-trivial design
-    // decision outside this round's scope (adding a persistent connection),
-    // and akapoor should weigh in before it's changed.
+    // ROUND 6 FIX (2026-09-16): Round 5 proved that sizing rows_per_txe from
+    // num_of_txes alone makes the remote lane range mathematically
+    // unreachable for any M -- by construction, num_of_txes tiles at that
+    // size always cover M, so the tile loop's `tile_m0 >= M` break always
+    // fires at or before t==num_of_txes. Fix: compute the num_of_txes-only
+    // baseline first (byte-for-byte Round 4's formula/behavior). If that
+    // baseline already needs every one of the num_of_txes local lanes
+    // (tiles_needed == num_of_txes -- this op is genuinely saturating local
+    // capacity), THEN recompute rows_per_txe from active_txes instead, so
+    // the excess spills into the remote lane range in this same wave.
+    // Small ops (most decode-time matmuls, which never come close to
+    // saturating num_of_txes lanes at baseline tile size) are completely
+    // unaffected -- identical tile count and size to Round 4/baseline, so
+    // the dispatch-count blowup Round 3 hit does not recur. Only ops big
+    // enough to already need all num_of_txes local lanes (e.g. the ~32k-row
+    // vocab projection) get finer tiling, and only for THOSE ops does the
+    // extra granularity genuinely buy real remote parallelism instead of
+    // just fragmentation overhead.
+    const int64_t baseline_rows_per_txe_unaligned =
+        (M + (int64_t)num_of_txes - 1) / (int64_t)num_of_txes;
+    const int64_t baseline_rows_per_txe =
+        tsi_round_up_i64(baseline_rows_per_txe_unaligned, txe_shape.m_dim);
+    const int64_t baseline_tiles_needed =
+        (M + baseline_rows_per_txe - 1) / baseline_rows_per_txe;
+
+    int64_t rows_per_txe;
+    if (multi_node_enable && baseline_tiles_needed >= (int64_t)num_of_txes) {
+        const int64_t active_rows_per_txe_unaligned =
+            (M + active_txes - 1) / active_txes;
+        rows_per_txe = tsi_round_up_i64(active_rows_per_txe_unaligned, txe_shape.m_dim);
+    } else {
+        rows_per_txe = baseline_rows_per_txe;
+    }
     uint64_t launched_kernel_calls = 0;
 
     for (int64_t d3 = 0; d3 < D3; ++d3) {
