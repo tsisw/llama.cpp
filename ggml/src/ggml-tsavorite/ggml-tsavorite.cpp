@@ -86,15 +86,26 @@ struct TsavoriteRuntimeState {
     bool *device_free = nullptr;
     bool multi_thread_enable = false;
 
-    // TSI_REMOTE_TXE_POC: cross-instance (multi-node) MAT_MUL dispatch.
-    // See "multi_node_enable" in tsavorite-model-deployment.yaml.
-    // txe_count keeps meaning "TXE count on EACH node" -- when multi_node_enable
-    // is true, this instance uses its own txe_count TXEs locally AND additionally
-    // dispatches MAT_MUL work to a second (fixed, hardcoded two-node topology)
-    // TSISIM instance's txe_count TXEs over TCP, for a logical 2*txe_count.
-    bool multi_node_enable = false;
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) MAT_MUL dispatch.
+    // See "multi_node" in tsavorite-model-deployment.yaml. multi_node is now
+    // an integer TOTAL NODE COUNT, not a bool: 1 (or absent) = disabled,
+    // single-node only (byte-for-byte unchanged from before this ever
+    // existed); 2 = today's only actually-implemented multi-node case (this
+    // instance + one remote peer). Values > 2 are accepted at the config
+    // level (so the field can be set to a future real node count like 18
+    // without another yaml migration) but are NOT yet functionally
+    // supported by the dispatch mechanism below, which only ever talks to
+    // ONE remote peer -- see the >= 2 checks throughout this file, which
+    // treat any value >= 2 identically to exactly 2 today. Extending
+    // dispatch to more than one remote peer (connection pool, addressing,
+    // routing) is real, separate future work, not implemented here.
+    // txe_count keeps meaning "TXE count on EACH node" -- when multi_node
+    // >= 2, this instance uses its own txe_count TXEs locally AND
+    // additionally dispatches MAT_MUL work to remote_txe_host:
+    // remote_txe_port_start's TXEs over TCP, for a logical 2*txe_count.
+    int multi_node_enable = 1;
     std::string remote_txe_host;
-    int remote_txe_port = 0;
+    int remote_txe_port_start = 0;
 
     // TSI_REMOTE_TXE_POC ROUND 5: persistent TCP connection to the remote
     // TXE worker, opened once in ensure_tsi_runtime_initialized() and reused
@@ -168,7 +179,7 @@ auto &device_free = g_rt.device_free;
 auto &multi_thread_enable     = g_rt.multi_thread_enable;
 auto &multi_node_enable       = g_rt.multi_node_enable;
 auto &remote_txe_host         = g_rt.remote_txe_host;
-auto &remote_txe_port         = g_rt.remote_txe_port;
+auto &remote_txe_port_start   = g_rt.remote_txe_port_start;
 auto &remote_txe_fd           = g_rt.remote_txe_fd;
 auto &packed_args     = g_rt.packed_args;
 
@@ -333,13 +344,15 @@ struct tsi_deploy_cfg_t {
     bool has_triton_matmul_small_n_transpose_opt = false;
 #endif
 
-    // TSI_REMOTE_TXE_POC: cross-instance (multi-node) TXE dispatch.
-    bool multi_node_enable = false;
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch.
+    // multi_node_enable is now the parsed TOTAL NODE COUNT (see the g_rt
+    // struct's comment above for the full semantics) -- 1 = disabled.
+    int  multi_node_enable = 1;
     bool has_multi_node_enable = false;
     std::string remote_txe_host;
     bool has_remote_txe_host = false;
-    int  remote_txe_port = -1;
-    bool has_remote_txe_port = false;
+    int  remote_txe_port_start = -1;
+    bool has_remote_txe_port_start = false;
 };
 
 // Heuristics supported for txe_count:
@@ -433,12 +446,16 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
         }
 #endif
 
-        // TSI_REMOTE_TXE_POC: cross-instance (multi-node) TXE dispatch keys.
-        if (t.find("multi_node_enable") != std::string::npos &&
+        // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE
+        // dispatch keys. multi_node is a total-node-count integer now, not
+        // a bool -- 1 (or absent) = disabled, 2 = today's implemented case,
+        // >2 accepted for future use but not yet functional (see the g_rt
+        // struct's comment for the full explanation).
+        if (t.find("multi_node") != std::string::npos &&
             t.find(':') != std::string::npos) {
-            bool b = false;
-            if (tsi_parse_bool_after_colon(t, &b)) {
-                cfg.multi_node_enable = b;
+            int v = tsi_parse_int_after_colon(t);
+            if (v > 0) {
+                cfg.multi_node_enable = v;
                 cfg.has_multi_node_enable = true;
             }
         }
@@ -452,12 +469,12 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
             }
         }
 
-        if (t.find("remote_txe_port") != std::string::npos &&
+        if (t.find("remote_txe_port_start") != std::string::npos &&
             t.find(':') != std::string::npos) {
             int v = tsi_parse_int_after_colon(t);
             if (v > 0) {
-                cfg.remote_txe_port = v;
-                cfg.has_remote_txe_port = true;
+                cfg.remote_txe_port_start = v;
+                cfg.has_remote_txe_port_start = true;
             }
         }
 
@@ -1767,7 +1784,7 @@ static bool tsi_remote_txe_recv_all(int fd, void *buf, size_t n) {
     return true;
 }
 
-// Opens a fresh TCP connection to remote_txe_host:remote_txe_port. Returns
+// Opens a fresh TCP connection to remote_txe_host:remote_txe_port_start. Returns
 // -1 (and logs why) on any failure.
 //
 // ROUND 5 history: through Round 4, EVERY remote MAT_MUL dispatch called
@@ -1786,7 +1803,7 @@ static bool tsi_remote_txe_recv_all(int fd, void *buf, size_t n) {
 // (see g_remote_slot_mutex below), so there is no concurrent-reconnect race
 // to guard against in this POC.
 static int tsi_remote_txe_connect() {
-    if (remote_txe_host.empty() || remote_txe_port <= 0) {
+    if (remote_txe_host.empty() || remote_txe_port_start <= 0) {
         return -1;
     }
 
@@ -1797,7 +1814,7 @@ static int tsi_remote_txe_connect() {
 
     struct sockaddr_in addr {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)remote_txe_port);
+    addr.sin_port = htons((uint16_t)remote_txe_port_start);
 
     if (inet_pton(AF_INET, remote_txe_host.c_str(), &addr.sin_addr) != 1) {
         // This POC's yaml (remote_txe_host) is documented/specified as a
@@ -1836,20 +1853,20 @@ static void tsi_remote_txe_ensure_reachable() {
     int fd = tsi_remote_txe_connect();
     if (fd < 0) {
         fprintf(stderr,
-                "ERROR: multi_node_enable=true but the remote TXE worker at "
+                "ERROR: multi_node=%d but the remote TXE worker at "
                 "%s:%d is not reachable. Start the remote-worker process on "
                 "that TSISIM instance first (see tsisim-multinode-poc-llamacpp.md), "
-                "or set multi_node_enable: false to run local-only.\n",
-                remote_txe_host.c_str(), remote_txe_port);
+                "or set multi_node: 1 to run local-only.\n",
+                multi_node_enable, remote_txe_host.c_str(), remote_txe_port_start);
         fflush(stderr);
         abort();
     }
     remote_txe_fd = fd;
     fprintf(stderr,
-            "[tsavorite] multi_node_enable=true: remote TXE worker at %s:%d "
+            "[tsavorite] multi_node=%d: remote TXE worker at %s:%d "
             "is reachable -- opened persistent connection (fd=%d) for the "
             "life of this process.\n",
-            remote_txe_host.c_str(), remote_txe_port, fd);
+            multi_node_enable, remote_txe_host.c_str(), remote_txe_port_start, fd);
 }
 
 // TSI_REMOTE_TXE_POC ROUND 5: closes the persistent remote-TXE-worker
@@ -2021,13 +2038,13 @@ static bool tsi_remote_dispatch_mul_mat(
             if (remote_txe_fd < 0) {
                 fprintf(stderr,
                         "ERROR: remote MAT_MUL dispatch: cannot (re)connect to %s:%d\n",
-                        remote_txe_host.c_str(), remote_txe_port);
+                        remote_txe_host.c_str(), remote_txe_port_start);
                 continue;
             }
             fprintf(stderr,
                     "[tsavorite] remote MAT_MUL dispatch: (re)established "
                     "persistent connection to %s:%d (fd=%d)\n",
-                    remote_txe_host.c_str(), remote_txe_port, remote_txe_fd);
+                    remote_txe_host.c_str(), remote_txe_port_start, remote_txe_fd);
         }
 
         int fd = remote_txe_fd;
@@ -2061,7 +2078,7 @@ static bool tsi_remote_dispatch_mul_mat(
         fprintf(stderr,
                 "WARNING: remote MAT_MUL dispatch on persistent connection to "
                 "%s:%d failed (M_valid=%ld N=%ld K=%ld), attempt %d/2%s\n",
-                remote_txe_host.c_str(), remote_txe_port,
+                remote_txe_host.c_str(), remote_txe_port_start,
                 (long)M_valid, (long)N, (long)K, attempt + 1,
                 attempt == 0 ? " -- will reconnect and retry once" : "");
         if (remote_txe_fd >= 0) {
@@ -2073,7 +2090,7 @@ static bool tsi_remote_dispatch_mul_mat(
     fprintf(stderr,
             "ERROR: remote MAT_MUL dispatch to %s:%d failed after reconnect "
             "retry (M_valid=%ld N=%ld K=%ld)\n",
-            remote_txe_host.c_str(), remote_txe_port,
+            remote_txe_host.c_str(), remote_txe_port_start,
             (long)M_valid, (long)N, (long)K);
     return false;
 }
@@ -2133,18 +2150,29 @@ static void ensure_tsi_runtime_initialized() {
         false;
 #endif
 
-    // TSI_REMOTE_TXE_POC: cross-instance (multi-node) TXE dispatch.
-    multi_node_enable = cfg.has_multi_node_enable ? cfg.multi_node_enable : false;
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch.
+    // multi_node_enable is now a total-node-count int; 1 = disabled.
+    multi_node_enable = cfg.has_multi_node_enable ? cfg.multi_node_enable : 1;
     remote_txe_host = cfg.has_remote_txe_host ? cfg.remote_txe_host : std::string();
-    remote_txe_port = cfg.has_remote_txe_port ? cfg.remote_txe_port : 0;
+    remote_txe_port_start = cfg.has_remote_txe_port_start ? cfg.remote_txe_port_start : 0;
 
-    if (multi_node_enable && (remote_txe_host.empty() || remote_txe_port <= 0)) {
+    if (multi_node_enable >= 2 && (remote_txe_host.empty() || remote_txe_port_start <= 0)) {
         fprintf(stderr,
-                "ERROR: multi_node_enable=true but remote_txe_host/remote_txe_port "
-                "are missing or invalid in %s (remote_txe_host='%s' remote_txe_port=%d)\n",
-                yaml_path.c_str(), remote_txe_host.c_str(), remote_txe_port);
+                "ERROR: multi_node=%d but remote_txe_host/remote_txe_port_start "
+                "are missing or invalid in %s (remote_txe_host='%s' remote_txe_port_start=%d)\n",
+                multi_node_enable, yaml_path.c_str(), remote_txe_host.c_str(), remote_txe_port_start);
         fflush(stderr);
         abort();
+    }
+    if (multi_node_enable > 2) {
+        fprintf(stderr,
+                "WARNING: multi_node=%d requested, but only 2-node dispatch is "
+                "actually implemented today -- this instance will behave exactly "
+                "as multi_node=2 (one remote peer at remote_txe_host:"
+                "remote_txe_port_start). Extending to more than one remote peer "
+                "is real, separate future work, not implemented in this POC.\n",
+                multi_node_enable);
+        fflush(stderr);
     }
 
     static TsavoriteDeviceConfig deviceConfig{};
@@ -2179,10 +2207,10 @@ static void ensure_tsi_runtime_initialized() {
            (int)triton_matmul_small_n_transpose_opt);
 #endif
 
-    printf(" multi_node_enable=%d", (int)multi_node_enable);
-    if (multi_node_enable) {
-        printf(" remote_txe_host=%s remote_txe_port=%d",
-               remote_txe_host.c_str(), remote_txe_port);
+    printf(" multi_node=%d", multi_node_enable);
+    if (multi_node_enable >= 2) {
+        printf(" remote_txe_host=%s remote_txe_port_start=%d",
+               remote_txe_host.c_str(), remote_txe_port_start);
     }
 
     printf("\n");
@@ -2212,7 +2240,7 @@ static void ensure_tsi_runtime_initialized() {
     // TSI_REMOTE_TXE_POC: verify the remote worker is reachable as part of
     // bring-up. Fails loudly (abort) rather than silently degrading to
     // local-only -- see tsi_remote_txe_ensure_reachable() above.
-    if (multi_node_enable) {
+    if (multi_node_enable >= 2) {
         tsi_remote_txe_ensure_reachable();
     }
 
@@ -3366,7 +3394,7 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
   // line right after the standard perf output above. Only meaningful when
   // multi_node_enable was ever true (otherwise remote is trivially 0 and
   // this would just be redundant noise on every ordinary single-node run).
-  if (multi_node_enable) {
+  if (multi_node_enable >= 2) {
       tsi_report_mul_mat_kernel_run_split();
   }
 
@@ -6000,7 +6028,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     // TXEs, at the SAME baseline tile size. When multi_node_enable is false
     // this is byte-for-byte the original active_txes = num_of_txes path.
     const int64_t active_txes =
-        multi_node_enable ? (int64_t)num_of_txes * 2 : (int64_t)num_of_txes;
+        (multi_node_enable >= 2) ? (int64_t)num_of_txes * 2 : (int64_t)num_of_txes;
 
     // ROUND 6 FIX (2026-09-16): Round 5 proved that sizing rows_per_txe from
     // num_of_txes alone makes the remote lane range mathematically
@@ -6028,7 +6056,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         (M + baseline_rows_per_txe - 1) / baseline_rows_per_txe;
 
     int64_t rows_per_txe;
-    if (multi_node_enable && baseline_tiles_needed >= (int64_t)num_of_txes) {
+    if (multi_node_enable >= 2 && baseline_tiles_needed >= (int64_t)num_of_txes) {
         const int64_t active_rows_per_txe_unaligned =
             (M + active_txes - 1) / active_txes;
         rows_per_txe = tsi_round_up_i64(active_rows_per_txe_unaligned, txe_shape.m_dim);
@@ -6036,6 +6064,15 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         rows_per_txe = baseline_rows_per_txe;
     }
     uint64_t launched_kernel_calls = 0;
+    // ROUND 7b: launched_kernel_calls only ever counts LOCAL per-tile
+    // dispatches now (each one IS exactly 1 real kernel launch, so a
+    // flat ++ is correct there). Remote dispatches are tracked here
+    // instead, using the REAL count reported by the worker (see the
+    // remote branch below) -- this feeds node->tsi_kernel_runs /
+    // profile.kernel_calls / device stats at the end of this function
+    // so the standard GGML Perf Summary table's own MUL_MAT row is
+    // correct too, not just the separate Tsavorite breakdown print.
+    std::atomic<int64_t> remote_kernel_runs_this_node{0};
 
     for (int64_t d3 = 0; d3 < D3; ++d3) {
         for (int64_t d2 = 0; d2 < D2; ++d2) {
@@ -6105,7 +6142,8 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                         workers.emplace_back([=, &batch_profile_mutex,
                                                &batch_wait_sum_us,
-                                               &batch_launch_us] {
+                                               &batch_launch_us,
+                                               &remote_kernel_runs_this_node] {
                             tsi_remote_slot_acquire();
 
                             const int64_t t0 = tsavorite_now_us();
@@ -6165,10 +6203,17 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                 abort();
                             }
 
-                            // ROUND 7: accumulate the REAL count reported by
-                            // the worker for this request -- see
-                            // tsi_report_mul_mat_kernel_run_split() above.
+                            // ROUND 7/7b: accumulate the REAL count reported
+                            // by the worker for this request -- into the
+                            // global cross-run counter (for
+                            // tsi_report_mul_mat_kernel_run_split()) AND
+                            // into this specific node's own local
+                            // accumulator (so node->tsi_kernel_runs and the
+                            // standard GGML Perf Summary table are correct
+                            // too, not just the separate breakdown print).
                             g_tsi_remote_mulmat_kernel_runs.fetch_add(
+                                remote_real_kernel_runs, std::memory_order_relaxed);
+                            remote_kernel_runs_this_node.fetch_add(
                                 remote_real_kernel_runs, std::memory_order_relaxed);
 
                             // NOTE: ggml_mul_mat's result tensor has
@@ -6202,12 +6247,15 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                         });
 
                         ++batch_launched;
-                        ++launched_kernel_calls;
-                        // ROUND 7: g_tsi_remote_mulmat_kernel_runs is now
-                        // accumulated inside the async dispatch lambda above
-                        // (real per-request count from the worker), not
-                        // here -- this call is fire-and-forget at this
-                        // point, the real count isn't known yet.
+                        // ROUND 7b: launched_kernel_calls is NOT incremented
+                        // here anymore -- a coalesced remote wave is not "1
+                        // kernel launch", it's however many the worker
+                        // actually ran (see remote_kernel_runs_this_node.
+                        // fetch_add inside the lambda above, using the real
+                        // count g_tsi_remote_mulmat_kernel_runs is also fed
+                        // from). This call is fire-and-forget at this
+                        // point; the real count isn't known until the
+                        // lambda's dispatch call returns.
                         continue;
                     }
 
@@ -6372,12 +6420,22 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         }
     }
 
+    // ROUND 7b: fold the real remote kernel-run count (reported by the
+    // worker over the wire, per request -- see remote_kernel_runs_this_node
+    // above) into the same totals local-only dispatch always fed, so the
+    // standard GGML Perf Summary table's MUL_MAT row (and device stats,
+    // and the profiler) reflect the true combined total, not a
+    // "1 coalesced call = 1 unit" undercount.
+    const int64_t real_remote_this_node = remote_kernel_runs_this_node.load();
+    const int64_t total_kernel_runs_this_node =
+        (int64_t)launched_kernel_calls + real_remote_this_node;
+
     if (device) {
-        device->stats.op_run_count[kernel_type].num_of_kernel_call += launched_kernel_calls;
+        device->stats.op_run_count[kernel_type].num_of_kernel_call += total_kernel_runs_this_node;
     }
 
-    node->tsi_kernel_runs += launched_kernel_calls;
-    profile.kernel_calls += (int64_t)launched_kernel_calls;
+    node->tsi_kernel_runs += total_kernel_runs_this_node;
+    profile.kernel_calls += total_kernel_runs_this_node;
 
     profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
     tsavorite_matmul_profile_record(node, profile);
