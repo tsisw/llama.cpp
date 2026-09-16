@@ -45,6 +45,11 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstdint>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <deque>
+#include <memory>
 
 static bool tsi_recv_all(int fd, void *buf, size_t n) {
     uint8_t *p = (uint8_t *)buf;
@@ -83,9 +88,9 @@ static bool tsi_send_all(int fd, const void *buf, size_t n) {
 //             on THIS process's own local TXE runtime)
 #define TSI_REMOTE_TXE_MAGIC 0x54584552u
 
-// Round 3: the worker now accepts *concurrent* client connections (one
+// Round 3: the worker accepted *concurrent* client connections (one
 // std::thread per connection, see tsi_run_remote_worker() below), each of
-// which can call ggml_backend_graph_compute() independently. But
+// which called ggml_backend_graph_compute() independently. But
 // ggml-tsavorite.cpp's TXE dispatch state (the `workers` vector of
 // in-flight blob-execution threads, `device_free[]`, `device_mutex`,
 // `workers_mutex`, packed_args[]/scalar_*_args[]) is process-global and was
@@ -95,18 +100,21 @@ static bool tsi_send_all(int fd, const void *buf, size_t n) {
 // into and join()-ing the *same* global `workers` vector via
 // join_all_workers() can cross-join each other's row-tile threads (one
 // call's join_all_workers() silently reaping and waiting on a *different*
-// call's threads), which was observed directly during real-model testing
-// as a genuine hang: worker threads piled up (44 live threads for what
-// should have been at most ~20 local + a handful of connection handlers),
-// worker CPU dropped to idle, and client connections sat blocked in
-// recv() forever with no forward progress. Serializing worker-side
-// dispatch with this mutex trades away worker-side request-level overlap
-// (the worker still parallelizes *within* one request across its own
-// local TXEs via ggml-tsavorite.cpp's own multi-TXE row-splitting; only
-// concurrent *separate* MAT_MUL/ADD requests from different connections
-// are now queued rather than run concurrently) for correctness, which is
-// the right tradeoff for this POC given the shared global state was never
-// built for multi-caller concurrency.
+// call's threads, and returning early while the other call's threads are
+// still writing into ITS OWN now-popped stack frame -- a real
+// dangling-stack-reference bug), which was observed directly during
+// real-model testing as a genuine hang: worker threads piled up (44 live
+// threads for what should have been at most ~20 local + a handful of
+// connection handlers), worker CPU dropped to idle, and client connections
+// sat blocked in recv() forever with no forward progress. Round 3 added
+// this mutex to serialize entry into the two worker-side dispatch
+// functions, which fixed the *cross-call* corruption -- but a *residual*
+// hang remained even with only one caller ever active at a time (see
+// tsi_worker_dispatch_thread_main's comment below for the Round 4 root
+// cause and real fix: it was never really about concurrent *callers*, it
+// was about which OS *thread* ever called graph_compute() at all). This
+// mutex is kept as a cheap, harmless second line of defense -- with Round
+// 4's single dedicated dispatch thread, it is never actually contended.
 static std::mutex g_worker_compute_mutex;
 
 // Runs one real ADD op through the Tsavorite backend for the given already
@@ -249,10 +257,110 @@ static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
     return ok;
 }
 
+// TSI_REMOTE_TXE_POC (ROUND 4): dedicated single dispatch-thread
+// architecture, replacing Round 3's g_worker_compute_mutex-only fix.
+//
+// Root cause of the residual hang (Round 3 sec. 6 point 2 -- "a single such
+// request could still internally trigger the worker's own Multi-TXE
+// row-splitting and hang there", root-caused only as far as "something
+// about the repeated fresh-context-per-request pattern interacting badly
+// with the shared TXE runtime's Multi-TXE path", not fully isolated):
+// every context in which ggml_tsavorite_run_tmu_mul_mat()'s multi-TXE
+// row-splitting is *known* to work correctly -- plain local llama-cli
+// inference, and Round 2's ADD POC (which served every request
+// sequentially in a single accept-loop, no per-connection thread spawn) --
+// always calls ggml_backend_graph_compute() from the SAME single OS thread
+// across the whole life of the process: the same thread that performed
+// ggml_backend_tsavorite_init(). Round 3's worker broke that invariant to
+// get concurrent connection handling: it spawned a FRESH std::thread per
+// accepted connection, and it was THAT thread which called
+// graph_compute() -- a different OS thread than the init thread, and a
+// different OS thread from one request to the next. Adding
+// g_worker_compute_mutex (Round 3's fix) removed *concurrent* callers but
+// did not restore the "always the same calling thread" invariant, and the
+// hang persisted for a single caller. That is the single structural
+// difference between this code path and every proven-working one, and is
+// the most likely real root cause.
+//
+// Round 4 restores the invariant directly: exactly ONE dedicated compute
+// thread is spawned, once, immediately after ggml_backend_tsavorite_init()
+// (see tsi_run_remote_worker() below) and never replaced -- it is the ONLY
+// thread that ever calls tsi_remote_worker_run_add()/
+// tsi_remote_worker_run_mul_mat() (and therefore the only thread that ever
+// calls ggml_backend_graph_compute()) for the entire lifetime of the
+// worker process. Per-connection threads still do their own socket I/O
+// (recv the request, send the response) concurrently -- that part was
+// never the problem -- but hand the actual compute off to this thread via
+// a simple thread-safe job queue, and block on a std::future for the
+// result. This keeps genuine throughput (many connections can be open and
+// queued at once; each job still gets full internal num_of_txes-way
+// parallelism on this worker's own local TXEs once it's picked up) while
+// eliminating the one architectural anomaly a real fix needed to remove,
+// rather than just papering over its symptom with a client-side
+// concurrency cap (see ggml-tsavorite.cpp's kRemoteSlotCapacity comment for
+// the client-side half of this Round 4 change).
+struct TsiWorkerJob {
+    bool is_matmul = false;
+    // ADD fields
+    std::vector<float> add_a, add_b;
+    // MATMUL fields
+    std::vector<float> mm_a_rows, mm_b_rows;
+    int64_t mm_m_valid = 0, mm_n = 0, mm_k = 0;
+    // Result + completion signal, filled in by the dispatch thread and
+    // consumed by the connection thread that submitted this job.
+    std::promise<bool> done;
+    std::vector<float> result;
+};
+
+static std::mutex g_job_queue_mutex;
+static std::condition_variable g_job_queue_cv;
+static std::deque<std::shared_ptr<TsiWorkerJob>> g_job_queue;
+
+// Submits a job and returns a future the caller blocks on for completion.
+// Safe to call from any number of concurrent connection threads.
+static std::future<bool> tsi_worker_submit_job(std::shared_ptr<TsiWorkerJob> job) {
+    std::future<bool> fut = job->done.get_future();
+    {
+        std::lock_guard<std::mutex> lock(g_job_queue_mutex);
+        g_job_queue.push_back(job);
+    }
+    g_job_queue_cv.notify_one();
+    return fut;
+}
+
+// The body of the single dedicated dispatch thread. Runs forever, one job
+// at a time, always on the same OS thread that started this loop (spawned
+// once from tsi_run_remote_worker(), immediately after
+// ggml_backend_tsavorite_init() on that same thread).
+static void tsi_worker_dispatch_thread_main(ggml_backend_t backend) {
+    for (;;) {
+        std::shared_ptr<TsiWorkerJob> job;
+        {
+            std::unique_lock<std::mutex> lock(g_job_queue_mutex);
+            g_job_queue_cv.wait(lock, [] { return !g_job_queue.empty(); });
+            job = g_job_queue.front();
+            g_job_queue.pop_front();
+        }
+
+        bool ok;
+        if (job->is_matmul) {
+            ok = tsi_remote_worker_run_mul_mat(backend, job->mm_a_rows, job->mm_m_valid,
+                                                job->mm_b_rows, job->mm_n, job->mm_k,
+                                                job->result);
+        } else {
+            ok = tsi_remote_worker_run_add(backend, job->add_a, job->add_b, job->result);
+        }
+        job->done.set_value(ok);
+    }
+}
+
 // Serves requests on one accepted connection until the peer disconnects.
 // Handles both the original ADD protocol and the newer MAT_MUL protocol on
-// the same port, dispatched by the leading magic value.
-static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
+// the same port, dispatched by the leading magic value. Socket I/O happens
+// on this (per-connection) thread; the actual TXE dispatch is handed off to
+// the single dedicated dispatch thread via tsi_worker_submit_job() -- see
+// its comment above for why.
+static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t /*backend*/) {
     for (;;) {
         uint32_t magic = 0;
         if (!tsi_recv_all(fd, &magic, sizeof(magic))) break;
@@ -265,19 +373,24 @@ static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
                 break;
             }
 
-            std::vector<float> A(n), B(n), C;
-            if (!tsi_recv_all(fd, A.data(), (size_t)n * sizeof(float))) break;
-            if (!tsi_recv_all(fd, B.data(), (size_t)n * sizeof(float))) break;
+            auto job = std::make_shared<TsiWorkerJob>();
+            job->is_matmul = false;
+            job->add_a.resize(n);
+            job->add_b.resize(n);
+            if (!tsi_recv_all(fd, job->add_a.data(), (size_t)n * sizeof(float))) break;
+            if (!tsi_recv_all(fd, job->add_b.data(), (size_t)n * sizeof(float))) break;
 
-            fprintf(stderr, "[remote-worker] ADD request: n=%u A[0]=%g B[0]=%g -- dispatching real ADD to local TXE runtime\n",
-                    n, A[0], B[0]);
+            fprintf(stderr, "[remote-worker] ADD request: n=%u A[0]=%g B[0]=%g -- queuing for the dispatch thread\n",
+                    n, job->add_a[0], job->add_b[0]);
 
-            if (!tsi_remote_worker_run_add(backend, A, B, C)) {
+            std::future<bool> fut = tsi_worker_submit_job(job);
+            if (!fut.get()) {
                 fprintf(stderr, "[remote-worker] local TXE dispatch failed, dropping connection\n");
                 break;
             }
+            const std::vector<float> &C = job->result;
 
-            fprintf(stderr, "[remote-worker] result: C[0]=%g (expected %g)\n", C[0], A[0] + B[0]);
+            fprintf(stderr, "[remote-worker] result: C[0]=%g (expected %g)\n", C[0], job->add_a[0] + job->add_b[0]);
 
             if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
             if (!tsi_send_all(fd, C.data(), (size_t)n * sizeof(float))) break;
@@ -295,17 +408,25 @@ static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
                 break;
             }
 
-            std::vector<float> A_rows((size_t)(M_valid * K)), B_rows((size_t)(N * K)), C;
-            if (!tsi_recv_all(fd, A_rows.data(), A_rows.size() * sizeof(float))) break;
-            if (!tsi_recv_all(fd, B_rows.data(), B_rows.size() * sizeof(float))) break;
+            auto job = std::make_shared<TsiWorkerJob>();
+            job->is_matmul = true;
+            job->mm_m_valid = M_valid;
+            job->mm_n = N;
+            job->mm_k = K;
+            job->mm_a_rows.resize((size_t)(M_valid * K));
+            job->mm_b_rows.resize((size_t)(N * K));
+            if (!tsi_recv_all(fd, job->mm_a_rows.data(), job->mm_a_rows.size() * sizeof(float))) break;
+            if (!tsi_recv_all(fd, job->mm_b_rows.data(), job->mm_b_rows.size() * sizeof(float))) break;
 
-            fprintf(stderr, "[remote-worker] MAT_MUL request: M_valid=%ld N=%ld K=%ld -- dispatching real ggml_mul_mat to local TXE runtime\n",
+            fprintf(stderr, "[remote-worker] MAT_MUL request: M_valid=%ld N=%ld K=%ld -- queuing for the dispatch thread\n",
                     (long)M_valid, (long)N, (long)K);
 
-            if (!tsi_remote_worker_run_mul_mat(backend, A_rows, M_valid, B_rows, N, K, C)) {
+            std::future<bool> fut = tsi_worker_submit_job(job);
+            if (!fut.get()) {
                 fprintf(stderr, "[remote-worker] local MAT_MUL TXE dispatch failed, dropping connection\n");
                 break;
             }
+            const std::vector<float> &C = job->result;
 
             fprintf(stderr, "[remote-worker] MAT_MUL result: C[0]=%g (M_valid*N=%zu floats)\n",
                     C.empty() ? 0.0f : C[0], C.size());
@@ -320,18 +441,15 @@ static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t backend) {
     }
 }
 
-static int tsi_run_remote_worker(int port) {
-    fprintf(stderr, "[remote-worker] initializing Tsavorite backend locally on THIS instance...\n");
-    ggml_backend_t backend = ggml_backend_tsavorite_init();
-    if (!backend) {
-        fprintf(stderr, "[remote-worker] ggml_backend_tsavorite_init() failed\n");
-        return -1;
-    }
-    fprintf(stderr, "[remote-worker] local Tsavorite/TXE runtime initialized successfully. "
-                     "Serving remote ADD dispatch on port %d\n", port);
-
+// Runs the accept loop: one thread per accepted connection handles that
+// connection's socket I/O (recv/send) concurrently with every other
+// connection. The actual TXE dispatch for each request is handed off to
+// the single dispatch thread (see tsi_worker_dispatch_thread_main) via
+// tsi_worker_submit_job() from within tsi_remote_worker_serve_conn() --
+// concurrent connections here do NOT mean concurrent graph_compute() calls.
+static void tsi_run_remote_worker_accept_loop(int port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("[remote-worker] socket"); return -1; }
+    if (listen_fd < 0) { perror("[remote-worker] socket"); return; }
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -342,11 +460,11 @@ static int tsi_run_remote_worker(int port) {
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("[remote-worker] bind");
-        return -1;
+        return;
     }
     if (listen(listen_fd, 8) < 0) {
         perror("[remote-worker] listen");
-        return -1;
+        return;
     }
     fprintf(stderr, "[remote-worker] listening on 0.0.0.0:%d\n", port);
 
@@ -363,22 +481,43 @@ static int tsi_run_remote_worker(int port) {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         fprintf(stderr, "[remote-worker] connection from %s:%d\n",
                 inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
-        // Round 3: one thread per accepted connection, so multiple
-        // concurrent MAT_MUL row-tile dispatches from the initiator's own
-        // local multi-TXE loop (up to txe_count in flight, bounded by its
-        // own remote-slot semaphore) are genuinely served in parallel here,
-        // matching how many real local TXEs this instance actually has.
-        // ggml_backend_graph_compute() against this shared `backend` handle
-        // is safe to call concurrently: it is the same underlying
-        // acquire_device_blocking()/release_device()-guarded dispatch the
-        // local multi-TXE path already uses concurrently within one graph.
-        std::thread([fd, backend, cli]() {
-            tsi_remote_worker_serve_conn(fd, backend);
+        // One thread per accepted connection for socket I/O only -- see the
+        // big comment above tsi_worker_dispatch_thread_main() for why the
+        // actual TXE dispatch is NOT done on this thread as of Round 4.
+        std::thread([fd, cli]() {
+            tsi_remote_worker_serve_conn(fd, nullptr);
             close(fd);
             fprintf(stderr, "[remote-worker] connection from %s:%d closed\n",
                     inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
         }).detach();
     }
+    // unreachable
+}
+
+static int tsi_run_remote_worker(int port) {
+    fprintf(stderr, "[remote-worker] initializing Tsavorite backend locally on THIS instance...\n");
+    ggml_backend_t backend = ggml_backend_tsavorite_init();
+    if (!backend) {
+        fprintf(stderr, "[remote-worker] ggml_backend_tsavorite_init() failed\n");
+        return -1;
+    }
+    fprintf(stderr, "[remote-worker] local Tsavorite/TXE runtime initialized successfully. "
+                     "Serving remote ADD/MAT_MUL dispatch on port %d\n", port);
+
+    // ROUND 4: the accept loop (and all per-connection socket I/O) moves to
+    // its own thread. THIS thread -- the one that just called
+    // ggml_backend_tsavorite_init() above -- becomes the single, permanent
+    // dispatch thread instead, by calling tsi_worker_dispatch_thread_main()
+    // directly (it never returns). This is deliberate, not incidental: it
+    // guarantees every ggml_backend_graph_compute() call this process ever
+    // makes runs on the exact same OS thread that initialized the TXE
+    // runtime, matching the invariant every previously-proven-correct case
+    // (local llama-cli inference, Round 2's ADD POC) already relied on --
+    // see the comment above tsi_worker_dispatch_thread_main() for the full
+    // reasoning and why Round 3's per-connection-thread dispatch broke it.
+    std::thread(tsi_run_remote_worker_accept_loop, port).detach();
+
+    tsi_worker_dispatch_thread_main(backend);
     // unreachable
     return 0;
 }

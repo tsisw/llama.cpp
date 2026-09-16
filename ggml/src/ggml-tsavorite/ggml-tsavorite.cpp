@@ -1821,28 +1821,32 @@ static void tsi_remote_txe_ensure_reachable() {
             remote_txe_host.c_str(), remote_txe_port);
 }
 
-// Bounded concurrency pool for in-flight remote MAT_MUL dispatches. Sized to
-// num_of_txes (this POC's fixed two-node topology assumes the remote
-// instance runs the same txe_count), so at most that many remote row-tiles
-// are ever in flight at once -- mirroring how many real TXEs the remote side
-// actually has to run them on.
+// Bounded concurrency pool for in-flight remote MAT_MUL dispatches.
 //
-// Round 3 correctness note: this was originally sized to num_of_txes (up to
-// 20 concurrent remote dispatches in flight). Real-model testing (M=56,
-// K=2048 tiles, not the small synthetic/tiny-model shapes) surfaced a real
-// hang when multiple concurrent remote requests each triggered the worker's
-// own internal Multi-TXE row-splitting concurrently against process-global
-// state (ggml-tsavorite.cpp's `workers` vector / device_free[] / mutexes
-// were never designed for concurrent top-level graph_compute() callers --
-// see simple-backend-tsi.cpp's g_worker_compute_mutex comment for the
-// worker-side half of this fix). Capping this to 1 guarantees at most one
-// remote dispatch (and therefore at most one fresh ggml_backend_graph_compute()
-// call touching the worker's shared TXE dispatch state) is ever in flight,
-// which is the exact repeated-sequential-call pattern already proven
-// correct by the Round 2 ADD POC (n=8, n=32, n=137 calls in sequence). This
-// trades away remote-side request-level overlap (still get correctness +
-// genuine cross-instance execution + real overlap with LOCAL lanes running
-// concurrently on this instance) for a hang-free result.
+// Round 3 history: this was originally sized to num_of_txes (up to 20
+// concurrent remote dispatches in flight, one per row-tile). Real-model
+// testing (M=56, K=2048 tiles, not the small synthetic/tiny-model shapes)
+// surfaced a real hang when multiple concurrent remote requests each
+// triggered the worker's own internal Multi-TXE row-splitting concurrently
+// against process-global state. Round 3 worked around it by capping this to
+// 1, trading away remote-side request-level overlap for a hang-free result
+// (see ROUND 3 sec. 6/7/8 in tsisim-multinode-poc-llamacpp.md).
+//
+// Round 4: the client now coalesces an entire wave's remote lane-range into
+// ONE combined request (see ggml_tsavorite_run_tmu_mul_mat's
+// remote_dispatched_this_wave), so there is only ever one remote dispatch
+// in flight per wave *by construction* -- this pool is no longer load-
+// bearing for correctness (kept at 1 anyway; it is never contended). The
+// actual fix for the worker-side hang is now on the worker side: see
+// simple-backend-tsi.cpp's dedicated single dispatch-thread architecture,
+// which restores the "top-level graph_compute() always runs on the same OS
+// thread as the one that initialized the runtime" invariant that every
+// previously-proven-correct case (local llama-cli inference, Round 2's ADD
+// POC) already relied on -- Round 3's worker instead spawned a fresh
+// std::thread per accepted connection to call graph_compute(), which is the
+// one structural difference from every known-working case, and is the
+// prime suspect for the residual single-caller hang Round 3 sec. 6 point 2
+// observed even after serializing top-level callers with a mutex.
 static std::mutex g_remote_slot_mutex;
 static std::condition_variable g_remote_slot_cv;
 static int g_remote_slots_free = -1; // lazily initialized to kRemoteSlotCapacity
@@ -1863,9 +1867,12 @@ static void tsi_remote_slot_release() {
     g_remote_slot_cv.notify_one();
 }
 
-// Dispatches one MAT_MUL row-tile to the remote TSISIM instance and blocks
-// for the result. A_rows is M_valid contiguous rows of K floats (the row
-// slice of A assigned to this tile); B_full is N contiguous rows of K
+// Dispatches one (as of Round 4, possibly multi-tile-wide) MAT_MUL row
+// range to the remote TSISIM instance and blocks for the result. A_rows is
+// M_valid contiguous rows of K floats (the row range of A assigned to the
+// remote side for this wave -- Round 4 coalesces what used to be up to
+// num_of_txes separate single-tile calls into one call covering the whole
+// remote range); B_full is N contiguous rows of K
 // floats (matches ggml's own [K,N] tensor convention for src1, i.e. this is
 // literally what a ggml_new_tensor_2d(ctx, F32, K, N) tensor's bytes look
 // like). C_out receives M_valid*N floats (row-major, matching node's own
@@ -5794,16 +5801,37 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     const triton_matmul_txe_shape_t &txe_shape = triton_matmul_select_shape(M, N);
     const int64_t N_pad = tsi_round_up_i64(N, txe_shape.n_dim);
 
-    // TSI_REMOTE_TXE_POC: when multi_node_enable, treat this instance's
-    // txe_count local TXEs plus the second instance's txe_count remote TXEs
-    // as one logical 2*txe_count row-tiling range. Lanes [0, num_of_txes)
-    // dispatch locally exactly as before; lanes [num_of_txes, 2*num_of_txes)
-    // dispatch to the remote TSISIM instance (see is_remote_lane below).
-    // When multi_node_enable is false this is byte-for-byte the original
-    // active_txes = num_of_txes.
+    // TSI_REMOTE_TXE_POC (ROUND 4 revision -- see "ROUND 4" in
+    // tsisim-multinode-poc-llamacpp.md for the full measurement/rationale):
+    // Round 3 computed rows_per_txe from active_txes = 2*num_of_txes, which
+    // roughly HALVED every tile's row count whenever a matmul was large
+    // enough to reach the remote lanes -- nearly doubling total kernel-run
+    // dispatch count (1700 -> 3271 for the same 85 top-level ops) for
+    // ~zero benefit, because this simulator's per-kernel-call cost is
+    // overhead-dominated, not proportional to tile row count (avg ~36.6us
+    // -> ~38.8us per call despite tiles being ~half the size). Round 4
+    // instead computes rows_per_txe from num_of_txes ONLY, so tile size is
+    // always exactly "what a single instance uses per lane" -- identical to
+    // the non-multi-node baseline -- regardless of multi_node_enable.
+    // active_txes still doubles the LANE COUNT available per wave (so a
+    // wave can cover up to 2*num_of_txes baseline-sized tiles instead of
+    // num_of_txes), which only matters for matmuls large enough to need
+    // more than num_of_txes tiles in the first place; small matmuls (most
+    // decode-time ops) never reach lane num_of_txes and are byte-for-byte
+    // unaffected. Lanes [0, num_of_txes) dispatch locally exactly as
+    // before. Lanes [num_of_txes, active_txes) are no longer dispatched one
+    // tiny tile at a time (Round 3's approach, which also required capping
+    // remote concurrency to 1-in-flight for correctness -- see ROUND 3 sec.
+    // 6); instead the ENTIRE remote lane-range of a wave is coalesced into
+    // ONE combined MAT_MUL request (see remote_dispatched_this_wave below),
+    // letting the remote instance's own already-proven internal multi-TXE
+    // row-splitting subdivide it across its own up to num_of_txes local
+    // TXEs, at the SAME baseline tile size. When multi_node_enable is false
+    // this is byte-for-byte the original active_txes = num_of_txes path.
     const int64_t active_txes =
         multi_node_enable ? (int64_t)num_of_txes * 2 : (int64_t)num_of_txes;
-    const int64_t rows_per_txe_unaligned = (M + active_txes - 1) / active_txes;
+    const int64_t rows_per_txe_unaligned =
+        (M + (int64_t)num_of_txes - 1) / (int64_t)num_of_txes;
     const int64_t rows_per_txe =
         tsi_round_up_i64(rows_per_txe_unaligned, txe_shape.m_dim);
 
@@ -5832,6 +5860,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 int64_t batch_copyback_us = 0;
 
                 std::mutex batch_profile_mutex;
+                bool remote_dispatched_this_wave = false;
 
                 for (int64_t t = 0; t < active_txes; ++t) {
                     const int64_t tile_m0 = m0 + t * rows_per_txe;
@@ -5843,11 +5872,35 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     const int64_t M_valid =
                         (M - tile_m0 > rows_per_txe) ? rows_per_txe : (M - tile_m0);
 
-                    // TSI_REMOTE_TXE_POC: lanes >= num_of_txes are the
-                    // remote-instance-backed half of the logical 2*txe_count
-                    // range (only reachable when multi_node_enable is true,
-                    // since active_txes stays == num_of_txes otherwise).
+                    // TSI_REMOTE_TXE_POC (ROUND 4 revision): lanes >=
+                    // num_of_txes are the remote-instance-backed half of the
+                    // logical 2*num_of_txes range (only reachable when
+                    // multi_node_enable is true, since active_txes stays ==
+                    // num_of_txes otherwise). Round 3 dispatched every such
+                    // lane as its own tiny separate remote request (up to
+                    // num_of_txes per wave); Round 4 coalesces the ENTIRE
+                    // remote range of this wave into ONE combined request,
+                    // issued the first time this branch is reached for the
+                    // wave (t == num_of_txes), covering every row from here
+                    // through the end of the wave (or M). Subsequent t
+                    // values in this range are already covered by that one
+                    // dispatch, so they just `continue`. The remote
+                    // instance's own already-proven internal multi-TXE
+                    // row-splitting subdivides the coalesced chunk across
+                    // its own up to num_of_txes local TXEs, at this same
+                    // baseline rows_per_txe tile size (its own copy of this
+                    // same function recomputes rows_per_txe from ITS OWN
+                    // num_of_txes against the M_valid it received).
                     if (t >= (int64_t)num_of_txes) {
+                        if (remote_dispatched_this_wave) {
+                            continue;
+                        }
+                        remote_dispatched_this_wave = true;
+
+                        const int64_t remote_m0 = tile_m0;
+                        const int64_t remote_rows_total =
+                            std::min(M, m0 + active_txes * rows_per_txe) - remote_m0;
+
                         std::lock_guard<std::mutex> lk(workers_mutex);
 
                         workers.emplace_back([=, &batch_profile_mutex,
@@ -5857,18 +5910,22 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                             const int64_t t0 = tsavorite_now_us();
 
-                            // Pack A's row-tile and the full B into plain,
-                            // contiguous [rows x K] float buffers -- the same
-                            // per-row copy helper the local path already uses
-                            // (handles arbitrary strides / non-F32-adjacent
-                            // layouts), but with NO Triton-specific M/N
-                            // padding: the remote side runs a real
-                            // ggml_mul_mat, not the raw Triton blob ABI, so it
-                            // does its own internal packing/padding on its
-                            // own local runtime.
-                            std::vector<float> A_rows((size_t)(M_valid * K));
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t src_r = tile_m0 + r;
+                            // Pack A's coalesced multi-tile row range and
+                            // the full B into plain, contiguous [rows x K]
+                            // float buffers -- the same per-row copy helper
+                            // the local path already uses (handles
+                            // arbitrary strides / non-F32-adjacent layouts),
+                            // but with NO Triton-specific M/N padding: the
+                            // remote side runs a real ggml_mul_mat, not the
+                            // raw Triton blob ABI, so it does its own
+                            // internal packing/padding on its own local
+                            // runtime (including its own internal row
+                            // splitting across its own local TXEs, since
+                            // remote_rows_total can be up to num_of_txes
+                            // baseline tiles' worth of rows).
+                            std::vector<float> A_rows((size_t)(remote_rows_total * K));
+                            for (int64_t r = 0; r < remote_rows_total; ++r) {
+                                const int64_t src_r = remote_m0 + r;
                                 const char *row = A_ptr + src_r * a_nb1;
                                 tsavorite_tensor_copy_k_to_f32(
                                     A, row, A_rows.data() + r * K, K, a_nb0);
@@ -5881,39 +5938,43 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                     B, col, B_rows.data() + c * K, K, b_nb0);
                             }
 
-                            std::vector<float> C_rows((size_t)(M_valid * N));
+                            std::vector<float> C_rows((size_t)(remote_rows_total * N));
                             const bool ok = tsi_remote_dispatch_mul_mat(
-                                A_rows.data(), M_valid,
+                                A_rows.data(), remote_rows_total,
                                 B_rows.data(), N,
                                 K, C_rows.data());
 
                             if (!ok) {
                                 fprintf(stderr,
                                         "ERROR: remote MAT_MUL dispatch failed "
-                                        "(tile_m0=%ld M_valid=%ld N=%ld K=%ld). "
+                                        "(remote_m0=%ld remote_rows_total=%ld N=%ld K=%ld). "
                                         "multi_node_enable requires the remote "
                                         "worker to stay up for correctness.\n",
-                                        (long)tile_m0, (long)M_valid, (long)N, (long)K);
+                                        (long)remote_m0, (long)remote_rows_total, (long)N, (long)K);
                                 fflush(stderr);
                                 tsi_remote_slot_release();
                                 tsi_cleanup();
                                 abort();
                             }
 
-                            // NOTE: ggml_mul_mat's result tensor has ne0=M,
-                            // ne1=N (fastest-varying dim is M), so its raw,
-                            // contiguous buffer -- exactly what the remote
-                            // worker sends back unmodified via
-                            // ggml_backend_tensor_get() -- is flat-indexed as
-                            // [n * M_valid + m], NOT the row-major [m * N + n]
-                            // one might assume. Verified against a hand-
-                            // computed reference case before wiring this into
-                            // the real inference path (see round-3 writeup).
-                            for (int64_t r = 0; r < M_valid; ++r) {
-                                const int64_t dst_r = tile_m0 + r;
+                            // NOTE: ggml_mul_mat's result tensor has
+                            // ne0=remote_rows_total, ne1=N (fastest-varying
+                            // dim is M), so its raw, contiguous buffer --
+                            // exactly what the remote worker sends back
+                            // unmodified via ggml_backend_tensor_get() -- is
+                            // flat-indexed as [n * remote_rows_total + m],
+                            // NOT the row-major [m * N + n] one might
+                            // assume. Verified against a hand-computed
+                            // reference case in Round 3 before wiring this
+                            // into the real inference path; the indexing
+                            // itself is unchanged by Round 4's coalescing
+                            // (only M_valid's meaning/size changed, from one
+                            // tile to the whole remote range of the wave).
+                            for (int64_t r = 0; r < remote_rows_total; ++r) {
+                                const int64_t dst_r = remote_m0 + r;
                                 for (int64_t c = 0; c < N; ++c) {
                                     *(float *)(C_ptr + dst_r * c_nb0 + c * c_nb1) =
-                                        C_rows[(size_t)(c * M_valid + r)];
+                                        C_rows[(size_t)(c * remote_rows_total + r)];
                                 }
                             }
 
