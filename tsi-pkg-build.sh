@@ -1070,6 +1070,13 @@ update_one_tsavorite_deployment_yaml() {
   local advanced_matmul_broadcast_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
 local user_dram_size_gb="8"
+  # TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch,
+  # preserved across ggml.sh re-runs the same way the advanced_matmul_*
+  # flags are. multi_node is a total-node-count integer -- 1 = disabled
+  # (default).
+  local multi_node_enable="1"
+  local remote_txe_host=""
+  local remote_txe_port=""
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1078,10 +1085,16 @@ local user_dram_size_gb="8"
     local existing_broadcast
     local existing_small_n_opt
 local existing_user_dram_size_gb
+    local existing_multi_node_enable
+    local existing_remote_txe_host
+    local existing_remote_txe_port
 
     existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
     existing_broadcast="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_broadcast_offload")"
     existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
+    existing_multi_node_enable="$(extract_deployment_yaml_value "${deployment_yaml_path}" "multi_node")"
+    existing_remote_txe_host="$(extract_deployment_yaml_value "${deployment_yaml_path}" "remote_txe_host")"
+    existing_remote_txe_port="$(extract_deployment_yaml_value "${deployment_yaml_path}" "remote_txe_port_start")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
@@ -1092,6 +1105,15 @@ local existing_user_dram_size_gb
     fi
     if [ -n "${existing_small_n_opt}" ]; then
       triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
+    fi
+    if [ -n "${existing_multi_node_enable}" ]; then
+      multi_node_enable="${existing_multi_node_enable}"
+    fi
+    if [ -n "${existing_remote_txe_host}" ]; then
+      remote_txe_host="${existing_remote_txe_host}"
+    fi
+    if [ -n "${existing_remote_txe_port}" ]; then
+      remote_txe_port="${existing_remote_txe_port}"
     fi
   fi
 
@@ -1136,9 +1158,23 @@ advanced_matmul_broadcast_offload: ${advanced_matmul_broadcast_offload}
 # false = old behavior
 # true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
 triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
+
+# TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch for
+# this POC. multi_node is a total-node-count integer, not a bool now:
+# 1 (or absent) = disabled, txe_count TXEs used purely locally (default).
+# 2 = today's only actually-implemented case: txe_count TXEs used locally
+# AND this instance also dispatches MAT_MUL work to one remote TSISIM
+# instance's txe_count TXEs over TCP. Values > 2 accepted but not yet
+# functionally supported (only one remote peer is ever contacted today).
+multi_node: ${multi_node_enable}
+
+# Only used when multi_node >= 2 -- the remote TSISIM instance's reachable
+# address for the remote-TXE worker.
+remote_txe_host: "${remote_txe_host}"
+remote_txe_port_start: ${remote_txe_port:-0}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}, multi_node:${multi_node_enable}, remote_txe_host:${remote_txe_host}, remote_txe_port_start:${remote_txe_port}"
   return 0
 }
 
