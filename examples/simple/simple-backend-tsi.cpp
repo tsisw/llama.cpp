@@ -257,7 +257,8 @@ static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
                                            const std::vector<float> &A_rows, int64_t M_valid,
                                            const std::vector<float> &B_rows, int64_t N,
                                            int64_t K,
-                                           std::vector<float> &C_out) {
+                                           std::vector<float> &C_out,
+                                           int64_t &kernel_runs_out) {
     // See g_worker_compute_mutex's comment above tsi_remote_worker_run_add():
     // ggml-tsavorite.cpp's TXE dispatch state is process-global and not
     // safe for concurrent top-level graph_compute() calls.
@@ -309,6 +310,7 @@ static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
         g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs,
                                                   std::memory_order_relaxed);
         g_worker_total_requests.fetch_add(1, std::memory_order_relaxed);
+        kernel_runs_out = result->tsi_kernel_runs;
     } else {
         fprintf(stderr, "[remote-worker] MAT_MUL graph alloc failed\n");
     }
@@ -373,6 +375,12 @@ struct TsiWorkerJob {
     // consumed by the connection thread that submitted this job.
     std::promise<bool> done;
     std::vector<float> result;
+    // ROUND 7: the real number of local TXE kernel launches this specific
+    // request took on THIS worker (== result->tsi_kernel_runs from the
+    // ggml_mul_mat() this job ran) -- sent back to the client on the wire
+    // so it can report the true per-node split instead of a "1 call = 1
+    // unit" placeholder.
+    int64_t result_kernel_runs = 0;
 };
 
 static std::mutex g_job_queue_mutex;
@@ -409,7 +417,7 @@ static void tsi_worker_dispatch_thread_main(ggml_backend_t backend) {
         if (job->is_matmul) {
             ok = tsi_remote_worker_run_mul_mat(backend, job->mm_a_rows, job->mm_m_valid,
                                                 job->mm_b_rows, job->mm_n, job->mm_k,
-                                                job->result);
+                                                job->result, job->result_kernel_runs);
         } else {
             ok = tsi_remote_worker_run_add(backend, job->add_a, job->add_b, job->result);
         }
@@ -491,10 +499,12 @@ static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t /*backend*/) {
             }
             const std::vector<float> &C = job->result;
 
-            fprintf(stderr, "[remote-worker] MAT_MUL result: C[0]=%g (M_valid*N=%zu floats)\n",
-                    C.empty() ? 0.0f : C[0], C.size());
+            fprintf(stderr, "[remote-worker] MAT_MUL result: C[0]=%g (M_valid*N=%zu floats, "
+                    "this request used %ld real local TXE kernel-runs)\n",
+                    C.empty() ? 0.0f : C[0], C.size(), (long)job->result_kernel_runs);
 
             if (!tsi_send_all(fd, &magic, sizeof(magic))) break;
+            if (!tsi_send_all(fd, &job->result_kernel_runs, sizeof(job->result_kernel_runs))) break;
             if (!tsi_send_all(fd, C.data(), C.size() * sizeof(float))) break;
             continue;
         }

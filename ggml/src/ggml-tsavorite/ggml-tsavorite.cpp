@@ -1945,35 +1945,27 @@ static std::atomic<int64_t> g_tsi_remote_mulmat_kernel_runs{0};
 // false the remote counter is always 0 and this line would be redundant
 // with the plain GGML Perf Summary total.
 //
-// IMPORTANT semantic note (read this before comparing numbers across
-// nodes): `local_n` here counts actual local TXE kernel launches
-// one-for-one (matches node 1's own per-tile granularity, the same
-// granularity the GGML Perf Summary's TSI_KERNEL-RUN column uses
-// everywhere else). `remote_n` counts coalesced REMOTE DISPATCH CALLS, not
-// remote kernel launches -- by Round 4's own deliberate design, one
-// combined network call can (and typically does) cover up to num_of_txes
-// worth of rows, and the remote worker's own internal multi-TXE
-// row-splitting subdivides that single call into potentially several real
-// TXE kernel launches on ITS end, invisible to the client. So
-// local_n + remote_n reproduces the existing GGML Perf Summary total
-// exactly (that total already treats 1 remote call = 1 unit, which is why
-// it matches the pure-local baseline's total in Round 4's writeup) -- but
-// remote_n is NOT the true node-2 kernel-launch count. For that, see
-// instance 2's own worker.log "TOTAL TSI_KERNEL-RUN count on this node"
-// line (tsi_worker_print_kernel_run_summary() in simple-backend-tsi.cpp),
-// which is fine-grained the same way local_n is. The true apples-to-apples
-// per-node comparison is: this line's local_n (node 1) vs. worker.log's
-// own total (node 2) -- NOT this line's local_n vs. this line's remote_n.
+// ROUND 7 UPDATE: `remote_n` is now the REAL per-node-2 kernel-launch count,
+// reported back to the client over the wire by the worker itself (see
+// tsi_remote_dispatch_mul_mat's kernel_runs_out param and the worker's
+// job->result_kernel_runs/TsiWorkerJob in simple-backend-tsi.cpp) --
+// NOT a "1 coalesced call = 1 unit" placeholder like Round 5. `local_n`
+// still counts actual local TXE kernel launches one-for-one (matches node
+// 1's own per-tile granularity, the same granularity the GGML Perf
+// Summary's TSI_KERNEL-RUN column uses everywhere else). So local_n and
+// remote_n are now DIRECTLY comparable, apples-to-apples, from this one
+// line alone -- no need to cross-reference instance 2's own worker.log to
+// get its true count anymore (though that log still independently confirms
+// the same number, which is a useful cross-check, not the only source of
+// truth).
 static void tsi_report_mul_mat_kernel_run_split() {
     const int64_t local_n  = g_tsi_local_mulmat_kernel_runs.load();
     const int64_t remote_n = g_tsi_remote_mulmat_kernel_runs.load();
     fprintf(stderr,
             "[tsavorite] MUL_MAT OPU TSI_KERNEL-RUN breakdown: total=%ld "
-            "(node1/local kernel-runs=%ld + node2/remote dispatch-calls=%ld). "
-            "NOTE: remote figure is coalesced NETWORK CALLS, not node 2's own "
-            "internal kernel-launch count -- see instance 2's worker.log for "
-            "node 2's true fine-grained TSI_KERNEL-RUN total, comparable to "
-            "this line's node1/local figure.\n",
+            "(node1/local kernel-runs=%ld + node2/remote kernel-runs=%ld -- "
+            "REAL count reported directly by node 2 over the wire, not a "
+            "placeholder).\n",
             (long)(local_n + remote_n), (long)local_n, (long)remote_n);
 }
 
@@ -2017,7 +2009,8 @@ static bool tsi_remote_dispatch_mul_mat(
     const float *A_rows, int64_t M_valid,
     const float *B_full, int64_t N,
     int64_t K,
-    float *C_out) {
+    float *C_out,
+    int64_t *kernel_runs_out) {
 
     uint32_t magic = TSI_REMOTE_TXE_MAGIC_MATMUL;
     int64_t hdr[3] = { M_valid, N, K };
@@ -2047,9 +2040,14 @@ static bool tsi_remote_dispatch_mul_mat(
 
         if (ok) {
             uint32_t resp_magic = 0;
+            int64_t remote_kernel_runs = 0;
             ok = tsi_remote_txe_recv_all(fd, &resp_magic, sizeof(resp_magic));
             ok = ok && (resp_magic == TSI_REMOTE_TXE_MAGIC_MATMUL);
+            ok = ok && tsi_remote_txe_recv_all(fd, &remote_kernel_runs, sizeof(remote_kernel_runs));
             ok = ok && tsi_remote_txe_recv_all(fd, C_out, (size_t)(M_valid * N) * sizeof(float));
+            if (ok && kernel_runs_out) {
+                *kernel_runs_out = remote_kernel_runs;
+            }
         }
 
         if (ok) {
@@ -6141,10 +6139,18 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                             }
 
                             std::vector<float> C_rows((size_t)(remote_rows_total * N));
+                            // ROUND 7: the real per-request kernel-run count
+                            // the worker actually used, reported back over
+                            // the wire (see tsi_remote_dispatch_mul_mat's
+                            // kernel_runs_out param and the worker's
+                            // job->result_kernel_runs) -- replaces the old
+                            // "1 call = 1 unit" placeholder accumulation
+                            // below with the real number.
+                            int64_t remote_real_kernel_runs = 0;
                             const bool ok = tsi_remote_dispatch_mul_mat(
                                 A_rows.data(), remote_rows_total,
                                 B_rows.data(), N,
-                                K, C_rows.data());
+                                K, C_rows.data(), &remote_real_kernel_runs);
 
                             if (!ok) {
                                 fprintf(stderr,
@@ -6158,6 +6164,12 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                                 tsi_cleanup();
                                 abort();
                             }
+
+                            // ROUND 7: accumulate the REAL count reported by
+                            // the worker for this request -- see
+                            // tsi_report_mul_mat_kernel_run_split() above.
+                            g_tsi_remote_mulmat_kernel_runs.fetch_add(
+                                remote_real_kernel_runs, std::memory_order_relaxed);
 
                             // NOTE: ggml_mul_mat's result tensor has
                             // ne0=remote_rows_total, ne1=N (fastest-varying
@@ -6191,10 +6203,11 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                         ++batch_launched;
                         ++launched_kernel_calls;
-                        // ROUND 5 requirement B: this is the "exactly 1 per
-                        // coalesced remote wave" increment -- see
-                        // tsi_report_mul_mat_kernel_run_split() above.
-                        g_tsi_remote_mulmat_kernel_runs.fetch_add(1, std::memory_order_relaxed);
+                        // ROUND 7: g_tsi_remote_mulmat_kernel_runs is now
+                        // accumulated inside the async dispatch lambda above
+                        // (real per-request count from the worker), not
+                        // here -- this call is fire-and-forget at this
+                        // point, the real count isn't known yet.
                         continue;
                     }
 
