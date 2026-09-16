@@ -2827,7 +2827,7 @@ void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
 #elif defined(GGML_PERF) || defined(GGML_PERF_DETAIL)
 void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
     LLAMA_LOG_TSAVORITE("\n=== GGML Perf Summary ===\n");
-    LLAMA_LOG_TSAVORITE("  %-16s %-8s %7s  %14s  %16s  %16s\n", "Op", "Target", "Runs", "TSI_KERNEL-RUN", "Total us", "Avg us");
+    LLAMA_LOG_TSAVORITE("  %-16s %-8s %7s  %9s  %9s  %16s  %16s\n", "Op", "Target", "Runs", "N1_KRUN", "N2_KRUN", "Total us", "Avg us");
 
     for (int i = 0; i < GGML_OP_COUNT; ++i) {
         if (totals[i].runs > 0) {
@@ -2837,11 +2837,12 @@ void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
                     char padded_backend[7] = {0}; // 6 chars + null terminator
                     snprintf(padded_backend, sizeof(padded_backend), "%-6s", backend_name);
 
-                    LLAMA_LOG_TSAVORITE("  %-16s %-8s %7ld  %14ld  %16ld  %16.2f\n",
+                    LLAMA_LOG_TSAVORITE("  %-16s %-8s %7ld  %9ld  %9ld  %16ld  %16.2f\n",
                         totals[i].op_name ? totals[i].op_name : "UNKNOWN",
                         padded_backend,
                         totals[i].backend_subtotals[b].runs,
-                        totals[i].backend_subtotals[b].tsi_kernel_count,
+                        totals[i].backend_subtotals[b].tsi_kernel_count[0],
+                        totals[i].backend_subtotals[b].tsi_kernel_count[1],
                         totals[i].backend_subtotals[b].total_us,
                         (double)totals[i].backend_subtotals[b].total_us / totals[i].backend_subtotals[b].runs);
                 }
@@ -2863,11 +2864,12 @@ void ggml_perf_print_totals(struct ggml_perf_totals totals[GGML_OP_COUNT]) {
                         char padded_backend[7] = {0};
                         snprintf(padded_backend, sizeof(padded_backend), "%-6s", backend_name ? backend_name : "UNK");
 
-                        LLAMA_LOG_TSAVORITE("    -> %-11s %-8s %7ld  %14ld  %16ld  %16.2f\n",
+                        LLAMA_LOG_TSAVORITE("    -> %-11s %-8s %7ld  %9ld  %9ld  %16ld  %16.2f\n",
                             ggml_unary_op_name((enum ggml_unary_op) j),
                             padded_backend,
                             totals[i].unary_subtotals[j].runs,
-                            totals[i].unary_subtotals[j].tsi_kernel_count,
+                            totals[i].unary_subtotals[j].tsi_kernel_count[0],
+                            totals[i].unary_subtotals[j].tsi_kernel_count[1],
                             totals[i].unary_subtotals[j].total_us,
                             (double)totals[i].unary_subtotals[j].total_us / totals[i].unary_subtotals[j].runs);
                     }

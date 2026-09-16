@@ -2185,35 +2185,36 @@ static void ensure_tsi_runtime_initialized() {
         deviceConfigPtr = &deviceConfig;
     }
 
-    printf("\n TSI deploy yaml=%s txe_count=%u multi_thread_enable=%d",
-           yaml_path.c_str(),
+    // Round 9: split across multiple lines (~2 fields/line) instead of one
+    // long concatenated line -- much easier to read during a live demo.
+    printf("\n TSI deploy yaml=%s\n", yaml_path.c_str());
+    printf(" txe_count=%u multi_thread_enable=%d\n",
            (unsigned)num_of_txes,
            (int)multi_thread_enable);
 
     if (requested_user_dram_size > 0) {
-        printf(" user_dram_size_gb=%d user_dram_size_bytes=%zu",
+        printf(" user_dram_size_gb=%d user_dram_size_bytes=%zu\n",
                cfg.user_dram_size_gb,
                requested_user_dram_size);
     } else {
-        printf(" user_dram_size_gb=default");
+        printf(" user_dram_size_gb=default\n");
     }
 
 #if TRITON_MAT_MUL
-    printf(" advanced_matmul_shape_offload=%d",
-           (int)advanced_matmul_shape_offload);
-    printf(" advanced_matmul_broadcast_offload=%d",
+    printf(" advanced_matmul_shape_offload=%d advanced_matmul_broadcast_offload=%d\n",
+           (int)advanced_matmul_shape_offload,
            (int)advanced_matmul_broadcast_offload);
-    printf(" triton_matmul_small_n_transpose_opt=%d",
-           (int)triton_matmul_small_n_transpose_opt);
+    printf(" triton_matmul_small_n_transpose_opt=%d multi_node=%d\n",
+           (int)triton_matmul_small_n_transpose_opt,
+           multi_node_enable);
+#else
+    printf(" multi_node=%d\n", multi_node_enable);
 #endif
 
-    printf(" multi_node=%d", multi_node_enable);
     if (multi_node_enable >= 2) {
-        printf(" remote_txe_host=%s remote_txe_port_start=%d",
+        printf(" remote_txe_host=%s remote_txe_port_start=%d\n",
                remote_txe_host.c_str(), remote_txe_port_start);
     }
-
-    printf("\n");
 
     tsi_initialize(num_of_txes, deviceConfigPtr);
     tsavorite_install_signal_handlers();
@@ -5976,7 +5977,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                 }
 
-                ++node->tsi_kernel_runs;
+                ++node->tsi_kernel_runs[0];
                 ++profile.kernel_calls;
             }
         }
@@ -6434,7 +6435,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         device->stats.op_run_count[kernel_type].num_of_kernel_call += total_kernel_runs_this_node;
     }
 
-    node->tsi_kernel_runs += total_kernel_runs_this_node;
+    // ROUND 9: split the combined total back into node1(local)/node2(remote)
+    // for the standard GGML Perf Summary table's two-column breakdown.
+    node->tsi_kernel_runs[0] += (int64_t)launched_kernel_calls;
+    node->tsi_kernel_runs[1] += real_remote_this_node;
     profile.kernel_calls += total_kernel_runs_this_node;
 
     profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
@@ -6792,7 +6796,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                         // Stats per kernel call
                         if (device) ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                        ++node->tsi_kernel_runs;
+                        ++node->tsi_kernel_runs[0];
 
 #ifdef TMU_DEBUG_VALIDATE
                         // -----------------------------------------------------------------
@@ -7300,7 +7304,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         val[0] = scale;
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, glob_buf);
                         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                        ++node->tsi_kernel_runs;
+                        ++node->tsi_kernel_runs[0];
 	            }
 	        }
 	    }
@@ -7421,7 +7425,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     }
 #endif /* TRITON_ADD */
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                    ++node->tsi_kernel_runs;
+                    ++node->tsi_kernel_runs[0];
                 }
             }
         }
@@ -7537,7 +7541,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
             ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input[kernel_sub_type](srcP0, nodeP);
 	}
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-        ++node->tsi_kernel_runs;
+        ++node->tsi_kernel_runs[0];
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
           log_data.data_type = GGML_TSAVORITE_TENSOR_NODE;

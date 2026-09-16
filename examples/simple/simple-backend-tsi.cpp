@@ -219,7 +219,7 @@ static bool tsi_remote_worker_run_add(ggml_backend_t backend, const std::vector<
         // RUN column sums (see the big comment above g_worker_total_tsi_
         // kernel_runs) -- read it before this graph is freed below and fold
         // it into this worker's own persistent running total.
-        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs,
+        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs[0],
                                                   std::memory_order_relaxed);
         g_worker_total_requests.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -307,10 +307,10 @@ static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
         // ROUND 5 requirement B: see the matching comment in
         // tsi_remote_worker_run_add() above -- this is the MAT_MUL side of
         // the same accounting (the op that actually matters for this POC).
-        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs,
+        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs[0],
                                                   std::memory_order_relaxed);
         g_worker_total_requests.fetch_add(1, std::memory_order_relaxed);
-        kernel_runs_out = result->tsi_kernel_runs;
+        kernel_runs_out = result->tsi_kernel_runs[0];
     } else {
         fprintf(stderr, "[remote-worker] MAT_MUL graph alloc failed\n");
     }
