@@ -2,6 +2,11 @@
 # ==============================================================================
 # tsi-pkg-build.sh (source-safe)
 #
+# For multi-node TSISIM cross-instance dispatch testing (2 TSISIM instances,
+# MAT_MUL split across both), see PR #165 (branch
+# poc/tsisim-cross-instance-txe-dispatch) on tsisw/llama.cpp for the full
+# setup and reproduction steps.
+#
 # USAGE (source is recommended)
 # ============================
 #

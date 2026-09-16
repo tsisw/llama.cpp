@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <future>
 #include <deque>
 #include <memory>
@@ -117,6 +118,54 @@ static bool tsi_send_all(int fd, const void *buf, size_t n) {
 // 4's single dedicated dispatch thread, it is never actually contended.
 static std::mutex g_worker_compute_mutex;
 
+// TSI_REMOTE_TXE_POC ROUND 5, requirement B (per-node kernel-dispatch count
+// visible on both instances): instance 1's own real llama-cli run already
+// prints a "=== GGML Perf Summary ===" table at shutdown (see
+// llama-context.cpp's ggml_perf_print_totals(), gated by GGML_PERF, which
+// IS defined in this build -- confirmed via build-fpga/CMakeCache.txt) with
+// a "TSI_KERNEL-RUN" column -- the sum, across every graph node of a given
+// op, of that node's `tsi_kernel_runs` field (a plain int64_t field added
+// to `struct ggml_tensor` itself, see ggml/include/ggml.h, incremented
+// unconditionally -- NOT gated behind TMU_DEBUG/GGML_PERF -- by
+// ggml-tsavorite.cpp's dispatch code every time it actually launches a TXE
+// kernel run for that node, e.g. once per row-tile in
+// ggml_tsavorite_run_tmu_mul_mat()). That printer lives in llama-context.cpp
+// and only ever runs as part of a `llama_context`'s shutdown -- this worker
+// process never constructs one (it drives raw ggml_new_tensor_2d +
+// ggml_mul_mat + ggml_backend_graph_compute() calls directly, the same
+// pattern this file's own local test cases use), so it never gets that
+// summary for free, even though the exact same underlying counter
+// (`tsi_kernel_runs`) is being incremented on this worker's own per-request
+// tensors by the identical, unmodified dispatch code every real llama-cli
+// run already relies on.
+//
+// Since each worker request builds a tiny throwaway graph (freed right
+// after the result is read back), the per-node counter itself doesn't
+// survive across requests -- so this worker keeps its OWN persistent
+// accumulator, fed by reading `result->tsi_kernel_runs` right after
+// graph_compute() and before the graph is freed. This is the same field,
+// summed the same way (just across many small ephemeral graphs instead of
+// one big long-lived one) -- so the total is directly comparable to
+// instance 1's own "TSI_KERNEL-RUN" column, not a reinvented metric.
+static std::atomic<int64_t> g_worker_total_tsi_kernel_runs{0};
+static std::atomic<int64_t> g_worker_total_requests{0};
+
+// Prints the running total to stderr (captured in worker.log) -- called at
+// the end of every client session (see tsi_remote_worker_serve_conn below)
+// so `tail`/`grep worker.log` gives a number directly comparable to
+// instance 1's own GGML Perf Summary "TSI_KERNEL-RUN" total, without
+// needing journalctl or any extra tooling (the worker is not a systemd
+// service).
+static void tsi_worker_print_kernel_run_summary(const char *context_label) {
+    fprintf(stderr,
+            "[remote-worker] %s: TOTAL TSI_KERNEL-RUN count on this node so far: %ld "
+            "(across %ld MAT_MUL/ADD requests served) -- comparable to instance 1's own "
+            "'GGML Perf Summary' TSI_KERNEL-RUN column\n",
+            context_label,
+            (long)g_worker_total_tsi_kernel_runs.load(),
+            (long)g_worker_total_requests.load());
+}
+
 // Runs one real ADD op through the Tsavorite backend for the given already
 // TXE-runtime-initialized `backend`, on tensors of length n. This is the
 // same load_model()+build_graph()+compute() pattern used by the rest of
@@ -165,6 +214,14 @@ static bool tsi_remote_worker_run_add(ggml_backend_t backend, const std::vector<
         ggml_backend_graph_compute(backend, gf);
         C.resize(n);
         ggml_backend_tensor_get(result, C.data(), 0, ggml_nbytes(result));
+        // ROUND 5 requirement B: `result->tsi_kernel_runs` is the same
+        // per-node counter instance 1's own "GGML Perf Summary" TSI_KERNEL-
+        // RUN column sums (see the big comment above g_worker_total_tsi_
+        // kernel_runs) -- read it before this graph is freed below and fold
+        // it into this worker's own persistent running total.
+        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs,
+                                                  std::memory_order_relaxed);
+        g_worker_total_requests.fetch_add(1, std::memory_order_relaxed);
     } else {
         fprintf(stderr, "[remote-worker] graph alloc failed\n");
     }
@@ -246,6 +303,12 @@ static bool tsi_remote_worker_run_mul_mat(ggml_backend_t backend,
         ggml_backend_graph_compute(backend, gf);
         C_out.resize((size_t)(M_valid * N));
         ggml_backend_tensor_get(result, C_out.data(), 0, ggml_nbytes(result));
+        // ROUND 5 requirement B: see the matching comment in
+        // tsi_remote_worker_run_add() above -- this is the MAT_MUL side of
+        // the same accounting (the op that actually matters for this POC).
+        g_worker_total_tsi_kernel_runs.fetch_add(result->tsi_kernel_runs,
+                                                  std::memory_order_relaxed);
+        g_worker_total_requests.fetch_add(1, std::memory_order_relaxed);
     } else {
         fprintf(stderr, "[remote-worker] MAT_MUL graph alloc failed\n");
     }
@@ -439,6 +502,16 @@ static void tsi_remote_worker_serve_conn(int fd, ggml_backend_t /*backend*/) {
         fprintf(stderr, "[remote-worker] bad magic 0x%08x, dropping connection\n", magic);
         break;
     }
+
+    // ROUND 5 requirement B: print the running kernel-run total at the end
+    // of this client session (this loop only exits when the client
+    // disconnects, sends a bad magic, or a send/recv fails -- i.e. exactly
+    // "end of session" for whichever client was on the other end of `fd`).
+    // As of ROUND 5's persistent-connection client, a normal real-model run
+    // has exactly ONE such session for its entire lifetime, so this line
+    // effectively becomes the final per-run total, comparable to instance
+    // 1's own end-of-run GGML Perf Summary.
+    tsi_worker_print_kernel_run_summary("client session ended");
 }
 
 // Runs the accept loop: one thread per accepted connection handles that
