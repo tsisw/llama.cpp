@@ -61,6 +61,7 @@ using TsavoriteDeviceConfig = tsi::runtime::FPGADeviceConfig;
 #include  <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <atomic>
 #include <map>
 
 using namespace tsi::runtime;
@@ -84,6 +85,36 @@ struct TsavoriteRuntimeState {
     uint32_t num_of_txes = 1;
     bool *device_free = nullptr;
     bool multi_thread_enable = false;
+
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) MAT_MUL dispatch.
+    // See "multi_node" in tsavorite-model-deployment.yaml. multi_node is now
+    // an integer TOTAL NODE COUNT, not a bool: 1 (or absent) = disabled,
+    // single-node only (byte-for-byte unchanged from before this ever
+    // existed); 2 = today's only actually-implemented multi-node case (this
+    // instance + one remote peer). Values > 2 are accepted at the config
+    // level (so the field can be set to a future real node count like 18
+    // without another yaml migration) but are NOT yet functionally
+    // supported by the dispatch mechanism below, which only ever talks to
+    // ONE remote peer -- see the >= 2 checks throughout this file, which
+    // treat any value >= 2 identically to exactly 2 today. Extending
+    // dispatch to more than one remote peer (connection pool, addressing,
+    // routing) is real, separate future work, not implemented here.
+    // txe_count keeps meaning "TXE count on EACH node" -- when multi_node
+    // >= 2, this instance uses its own txe_count TXEs locally AND
+    // additionally dispatches MAT_MUL work to remote_txe_host:
+    // remote_txe_port_start's TXEs over TCP, for a logical 2*txe_count.
+    int multi_node_enable = 1;
+    std::string remote_txe_host;
+    int remote_txe_port_start = 0;
+
+    // TSI_REMOTE_TXE_POC ROUND 5: persistent TCP connection to the remote
+    // TXE worker, opened once in ensure_tsi_runtime_initialized() and reused
+    // for every coalesced remote MAT_MUL dispatch for the rest of the
+    // process's life (replaces Round 3/4's "fresh connect()/close() per
+    // wave" scheme). -1 means "not connected" (either never connected yet,
+    // or a prior send/recv failure closed it and a reconnect is needed).
+    int remote_txe_fd = -1;
+
     // one packed-args buffer per TXE
     std::vector<void *> packed_args;
 
@@ -146,6 +177,10 @@ static TsavoriteRuntimeState g_rt;
 auto &num_of_txes = g_rt.num_of_txes;
 auto &device_free = g_rt.device_free;
 auto &multi_thread_enable     = g_rt.multi_thread_enable;
+auto &multi_node_enable       = g_rt.multi_node_enable;
+auto &remote_txe_host         = g_rt.remote_txe_host;
+auto &remote_txe_port_start   = g_rt.remote_txe_port_start;
+auto &remote_txe_fd           = g_rt.remote_txe_fd;
 auto &packed_args     = g_rt.packed_args;
 
 auto &scalar_loop_args        = g_rt.scalar_loop_args;
@@ -273,6 +308,25 @@ static bool tsi_parse_bool_after_colon(const std::string &line, bool *out) {
     return false;
 }
 
+// Parses the (possibly quoted) string value after ':' on a line, e.g.
+//   remote_txe_host: "10.10.0.102"
+// Trailing/leading whitespace and a single pair of matching quotes are
+// stripped; the raw text is returned otherwise.
+static bool tsi_parse_string_after_colon(const std::string &line, std::string *out) {
+    if (!out) return false;
+    size_t c = line.find(':');
+    if (c == std::string::npos) return false;
+    std::string rhs = tsi_trim_copy(line.substr(c + 1));
+    if (rhs.empty()) return false;
+    if (rhs.size() >= 2 &&
+        ((rhs.front() == '"' && rhs.back() == '"') ||
+         (rhs.front() == '\'' && rhs.back() == '\''))) {
+        rhs = rhs.substr(1, rhs.size() - 2);
+    }
+    *out = rhs;
+    return true;
+}
+
 struct tsi_deploy_cfg_t {
     int  txe_count = -1;
     bool mt_enable = false;
@@ -289,6 +343,16 @@ struct tsi_deploy_cfg_t {
     bool triton_matmul_small_n_transpose_opt = false;
     bool has_triton_matmul_small_n_transpose_opt = false;
 #endif
+
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch.
+    // multi_node_enable is now the parsed TOTAL NODE COUNT (see the g_rt
+    // struct's comment above for the full semantics) -- 1 = disabled.
+    int  multi_node_enable = 1;
+    bool has_multi_node_enable = false;
+    std::string remote_txe_host;
+    bool has_remote_txe_host = false;
+    int  remote_txe_port_start = -1;
+    bool has_remote_txe_port_start = false;
 };
 
 // Heuristics supported for txe_count:
@@ -381,6 +445,38 @@ static tsi_deploy_cfg_t tsi_read_deploy_yaml(const std::string &path) {
             }
         }
 #endif
+
+        // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE
+        // dispatch keys. multi_node is a total-node-count integer now, not
+        // a bool -- 1 (or absent) = disabled, 2 = today's implemented case,
+        // >2 accepted for future use but not yet functional (see the g_rt
+        // struct's comment for the full explanation).
+        if (t.find("multi_node") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            int v = tsi_parse_int_after_colon(t);
+            if (v > 0) {
+                cfg.multi_node_enable = v;
+                cfg.has_multi_node_enable = true;
+            }
+        }
+
+        if (t.find("remote_txe_host") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            std::string s;
+            if (tsi_parse_string_after_colon(t, &s) && !s.empty()) {
+                cfg.remote_txe_host = s;
+                cfg.has_remote_txe_host = true;
+            }
+        }
+
+        if (t.find("remote_txe_port_start") != std::string::npos &&
+            t.find(':') != std::string::npos) {
+            int v = tsi_parse_int_after_colon(t);
+            if (v > 0) {
+                cfg.remote_txe_port_start = v;
+                cfg.has_remote_txe_port_start = true;
+            }
+        }
 
         // list counting under "txes:"
         if (tsi_starts_with(t, "txes:")) {
@@ -1620,6 +1716,388 @@ static inline void tsi_init_per_txe_state_once() {
     }
 }
 
+// =============================================================================
+// TSI_REMOTE_TXE_POC: cross-instance (multi-node) MAT_MUL dispatch transport.
+//
+// This is the client side of the mechanism proven in the earlier ADD POC
+// round (examples/simple/simple-backend-tsi.cpp's "remote-worker" mode,
+// reachable target commit: "POC: genuine cross-instance TXE dispatch across
+// two TSISIM instances"). That round proved a real ADD op can be dispatched
+// from one TSISIM instance and executed on a second, independent TSISIM
+// instance's own local TXE runtime over plain TCP.
+//
+// This block extends the same wire-level pattern (length-prefixed magic +
+// fixed header + raw float payload, blocking recv/send loops) to MAT_MUL,
+// and wires it into the real ggml-tsavorite MAT_MUL dispatch path used by
+// actual llama-cli inference (ggml_tsavorite_run_tmu_mul_mat's row-tiled
+// multi-TXE loop), not just a standalone test harness.
+//
+// Design note (why this does NOT reuse/extend device_free[]/
+// acquire_device_blocking() to a literal [0, 2*txe_count) range):
+// device_free[]/packed_args[]/scalar_*_args[] are shared by EVERY op type
+// this backend dispatches (ADD, MULT, RMS_NORM, SOFT_MAX, GLU, the Triton
+// ADD path, and the Triton MAT_MUL M-split path), all sized to exactly
+// num_of_txes. Handing any of those callers a deviceId >= num_of_txes would
+// index packed_args[] out of bounds (undefined behavior, not a clean abort)
+// the first time a non-MAT_MUL op raced onto a "remote" id. Only the MAT_MUL
+// row-tile loop below has been taught what a remote id means. To keep the
+// hard "multi_node_enable=false is byte-for-byte unchanged" requirement
+// trivially true, and to avoid that UB risk when true, remote dispatch uses
+// its own small, separate concurrency pool (tsi_remote_slot_acquire/release
+// below) scoped only to MAT_MUL row tiles, instead of widening the shared
+// pool. See tsisim-multinode-poc-llamacpp.md "ROUND 3" for the full writeup.
+// =============================================================================
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <cerrno>
+
+#define TSI_REMOTE_TXE_MAGIC_MATMUL 0x4d4d5458u /* 'XTMM' */
+
+static bool tsi_remote_txe_send_all(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t r = send(fd, p + sent, n - sent, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        sent += (size_t)r;
+    }
+    return true;
+}
+
+static bool tsi_remote_txe_recv_all(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
+        if (r == 0) return false;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+
+// Opens a fresh TCP connection to remote_txe_host:remote_txe_port_start. Returns
+// -1 (and logs why) on any failure.
+//
+// ROUND 5 history: through Round 4, EVERY remote MAT_MUL dispatch called
+// this to open a brand new connection and closed it again right after
+// (see tsi_remote_dispatch_mul_mat's old body) -- Round 4's coalescing cut
+// the *count* of such connections from up to num_of_txes/wave down to
+// exactly 1/wave, but each of those was still a fresh connect()/close().
+// As of Round 5, this function is only called (a) once at bring-up from
+// tsi_remote_txe_ensure_reachable(), which now KEEPS the fd open as the
+// long-lived persistent connection (g_rt.remote_txe_fd), and (b) as a
+// reconnect path if the persistent connection is ever found closed/broken
+// (see tsi_remote_dispatch_mul_mat below). It is safe for this to remain a
+// plain non-serialized connect(): the persistent fd itself is only ever
+// touched from within the single remote-dispatch call site, which is
+// already serialized to one-in-flight-at-a-time by kRemoteSlotCapacity=1
+// (see g_remote_slot_mutex below), so there is no concurrent-reconnect race
+// to guard against in this POC.
+static int tsi_remote_txe_connect() {
+    if (remote_txe_host.empty() || remote_txe_port_start <= 0) {
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)remote_txe_port_start);
+
+    if (inet_pton(AF_INET, remote_txe_host.c_str(), &addr.sin_addr) != 1) {
+        // This POC's yaml (remote_txe_host) is documented/specified as a
+        // dotted IPv4 address; deliberately not resolving hostnames here to
+        // avoid gethostbyname()'s non-reentrant static-buffer hazard, since
+        // this is called concurrently from multiple worker threads.
+        fprintf(stderr,
+                "ERROR: remote_txe_host='%s' is not a valid dotted IPv4 address\n",
+                remote_txe_host.c_str());
+        close(fd);
+        return -1;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return fd;
+}
+
+// Called once at bring-up (from ensure_tsi_runtime_initialized) when
+// multi_node_enable is true. Fails loudly rather than silently degrading to
+// local-only, per the POC requirement that a missing remote worker is a
+// hard configuration error, not a soft fallback.
+//
+// ROUND 5: this used to connect(), verify, then close() immediately --
+// purely a reachability probe. It now KEEPS the connection open in
+// g_rt.remote_txe_fd, and that same fd is what every subsequent coalesced
+// remote MAT_MUL dispatch reuses for the rest of the process's life (see
+// tsi_remote_dispatch_mul_mat below and tsi_remote_txe_close_persistent()
+// for the matching cleanup path).
+static void tsi_remote_txe_ensure_reachable() {
+    int fd = tsi_remote_txe_connect();
+    if (fd < 0) {
+        fprintf(stderr,
+                "ERROR: multi_node=%d but the remote TXE worker at "
+                "%s:%d is not reachable. Start the remote-worker process on "
+                "that TSISIM instance first (see tsisim-multinode-poc-llamacpp.md), "
+                "or set multi_node: 1 to run local-only.\n",
+                multi_node_enable, remote_txe_host.c_str(), remote_txe_port_start);
+        fflush(stderr);
+        abort();
+    }
+    remote_txe_fd = fd;
+    fprintf(stderr,
+            "[tsavorite] multi_node=%d: remote TXE worker at %s:%d "
+            "is reachable -- opened persistent connection (fd=%d) for the "
+            "life of this process.\n",
+            multi_node_enable, remote_txe_host.c_str(), remote_txe_port_start, fd);
+}
+
+// TSI_REMOTE_TXE_POC ROUND 5: closes the persistent remote-TXE-worker
+// connection, if one is open. Symmetric with the local-resource cleanup
+// this file already does at every tsi_finalize() call site (device_free[],
+// the blob tables, etc.) -- called from the same places, so the client's
+// one long-lived socket to the remote worker never outlives the process's
+// other TXE resources. Safe to call even when multi_node_enable is false
+// (remote_txe_fd is simply -1 in that case) or when called more than once
+// (idempotent).
+static void tsi_remote_txe_close_persistent() {
+    if (remote_txe_fd >= 0) {
+        close(remote_txe_fd);
+        fprintf(stderr,
+                "[tsavorite] closed persistent remote TXE worker connection "
+                "(fd=%d)\n", remote_txe_fd);
+        remote_txe_fd = -1;
+    }
+}
+
+// Bounded concurrency pool for in-flight remote MAT_MUL dispatches.
+//
+// Round 3 history: this was originally sized to num_of_txes (up to 20
+// concurrent remote dispatches in flight, one per row-tile). Real-model
+// testing (M=56, K=2048 tiles, not the small synthetic/tiny-model shapes)
+// surfaced a real hang when multiple concurrent remote requests each
+// triggered the worker's own internal Multi-TXE row-splitting concurrently
+// against process-global state. Round 3 worked around it by capping this to
+// 1, trading away remote-side request-level overlap for a hang-free result
+// (see ROUND 3 sec. 6/7/8 in tsisim-multinode-poc-llamacpp.md).
+//
+// Round 4: the client now coalesces an entire wave's remote lane-range into
+// ONE combined request (see ggml_tsavorite_run_tmu_mul_mat's
+// remote_dispatched_this_wave), so there is only ever one remote dispatch
+// in flight per wave *by construction* -- this pool is no longer load-
+// bearing for correctness (kept at 1 anyway; it is never contended). The
+// actual fix for the worker-side hang is now on the worker side: see
+// simple-backend-tsi.cpp's dedicated single dispatch-thread architecture,
+// which restores the "top-level graph_compute() always runs on the same OS
+// thread as the one that initialized the runtime" invariant that every
+// previously-proven-correct case (local llama-cli inference, Round 2's ADD
+// POC) already relied on -- Round 3's worker instead spawned a fresh
+// std::thread per accepted connection to call graph_compute(), which is the
+// one structural difference from every known-working case, and is the
+// prime suspect for the residual single-caller hang Round 3 sec. 6 point 2
+// observed even after serializing top-level callers with a mutex.
+static std::mutex g_remote_slot_mutex;
+static std::condition_variable g_remote_slot_cv;
+static int g_remote_slots_free = -1; // lazily initialized to kRemoteSlotCapacity
+static constexpr int kRemoteSlotCapacity = 1;
+
+static void tsi_remote_slot_acquire() {
+    std::unique_lock<std::mutex> lock(g_remote_slot_mutex);
+    if (g_remote_slots_free < 0) {
+        g_remote_slots_free = kRemoteSlotCapacity;
+    }
+    g_remote_slot_cv.wait(lock, [] { return g_remote_slots_free > 0; });
+    g_remote_slots_free--;
+}
+
+static void tsi_remote_slot_release() {
+    std::lock_guard<std::mutex> lock(g_remote_slot_mutex);
+    g_remote_slots_free++;
+    g_remote_slot_cv.notify_one();
+}
+
+// TSI_REMOTE_TXE_POC ROUND 5, requirement B (per-node TXE kernel-dispatch
+// count split by node, mirroring instance 1's own "=== GGML Perf Summary
+// ===" table -- see llama-context.cpp's ggml_perf_print_totals() and
+// ggml.c's ggml_perf_accumulate(), both open-source llama.cpp-fork code,
+// NOT the closed-source tsi-rt TSIProfiler -- that table's "TSI_KERNEL-RUN"
+// column is just a sum, per op, of every graph node's `tsi_kernel_runs`
+// field (a plain int64_t on `struct ggml_tensor`, ggml.h), and that field
+// gets incremented by exactly the two `++launched_kernel_calls;` sites
+// below in ggml_tsavorite_run_tmu_mul_mat() -- one for each local per-tile
+// dispatch, one (always exactly 1, regardless of how many rows it covers)
+// per coalesced remote wave dispatch. Neither `launched_kernel_calls` nor
+// `node->tsi_kernel_runs` distinguish which of those two dispatch kinds
+// contributed to the total -- that split isn't tracked anywhere today.
+// These two additive counters are NOT a replacement for that existing
+// total (left completely untouched, still byte-for-byte what it always
+// was) -- they are new, Tsavorite-only, MUL_MAT-only bookkeeping that lets
+// tsi_report_mul_mat_kernel_run_split() below print local-vs-remote as a
+// clearly-labeled second line right after the existing GGML Perf Summary/
+// profile dump, without touching ggml.c's generic per-backend aggregation
+// (which every other backend also relies on) or the closed-source SDK.
+static std::atomic<int64_t> g_tsi_local_mulmat_kernel_runs{0};
+static std::atomic<int64_t> g_tsi_remote_mulmat_kernel_runs{0};
+
+// Prints the local/remote MUL_MAT OPU dispatch-count split. Called from the
+// client's own shutdown path (ggml_tsavorite_free()/tsi_cleanup(), see
+// below) only when multi_node_enable is true -- with multi_node_enable
+// false the remote counter is always 0 and this line would be redundant
+// with the plain GGML Perf Summary total.
+//
+// ROUND 7 UPDATE: `remote_n` is now the REAL per-node-2 kernel-launch count,
+// reported back to the client over the wire by the worker itself (see
+// tsi_remote_dispatch_mul_mat's kernel_runs_out param and the worker's
+// job->result_kernel_runs/TsiWorkerJob in simple-backend-tsi.cpp) --
+// NOT a "1 coalesced call = 1 unit" placeholder like Round 5. `local_n`
+// still counts actual local TXE kernel launches one-for-one (matches node
+// 1's own per-tile granularity, the same granularity the GGML Perf
+// Summary's TSI_KERNEL-RUN column uses everywhere else). So local_n and
+// remote_n are now DIRECTLY comparable, apples-to-apples, from this one
+// line alone -- no need to cross-reference instance 2's own worker.log to
+// get its true count anymore (though that log still independently confirms
+// the same number, which is a useful cross-check, not the only source of
+// truth).
+static void tsi_report_mul_mat_kernel_run_split() {
+    const int64_t local_n  = g_tsi_local_mulmat_kernel_runs.load();
+    const int64_t remote_n = g_tsi_remote_mulmat_kernel_runs.load();
+    fprintf(stderr,
+            "[tsavorite] MUL_MAT OPU TSI_KERNEL-RUN breakdown: total=%ld "
+            "(node1/local kernel-runs=%ld + node2/remote kernel-runs=%ld -- "
+            "REAL count reported directly by node 2 over the wire, not a "
+            "placeholder).\n",
+            (long)(local_n + remote_n), (long)local_n, (long)remote_n);
+}
+
+// Dispatches one (as of Round 4, possibly multi-tile-wide) MAT_MUL row
+// range to the remote TSISIM instance and blocks for the result. A_rows is
+// M_valid contiguous rows of K floats (the row range of A assigned to the
+// remote side for this wave -- Round 4 coalesces what used to be up to
+// num_of_txes separate single-tile calls into one call covering the whole
+// remote range); B_full is N contiguous rows of K
+// floats (matches ggml's own [K,N] tensor convention for src1, i.e. this is
+// literally what a ggml_new_tensor_2d(ctx, F32, K, N) tensor's bytes look
+// like). C_out receives M_valid*N floats (row-major, matching node's own
+// [M,N] convention) on success.
+//
+// On the remote worker (see simple-backend-tsi.cpp's TSI_REMOTE_TXE_POC
+// block), this exact byte layout is handed straight to ggml_new_tensor_2d +
+// ggml_mul_mat + ggml_backend_graph_compute() against ITS OWN local
+// ggml_backend_tsavorite_init() runtime -- i.e. the remote instance runs the
+// identical, unmodified real MAT_MUL dispatch path (including its own
+// internal Triton row-splitting across its own local TXEs) that a plain
+// llama-cli inference would use, not a hand-rolled reimplementation.
+//
+// ROUND 5: through Round 4 this opened a brand new TCP connection for every
+// call and closed it again before returning -- one connect()/close() per
+// coalesced wave. It now sends/receives on the single persistent connection
+// (g_rt.remote_txe_fd) opened once in tsi_remote_txe_ensure_reachable() and
+// held for the life of the process, eliminating that per-wave handshake/
+// teardown cost entirely. Callers are already serialized to one-in-flight
+// remote dispatch at a time via tsi_remote_slot_acquire()/release()
+// (kRemoteSlotCapacity=1, see above) -- the same invariant that already
+// made the fd-reuse safe here without extra locking around remote_txe_fd
+// itself: only one caller ever touches it at a time.
+//
+// A single reconnect-and-retry is attempted if the persistent connection is
+// ever found closed or a send/recv on it fails (e.g. the remote worker
+// process itself restarted) -- this keeps a long real-model run resilient
+// to one transient hiccup instead of hard-failing the whole client process
+// on the very first blip, while still failing loudly (as Round 3/4 always
+// have) if the remote worker is genuinely unreachable.
+static bool tsi_remote_dispatch_mul_mat(
+    const float *A_rows, int64_t M_valid,
+    const float *B_full, int64_t N,
+    int64_t K,
+    float *C_out,
+    int64_t *kernel_runs_out) {
+
+    uint32_t magic = TSI_REMOTE_TXE_MAGIC_MATMUL;
+    int64_t hdr[3] = { M_valid, N, K };
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (remote_txe_fd < 0) {
+            remote_txe_fd = tsi_remote_txe_connect();
+            if (remote_txe_fd < 0) {
+                fprintf(stderr,
+                        "ERROR: remote MAT_MUL dispatch: cannot (re)connect to %s:%d\n",
+                        remote_txe_host.c_str(), remote_txe_port_start);
+                continue;
+            }
+            fprintf(stderr,
+                    "[tsavorite] remote MAT_MUL dispatch: (re)established "
+                    "persistent connection to %s:%d (fd=%d)\n",
+                    remote_txe_host.c_str(), remote_txe_port_start, remote_txe_fd);
+        }
+
+        int fd = remote_txe_fd;
+        bool ok = true;
+
+        ok = ok && tsi_remote_txe_send_all(fd, &magic, sizeof(magic));
+        ok = ok && tsi_remote_txe_send_all(fd, hdr, sizeof(hdr));
+        ok = ok && tsi_remote_txe_send_all(fd, A_rows, (size_t)(M_valid * K) * sizeof(float));
+        ok = ok && tsi_remote_txe_send_all(fd, B_full, (size_t)(N * K) * sizeof(float));
+
+        if (ok) {
+            uint32_t resp_magic = 0;
+            int64_t remote_kernel_runs = 0;
+            ok = tsi_remote_txe_recv_all(fd, &resp_magic, sizeof(resp_magic));
+            ok = ok && (resp_magic == TSI_REMOTE_TXE_MAGIC_MATMUL);
+            ok = ok && tsi_remote_txe_recv_all(fd, &remote_kernel_runs, sizeof(remote_kernel_runs));
+            ok = ok && tsi_remote_txe_recv_all(fd, C_out, (size_t)(M_valid * N) * sizeof(float));
+            if (ok && kernel_runs_out) {
+                *kernel_runs_out = remote_kernel_runs;
+            }
+        }
+
+        if (ok) {
+            return true;
+        }
+
+        // The persistent connection is broken (or never got established
+        // this attempt) -- close it (if open) so the next loop iteration
+        // (or the next call, if this was the last attempt) reconnects from
+        // scratch rather than reusing a half-dead fd.
+        fprintf(stderr,
+                "WARNING: remote MAT_MUL dispatch on persistent connection to "
+                "%s:%d failed (M_valid=%ld N=%ld K=%ld), attempt %d/2%s\n",
+                remote_txe_host.c_str(), remote_txe_port_start,
+                (long)M_valid, (long)N, (long)K, attempt + 1,
+                attempt == 0 ? " -- will reconnect and retry once" : "");
+        if (remote_txe_fd >= 0) {
+            close(remote_txe_fd);
+            remote_txe_fd = -1;
+        }
+    }
+
+    fprintf(stderr,
+            "ERROR: remote MAT_MUL dispatch to %s:%d failed after reconnect "
+            "retry (M_valid=%ld N=%ld K=%ld)\n",
+            remote_txe_host.c_str(), remote_txe_port_start,
+            (long)M_valid, (long)N, (long)K);
+    return false;
+}
+// =============================================================================
+// END TSI_REMOTE_TXE_POC transport
+// =============================================================================
+
 // Centralized TSI runtime initialization - called once globally
 //
 static void ensure_tsi_runtime_initialized() {
@@ -1672,6 +2150,31 @@ static void ensure_tsi_runtime_initialized() {
         false;
 #endif
 
+    // TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch.
+    // multi_node_enable is now a total-node-count int; 1 = disabled.
+    multi_node_enable = cfg.has_multi_node_enable ? cfg.multi_node_enable : 1;
+    remote_txe_host = cfg.has_remote_txe_host ? cfg.remote_txe_host : std::string();
+    remote_txe_port_start = cfg.has_remote_txe_port_start ? cfg.remote_txe_port_start : 0;
+
+    if (multi_node_enable >= 2 && (remote_txe_host.empty() || remote_txe_port_start <= 0)) {
+        fprintf(stderr,
+                "ERROR: multi_node=%d but remote_txe_host/remote_txe_port_start "
+                "are missing or invalid in %s (remote_txe_host='%s' remote_txe_port_start=%d)\n",
+                multi_node_enable, yaml_path.c_str(), remote_txe_host.c_str(), remote_txe_port_start);
+        fflush(stderr);
+        abort();
+    }
+    if (multi_node_enable > 2) {
+        fprintf(stderr,
+                "WARNING: multi_node=%d requested, but only 2-node dispatch is "
+                "actually implemented today -- this instance will behave exactly "
+                "as multi_node=2 (one remote peer at remote_txe_host:"
+                "remote_txe_port_start). Extending to more than one remote peer "
+                "is real, separate future work, not implemented in this POC.\n",
+                multi_node_enable);
+        fflush(stderr);
+    }
+
     static TsavoriteDeviceConfig deviceConfig{};
     const size_t requested_user_dram_size =
         tsi_user_dram_size_bytes_from_cfg(cfg);
@@ -1682,29 +2185,36 @@ static void ensure_tsi_runtime_initialized() {
         deviceConfigPtr = &deviceConfig;
     }
 
-    printf("\n TSI deploy yaml=%s txe_count=%u multi_thread_enable=%d",
-           yaml_path.c_str(),
+    // Round 9: split across multiple lines (~2 fields/line) instead of one
+    // long concatenated line -- much easier to read during a live demo.
+    printf("\n TSI deploy yaml=%s\n", yaml_path.c_str());
+    printf(" txe_count=%u multi_thread_enable=%d\n",
            (unsigned)num_of_txes,
            (int)multi_thread_enable);
 
     if (requested_user_dram_size > 0) {
-        printf(" user_dram_size_gb=%d user_dram_size_bytes=%zu",
+        printf(" user_dram_size_gb=%d user_dram_size_bytes=%zu\n",
                cfg.user_dram_size_gb,
                requested_user_dram_size);
     } else {
-        printf(" user_dram_size_gb=default");
+        printf(" user_dram_size_gb=default\n");
     }
 
 #if TRITON_MAT_MUL
-    printf(" advanced_matmul_shape_offload=%d",
-           (int)advanced_matmul_shape_offload);
-    printf(" advanced_matmul_broadcast_offload=%d",
+    printf(" advanced_matmul_shape_offload=%d advanced_matmul_broadcast_offload=%d\n",
+           (int)advanced_matmul_shape_offload,
            (int)advanced_matmul_broadcast_offload);
-    printf(" triton_matmul_small_n_transpose_opt=%d",
-           (int)triton_matmul_small_n_transpose_opt);
+    printf(" triton_matmul_small_n_transpose_opt=%d multi_node=%d\n",
+           (int)triton_matmul_small_n_transpose_opt,
+           multi_node_enable);
+#else
+    printf(" multi_node=%d\n", multi_node_enable);
 #endif
 
-    printf("\n");
+    if (multi_node_enable >= 2) {
+        printf(" remote_txe_host=%s remote_txe_port_start=%d\n",
+               remote_txe_host.c_str(), remote_txe_port_start);
+    }
 
     tsi_initialize(num_of_txes, deviceConfigPtr);
     tsavorite_install_signal_handlers();
@@ -1727,6 +2237,14 @@ static void ensure_tsi_runtime_initialized() {
     }
 
     workers.reserve(num_of_txes);
+
+    // TSI_REMOTE_TXE_POC: verify the remote worker is reachable as part of
+    // bring-up. Fails loudly (abort) rather than silently degrading to
+    // local-only -- see tsi_remote_txe_ensure_reachable() above.
+    if (multi_node_enable >= 2) {
+        tsi_remote_txe_ensure_reachable();
+    }
+
     runtime_initialized = true;
 
     GGML_TSAVORITE_LOG_INFO("Profiler and TSI runtime initialized early in registration\n");
@@ -2855,6 +3373,10 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
           free(device_free);
          device_free = NULL;
       }
+      // TSI_REMOTE_TXE_POC ROUND 5: symmetric with the local TXE resource
+      // teardown above -- close the persistent remote-worker connection (if
+      // multi_node_enable ever opened one) before tsi_finalize().
+      tsi_remote_txe_close_persistent();
       sleep(2);
       tsi_finalize();
       tsirt::utils::TSIProfiler::finalize();
@@ -2867,6 +3389,16 @@ static void ggml_tsavorite_free(struct ggml_backend_tsavorite_context *ctx) {
   std::cout << tsirt::utils::TSIProfiler::getFormattedResults(
                  /*truncateFuncNames*/ true)
           << std::endl;
+
+  // TSI_REMOTE_TXE_POC ROUND 5, requirement B: print the MUL_MAT OPU
+  // local(node1)/remote(node2) TSI_KERNEL-RUN split as a clearly-labeled
+  // line right after the standard perf output above. Only meaningful when
+  // multi_node_enable was ever true (otherwise remote is trivially 0 and
+  // this would just be redundant noise on every ordinary single-node run).
+  if (multi_node_enable >= 2) {
+      tsi_report_mul_mat_kernel_run_split();
+  }
+
   GGML_TSAVORITE_LOG_INFO("End %s\n", __func__);
   return;
 }
@@ -2883,6 +3415,11 @@ tsi_cleanup() {
         free(device_free);
         device_free = NULL;
     }
+    // TSI_REMOTE_TXE_POC ROUND 5: see the matching close in
+    // ggml_tsavorite_free() above -- this is the error/abort-path cleanup
+    // (e.g. a failed remote dispatch calls tsi_cleanup(); abort();), so it
+    // needs the same persistent-connection teardown for symmetry.
+    tsi_remote_txe_close_persistent();
     sleep(2);
     tsi_finalize();
     GGML_TSAVORITE_LOG_INFO("Start %s\n", __func__);
@@ -5440,7 +5977,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
                 }
 
-                ++node->tsi_kernel_runs;
+                ++node->tsi_kernel_runs[0];
                 ++profile.kernel_calls;
             }
         }
@@ -5464,12 +6001,79 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
     const triton_matmul_txe_shape_t &txe_shape = triton_matmul_select_shape(M, N);
     const int64_t N_pad = tsi_round_up_i64(N, txe_shape.n_dim);
 
-    const int64_t active_txes = (int64_t)num_of_txes;
-    const int64_t rows_per_txe_unaligned = (M + active_txes - 1) / active_txes;
-    const int64_t rows_per_txe =
-        tsi_round_up_i64(rows_per_txe_unaligned, txe_shape.m_dim);
+    // TSI_REMOTE_TXE_POC (ROUND 4 revision -- see "ROUND 4" in
+    // tsisim-multinode-poc-llamacpp.md for the full measurement/rationale):
+    // Round 3 computed rows_per_txe from active_txes = 2*num_of_txes, which
+    // roughly HALVED every tile's row count whenever a matmul was large
+    // enough to reach the remote lanes -- nearly doubling total kernel-run
+    // dispatch count (1700 -> 3271 for the same 85 top-level ops) for
+    // ~zero benefit, because this simulator's per-kernel-call cost is
+    // overhead-dominated, not proportional to tile row count (avg ~36.6us
+    // -> ~38.8us per call despite tiles being ~half the size). Round 4
+    // instead computes rows_per_txe from num_of_txes ONLY, so tile size is
+    // always exactly "what a single instance uses per lane" -- identical to
+    // the non-multi-node baseline -- regardless of multi_node_enable.
+    // active_txes still doubles the LANE COUNT available per wave (so a
+    // wave can cover up to 2*num_of_txes baseline-sized tiles instead of
+    // num_of_txes), which only matters for matmuls large enough to need
+    // more than num_of_txes tiles in the first place; small matmuls (most
+    // decode-time ops) never reach lane num_of_txes and are byte-for-byte
+    // unaffected. Lanes [0, num_of_txes) dispatch locally exactly as
+    // before. Lanes [num_of_txes, active_txes) are no longer dispatched one
+    // tiny tile at a time (Round 3's approach, which also required capping
+    // remote concurrency to 1-in-flight for correctness -- see ROUND 3 sec.
+    // 6); instead the ENTIRE remote lane-range of a wave is coalesced into
+    // ONE combined MAT_MUL request (see remote_dispatched_this_wave below),
+    // letting the remote instance's own already-proven internal multi-TXE
+    // row-splitting subdivide it across its own up to num_of_txes local
+    // TXEs, at the SAME baseline tile size. When multi_node_enable is false
+    // this is byte-for-byte the original active_txes = num_of_txes path.
+    const int64_t active_txes =
+        (multi_node_enable >= 2) ? (int64_t)num_of_txes * 2 : (int64_t)num_of_txes;
 
+    // ROUND 6 FIX (2026-09-16): Round 5 proved that sizing rows_per_txe from
+    // num_of_txes alone makes the remote lane range mathematically
+    // unreachable for any M -- by construction, num_of_txes tiles at that
+    // size always cover M, so the tile loop's `tile_m0 >= M` break always
+    // fires at or before t==num_of_txes. Fix: compute the num_of_txes-only
+    // baseline first (byte-for-byte Round 4's formula/behavior). If that
+    // baseline already needs every one of the num_of_txes local lanes
+    // (tiles_needed == num_of_txes -- this op is genuinely saturating local
+    // capacity), THEN recompute rows_per_txe from active_txes instead, so
+    // the excess spills into the remote lane range in this same wave.
+    // Small ops (most decode-time matmuls, which never come close to
+    // saturating num_of_txes lanes at baseline tile size) are completely
+    // unaffected -- identical tile count and size to Round 4/baseline, so
+    // the dispatch-count blowup Round 3 hit does not recur. Only ops big
+    // enough to already need all num_of_txes local lanes (e.g. the ~32k-row
+    // vocab projection) get finer tiling, and only for THOSE ops does the
+    // extra granularity genuinely buy real remote parallelism instead of
+    // just fragmentation overhead.
+    const int64_t baseline_rows_per_txe_unaligned =
+        (M + (int64_t)num_of_txes - 1) / (int64_t)num_of_txes;
+    const int64_t baseline_rows_per_txe =
+        tsi_round_up_i64(baseline_rows_per_txe_unaligned, txe_shape.m_dim);
+    const int64_t baseline_tiles_needed =
+        (M + baseline_rows_per_txe - 1) / baseline_rows_per_txe;
+
+    int64_t rows_per_txe;
+    if (multi_node_enable >= 2 && baseline_tiles_needed >= (int64_t)num_of_txes) {
+        const int64_t active_rows_per_txe_unaligned =
+            (M + active_txes - 1) / active_txes;
+        rows_per_txe = tsi_round_up_i64(active_rows_per_txe_unaligned, txe_shape.m_dim);
+    } else {
+        rows_per_txe = baseline_rows_per_txe;
+    }
     uint64_t launched_kernel_calls = 0;
+    // ROUND 7b: launched_kernel_calls only ever counts LOCAL per-tile
+    // dispatches now (each one IS exactly 1 real kernel launch, so a
+    // flat ++ is correct there). Remote dispatches are tracked here
+    // instead, using the REAL count reported by the worker (see the
+    // remote branch below) -- this feeds node->tsi_kernel_runs /
+    // profile.kernel_calls / device stats at the end of this function
+    // so the standard GGML Perf Summary table's own MUL_MAT row is
+    // correct too, not just the separate Tsavorite breakdown print.
+    std::atomic<int64_t> remote_kernel_runs_this_node{0};
 
     for (int64_t d3 = 0; d3 < D3; ++d3) {
         for (int64_t d2 = 0; d2 < D2; ++d2) {
@@ -5494,6 +6098,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
                 int64_t batch_copyback_us = 0;
 
                 std::mutex batch_profile_mutex;
+                bool remote_dispatched_this_wave = false;
 
                 for (int64_t t = 0; t < active_txes; ++t) {
                     const int64_t tile_m0 = m0 + t * rows_per_txe;
@@ -5504,6 +6109,157 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                     const int64_t M_valid =
                         (M - tile_m0 > rows_per_txe) ? rows_per_txe : (M - tile_m0);
+
+                    // TSI_REMOTE_TXE_POC (ROUND 4 revision): lanes >=
+                    // num_of_txes are the remote-instance-backed half of the
+                    // logical 2*num_of_txes range (only reachable when
+                    // multi_node_enable is true, since active_txes stays ==
+                    // num_of_txes otherwise). Round 3 dispatched every such
+                    // lane as its own tiny separate remote request (up to
+                    // num_of_txes per wave); Round 4 coalesces the ENTIRE
+                    // remote range of this wave into ONE combined request,
+                    // issued the first time this branch is reached for the
+                    // wave (t == num_of_txes), covering every row from here
+                    // through the end of the wave (or M). Subsequent t
+                    // values in this range are already covered by that one
+                    // dispatch, so they just `continue`. The remote
+                    // instance's own already-proven internal multi-TXE
+                    // row-splitting subdivides the coalesced chunk across
+                    // its own up to num_of_txes local TXEs, at this same
+                    // baseline rows_per_txe tile size (its own copy of this
+                    // same function recomputes rows_per_txe from ITS OWN
+                    // num_of_txes against the M_valid it received).
+                    if (t >= (int64_t)num_of_txes) {
+                        if (remote_dispatched_this_wave) {
+                            continue;
+                        }
+                        remote_dispatched_this_wave = true;
+
+                        const int64_t remote_m0 = tile_m0;
+                        const int64_t remote_rows_total =
+                            std::min(M, m0 + active_txes * rows_per_txe) - remote_m0;
+
+                        std::lock_guard<std::mutex> lk(workers_mutex);
+
+                        workers.emplace_back([=, &batch_profile_mutex,
+                                               &batch_wait_sum_us,
+                                               &batch_launch_us,
+                                               &remote_kernel_runs_this_node] {
+                            tsi_remote_slot_acquire();
+
+                            const int64_t t0 = tsavorite_now_us();
+
+                            // Pack A's coalesced multi-tile row range and
+                            // the full B into plain, contiguous [rows x K]
+                            // float buffers -- the same per-row copy helper
+                            // the local path already uses (handles
+                            // arbitrary strides / non-F32-adjacent layouts),
+                            // but with NO Triton-specific M/N padding: the
+                            // remote side runs a real ggml_mul_mat, not the
+                            // raw Triton blob ABI, so it does its own
+                            // internal packing/padding on its own local
+                            // runtime (including its own internal row
+                            // splitting across its own local TXEs, since
+                            // remote_rows_total can be up to num_of_txes
+                            // baseline tiles' worth of rows).
+                            std::vector<float> A_rows((size_t)(remote_rows_total * K));
+                            for (int64_t r = 0; r < remote_rows_total; ++r) {
+                                const int64_t src_r = remote_m0 + r;
+                                const char *row = A_ptr + src_r * a_nb1;
+                                tsavorite_tensor_copy_k_to_f32(
+                                    A, row, A_rows.data() + r * K, K, a_nb0);
+                            }
+
+                            std::vector<float> B_rows((size_t)(N * K));
+                            for (int64_t c = 0; c < N; ++c) {
+                                const char *col = B_ptr + c * b_nb1;
+                                tsavorite_tensor_copy_k_to_f32(
+                                    B, col, B_rows.data() + c * K, K, b_nb0);
+                            }
+
+                            std::vector<float> C_rows((size_t)(remote_rows_total * N));
+                            // ROUND 7: the real per-request kernel-run count
+                            // the worker actually used, reported back over
+                            // the wire (see tsi_remote_dispatch_mul_mat's
+                            // kernel_runs_out param and the worker's
+                            // job->result_kernel_runs) -- replaces the old
+                            // "1 call = 1 unit" placeholder accumulation
+                            // below with the real number.
+                            int64_t remote_real_kernel_runs = 0;
+                            const bool ok = tsi_remote_dispatch_mul_mat(
+                                A_rows.data(), remote_rows_total,
+                                B_rows.data(), N,
+                                K, C_rows.data(), &remote_real_kernel_runs);
+
+                            if (!ok) {
+                                fprintf(stderr,
+                                        "ERROR: remote MAT_MUL dispatch failed "
+                                        "(remote_m0=%ld remote_rows_total=%ld N=%ld K=%ld). "
+                                        "multi_node_enable requires the remote "
+                                        "worker to stay up for correctness.\n",
+                                        (long)remote_m0, (long)remote_rows_total, (long)N, (long)K);
+                                fflush(stderr);
+                                tsi_remote_slot_release();
+                                tsi_cleanup();
+                                abort();
+                            }
+
+                            // ROUND 7/7b: accumulate the REAL count reported
+                            // by the worker for this request -- into the
+                            // global cross-run counter (for
+                            // tsi_report_mul_mat_kernel_run_split()) AND
+                            // into this specific node's own local
+                            // accumulator (so node->tsi_kernel_runs and the
+                            // standard GGML Perf Summary table are correct
+                            // too, not just the separate breakdown print).
+                            g_tsi_remote_mulmat_kernel_runs.fetch_add(
+                                remote_real_kernel_runs, std::memory_order_relaxed);
+                            remote_kernel_runs_this_node.fetch_add(
+                                remote_real_kernel_runs, std::memory_order_relaxed);
+
+                            // NOTE: ggml_mul_mat's result tensor has
+                            // ne0=remote_rows_total, ne1=N (fastest-varying
+                            // dim is M), so its raw, contiguous buffer --
+                            // exactly what the remote worker sends back
+                            // unmodified via ggml_backend_tensor_get() -- is
+                            // flat-indexed as [n * remote_rows_total + m],
+                            // NOT the row-major [m * N + n] one might
+                            // assume. Verified against a hand-computed
+                            // reference case in Round 3 before wiring this
+                            // into the real inference path; the indexing
+                            // itself is unchanged by Round 4's coalescing
+                            // (only M_valid's meaning/size changed, from one
+                            // tile to the whole remote range of the wave).
+                            for (int64_t r = 0; r < remote_rows_total; ++r) {
+                                const int64_t dst_r = remote_m0 + r;
+                                for (int64_t c = 0; c < N; ++c) {
+                                    *(float *)(C_ptr + dst_r * c_nb0 + c * c_nb1) =
+                                        C_rows[(size_t)(c * remote_rows_total + r)];
+                                }
+                            }
+
+                            {
+                                std::lock_guard<std::mutex> lk2(batch_profile_mutex);
+                                batch_launch_us += tsavorite_elapsed_us(t0);
+                                batch_wait_sum_us += tsavorite_elapsed_us(t0);
+                            }
+
+                            tsi_remote_slot_release();
+                        });
+
+                        ++batch_launched;
+                        // ROUND 7b: launched_kernel_calls is NOT incremented
+                        // here anymore -- a coalesced remote wave is not "1
+                        // kernel launch", it's however many the worker
+                        // actually ran (see remote_kernel_runs_this_node.
+                        // fetch_add inside the lambda above, using the real
+                        // count g_tsi_remote_mulmat_kernel_runs is also fed
+                        // from). This call is fire-and-forget at this
+                        // point; the real count isn't known until the
+                        // lambda's dispatch call returns.
+                        continue;
+                    }
+
                     const int64_t M_tile_pad =
                         tsi_round_up_i64(M_valid, txe_shape.m_dim);
 
@@ -5643,6 +6399,10 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                     ++batch_launched;
                     ++launched_kernel_calls;
+                    // ROUND 5 requirement B: one increment per local
+                    // per-tile dispatch -- see
+                    // tsi_report_mul_mat_kernel_run_split() above.
+                    g_tsi_local_mulmat_kernel_runs.fetch_add(1, std::memory_order_relaxed);
                 }
 
                 if (batch_launched > 0) {
@@ -5661,12 +6421,25 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
         }
     }
 
+    // ROUND 7b: fold the real remote kernel-run count (reported by the
+    // worker over the wire, per request -- see remote_kernel_runs_this_node
+    // above) into the same totals local-only dispatch always fed, so the
+    // standard GGML Perf Summary table's MUL_MAT row (and device stats,
+    // and the profiler) reflect the true combined total, not a
+    // "1 coalesced call = 1 unit" undercount.
+    const int64_t real_remote_this_node = remote_kernel_runs_this_node.load();
+    const int64_t total_kernel_runs_this_node =
+        (int64_t)launched_kernel_calls + real_remote_this_node;
+
     if (device) {
-        device->stats.op_run_count[kernel_type].num_of_kernel_call += launched_kernel_calls;
+        device->stats.op_run_count[kernel_type].num_of_kernel_call += total_kernel_runs_this_node;
     }
 
-    node->tsi_kernel_runs += launched_kernel_calls;
-    profile.kernel_calls += (int64_t)launched_kernel_calls;
+    // ROUND 9: split the combined total back into node1(local)/node2(remote)
+    // for the standard GGML Perf Summary table's two-column breakdown.
+    node->tsi_kernel_runs[0] += (int64_t)launched_kernel_calls;
+    node->tsi_kernel_runs[1] += real_remote_this_node;
+    profile.kernel_calls += total_kernel_runs_this_node;
 
     profile.matrix_total_us = tsavorite_elapsed_us(matrix_start_us);
     tsavorite_matmul_profile_record(node, profile);
@@ -6023,7 +6796,7 @@ static enum ggml_status ggml_tsavorite_run_tmu_mul_mat(
 
                         // Stats per kernel call
                         if (device) ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                        ++node->tsi_kernel_runs;
+                        ++node->tsi_kernel_runs[0];
 
 #ifdef TMU_DEBUG_VALIDATE
                         // -----------------------------------------------------------------
@@ -6531,7 +7304,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                         val[0] = scale;
                         ctx->kernels[kernel_type].pipeline->_mlir_fptr_3_input[kernel_sub_type](srcP0, srcP1, nodeP, glob_buf);
                         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                        ++node->tsi_kernel_runs;
+                        ++node->tsi_kernel_runs[0];
 	            }
 	        }
 	    }
@@ -6652,7 +7425,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
                     }
 #endif /* TRITON_ADD */
                     ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-                    ++node->tsi_kernel_runs;
+                    ++node->tsi_kernel_runs[0];
                 }
             }
         }
@@ -6768,7 +7541,7 @@ std::lock_guard<std::mutex> _lk(g_tsavorite_compute_mutex);
             ctx->kernels[kernel_type].pipeline->_mlir_fptr_1_input[kernel_sub_type](srcP0, nodeP);
 	}
         ++device->stats.op_run_count[kernel_type].num_of_kernel_call;
-        ++node->tsi_kernel_runs;
+        ++node->tsi_kernel_runs[0];
 
         if (ggml_tsavorite_log_type_val == GGML_TSAVORITE_LOG_DEBUG) {
           log_data.data_type = GGML_TSAVORITE_TENSOR_NODE;
@@ -7204,6 +7977,11 @@ tsi_log_profile_info() {
         free(device_free);
         device_free = NULL;
     }
+    // TSI_REMOTE_TXE_POC ROUND 5: symmetric cleanup (see
+    // ggml_tsavorite_free()/tsi_cleanup() above) -- this OLLAMA-only
+    // teardown path is not exercised by this POC's tsi-ggml build, but keep
+    // it correct in case OLLAMA is ever defined.
+    tsi_remote_txe_close_persistent();
     printf("\n finalize 4 \n");
     tsi_finalize();
     tsirt::utils::TSIProfiler::finalize();

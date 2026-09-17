@@ -2,6 +2,11 @@
 # ==============================================================================
 # tsi-pkg-build.sh (source-safe)
 #
+# For multi-node TSISIM cross-instance dispatch testing (2 TSISIM instances,
+# MAT_MUL split across both), see PR #165 (branch
+# poc/tsisim-cross-instance-txe-dispatch) on tsisw/llama.cpp for the full
+# setup and reproduction steps.
+#
 # USAGE (source is recommended)
 # ============================
 #
@@ -243,6 +248,63 @@
 #     working directory before running package.
 #
 #       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
+# ==============================================================================
+#
+# MULTI-NODE TSISIM TESTING CHEATSHEET (cross-instance TXE dispatch PoC)
+# =======================================================================
+# How to bring up two TSISIM instances and verify MAT_MUL work actually
+# splits across both (see PR #165, branch poc/tsisim-cross-instance-txe-dispatch,
+# on tsisw/llama.cpp for the full architecture writeup and raw-log evidence).
+# Deploy this package's tsi-ggml/ output identically to both instances first
+# (extract the .tz from "package", above, to wherever your deployment
+# symlink -- /usr/bin/tsi/bin/tsi-ggml -- points, on each instance).
+#
+# Instance 1 = client running llama-cli. Instance 2 = remote TXE worker
+# (simple-backend-tsi remote-worker, no llama-cli involved). Both instances
+# only ever reach each other through the HOST's real IP -- each TSISIM
+# guest sits behind its own NAT and cannot route directly to the other
+# guest's own internal address.
+#
+# 1) Bring up instance 2's worker (run this first, it must be listening
+#    before instance 1 starts):
+#      cd <deployment-dir>   # wherever /usr/bin/tsi/bin/tsi-ggml points
+#      export TSI_SKIP_NOP_TEST=1
+#      ./simple-backend-tsi remote-worker 29511
+#
+# 2) On instance 1's deployment yaml (tsavorite-model-deployment.yaml),
+#    set: multi_node: 2, remote_txe_host: "<host's real IP>",
+#    remote_txe_port_start: 29511  (multi_node: 1 = single-node/disabled,
+#    the default -- flip back to 1 for an apples-to-apples baseline run).
+#
+# 3) From instance 1, confirm the path to instance 2's worker port is
+#    open before running anything expensive:
+#      (echo > /dev/tcp/<host-ip>/29511) && echo REACHABLE
+#
+# 4) Run inference as normal (run_llama_cli.sh internally calls ./ggml.sh,
+#    which preserves multi_node/remote_txe_host/remote_txe_port_start
+#    across regeneration -- no extra flags needed):
+#      bash /usr/bin/tsi/bin/run_llama_cli.sh "<prompt>" <n_predict> <model.gguf>
+#
+# 5) Verify the work genuinely split, three independent ways:
+#    a) instance 1's own closing line:
+#         "MUL_MAT OPU TSI_KERNEL-RUN breakdown: total=N
+#          (node1/local kernel-runs=X + node2/remote kernel-runs=Y --
+#          REAL count reported directly by node 2 over the wire)"
+#    b) instance 1's standard GGML Perf Summary table -- the MUL_MAT OPU
+#       row's N1_KRUN/N2_KRUN columns should equal X and Y above exactly.
+#    c) instance 2's own worker.log, completely independently, logs its
+#       own real per-request kernel-run counts and a running total that
+#       should match Y exactly.
+#    d) on BOTH instances: ./check_tsictl.sh (loops tsictl oc hw details
+#       0..19 | grep execute) should show a flat, even execute count
+#       across all 20 TXE indices -- the signature of genuinely
+#       evenly-tiled hardware dispatch, not a handful of TXEs doing
+#       all the work.
+#
+# 6) For a fair single-node vs. multi-node comparison: run both back-to-
+#    back on the same host (absolute wall-clock varies with host load on
+#    a shared dev box), and always run one cheap cache-clear invocation
+#    (a tiny model, e.g. 2 tokens) immediately before each timed run.
 # ==============================================================================
 
 log_error(){ echo "ERROR: $*" >&2; }
@@ -778,7 +840,7 @@ setup_python() {
   fi
 
   if ! pip show onnxruntime-training >/dev/null 2>&1; then
-    run pip install onnxruntime-training || return 1
+    run pip install onnxruntime-training || log_info "WARNING: onnxruntime-training install failed, continuing anyway (POC workaround)"
   fi
 
   # ---------------------------------------------------------------------------
@@ -1065,6 +1127,13 @@ update_one_tsavorite_deployment_yaml() {
   local advanced_matmul_broadcast_offload="false"
   local triton_matmul_small_n_transpose_opt="false"
 local user_dram_size_gb="8"
+  # TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch,
+  # preserved across ggml.sh re-runs the same way the advanced_matmul_*
+  # flags are. multi_node is a total-node-count integer -- 1 = disabled
+  # (default).
+  local multi_node_enable="1"
+  local remote_txe_host=""
+  local remote_txe_port=""
 
   mkdir -p "$(dirname "${deployment_yaml_path}")" || return 1
 
@@ -1073,10 +1142,16 @@ local user_dram_size_gb="8"
     local existing_broadcast
     local existing_small_n_opt
 local existing_user_dram_size_gb
+    local existing_multi_node_enable
+    local existing_remote_txe_host
+    local existing_remote_txe_port
 
     existing_advanced="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_shape_offload")"
     existing_broadcast="$(extract_deployment_yaml_value "${deployment_yaml_path}" "advanced_matmul_broadcast_offload")"
     existing_small_n_opt="$(extract_deployment_yaml_value "${deployment_yaml_path}" "triton_matmul_small_n_transpose_opt")"
+    existing_multi_node_enable="$(extract_deployment_yaml_value "${deployment_yaml_path}" "multi_node")"
+    existing_remote_txe_host="$(extract_deployment_yaml_value "${deployment_yaml_path}" "remote_txe_host")"
+    existing_remote_txe_port="$(extract_deployment_yaml_value "${deployment_yaml_path}" "remote_txe_port_start")"
 
     if [ -n "${existing_advanced}" ]; then
       advanced_matmul_shape_offload="${existing_advanced}"
@@ -1087,6 +1162,15 @@ local existing_user_dram_size_gb
     fi
     if [ -n "${existing_small_n_opt}" ]; then
       triton_matmul_small_n_transpose_opt="${existing_small_n_opt}"
+    fi
+    if [ -n "${existing_multi_node_enable}" ]; then
+      multi_node_enable="${existing_multi_node_enable}"
+    fi
+    if [ -n "${existing_remote_txe_host}" ]; then
+      remote_txe_host="${existing_remote_txe_host}"
+    fi
+    if [ -n "${existing_remote_txe_port}" ]; then
+      remote_txe_port="${existing_remote_txe_port}"
     fi
   fi
 
@@ -1131,9 +1215,23 @@ advanced_matmul_broadcast_offload: ${advanced_matmul_broadcast_offload}
 # false = old behavior
 # true  = for M >> N, compute swapped [N x M] and transpose copyback to [M x N]
 triton_matmul_small_n_transpose_opt: ${triton_matmul_small_n_transpose_opt}
+
+# TSI_REMOTE_TXE_POC ROUND 8: cross-instance (multi-node) TXE dispatch for
+# this POC. multi_node is a total-node-count integer, not a bool now:
+# 1 (or absent) = disabled, txe_count TXEs used purely locally (default).
+# 2 = today's only actually-implemented case: txe_count TXEs used locally
+# AND this instance also dispatches MAT_MUL work to one remote TSISIM
+# instance's txe_count TXEs over TCP. Values > 2 accepted but not yet
+# functionally supported (only one remote peer is ever contacted today).
+multi_node: ${multi_node_enable}
+
+# Only used when multi_node >= 2 -- the remote TSISIM instance's reachable
+# address for the remote-TXE worker.
+remote_txe_host: "${remote_txe_host}"
+remote_txe_port_start: ${remote_txe_port:-0}
 EOF
 
-  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}"
+  echo "INFO: updated ${deployment_yaml_path} with txe_count:${txe_count}, multi_thread_enable:true; preserved advanced_matmul_shape_offload:${advanced_matmul_shape_offload}, advanced_matmul_broadcast_offload:${advanced_matmul_broadcast_offload}, triton_matmul_small_n_transpose_opt:${triton_matmul_small_n_transpose_opt}, multi_node:${multi_node_enable}, remote_txe_host:${remote_txe_host}, remote_txe_port_start:${remote_txe_port}"
   return 0
 }
 

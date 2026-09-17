@@ -669,10 +669,14 @@ extern "C" {
 
 #if defined(GGML_PERF) || defined(GGML_PERF_RELEASE) || defined(GGML_PERF_DETAIL)
         int64_t perf_runs;
-        int64_t tsi_kernel_runs;
+        // ROUND 9: [0] = this node's own local TXE kernel-runs, [1] = the
+        // remote node's real kernel-runs (multi_node only; always 0 for
+        // ops/runs that never go remote).
+        int64_t tsi_kernel_runs[2];
         int64_t perf_time_us;
         enum ggml_compute_backend_type ggml_compute_backend;
-        char padding[12];
+        // ROUND 9: shrunk from 12 -> 4 to offset the extra 8 bytes tsi_kernel_runs[2] added, keeping sizeof(ggml_tensor) % GGML_MEM_ALIGN == 0.
+        char padding[4];
 #else
         char padding[8];
 #endif /* GML_PERF-related flag */
@@ -2628,13 +2632,15 @@ extern "C" {
 struct ggml_perf_backend_subtotals {
     int64_t total_us;
     int64_t runs;
-    int64_t tsi_kernel_count;
+    // [0] = node1/local kernel-runs, [1] = node2/remote kernel-runs
+    int64_t tsi_kernel_count[2];
 };
 
 struct ggml_perf_unary_subtotals {
     int64_t total_us;
     int64_t runs;
-    int64_t tsi_kernel_count;
+    // [0] = node1/local kernel-runs, [1] = node2/remote kernel-runs
+    int64_t tsi_kernel_count[2];
 };
 // internal perf accumulation struct
 struct ggml_perf_totals {
