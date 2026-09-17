@@ -249,6 +249,63 @@
 #
 #       SDK_VERSION=0.4.1 source tsi-pkg-build.sh build-fpga package
 # ==============================================================================
+#
+# MULTI-NODE TSISIM TESTING CHEATSHEET (cross-instance TXE dispatch PoC)
+# =======================================================================
+# How to bring up two TSISIM instances and verify MAT_MUL work actually
+# splits across both (see PR #165, branch poc/tsisim-cross-instance-txe-dispatch,
+# on tsisw/llama.cpp for the full architecture writeup and raw-log evidence).
+# Deploy this package's tsi-ggml/ output identically to both instances first
+# (extract the .tz from "package", above, to wherever your deployment
+# symlink -- /usr/bin/tsi/bin/tsi-ggml -- points, on each instance).
+#
+# Instance 1 = client running llama-cli. Instance 2 = remote TXE worker
+# (simple-backend-tsi remote-worker, no llama-cli involved). Both instances
+# only ever reach each other through the HOST's real IP -- each TSISIM
+# guest sits behind its own NAT and cannot route directly to the other
+# guest's own internal address.
+#
+# 1) Bring up instance 2's worker (run this first, it must be listening
+#    before instance 1 starts):
+#      cd <deployment-dir>   # wherever /usr/bin/tsi/bin/tsi-ggml points
+#      export TSI_SKIP_NOP_TEST=1
+#      ./simple-backend-tsi remote-worker 29511
+#
+# 2) On instance 1's deployment yaml (tsavorite-model-deployment.yaml),
+#    set: multi_node: 2, remote_txe_host: "<host's real IP>",
+#    remote_txe_port_start: 29511  (multi_node: 1 = single-node/disabled,
+#    the default -- flip back to 1 for an apples-to-apples baseline run).
+#
+# 3) From instance 1, confirm the path to instance 2's worker port is
+#    open before running anything expensive:
+#      (echo > /dev/tcp/<host-ip>/29511) && echo REACHABLE
+#
+# 4) Run inference as normal (run_llama_cli.sh internally calls ./ggml.sh,
+#    which preserves multi_node/remote_txe_host/remote_txe_port_start
+#    across regeneration -- no extra flags needed):
+#      bash /usr/bin/tsi/bin/run_llama_cli.sh "<prompt>" <n_predict> <model.gguf>
+#
+# 5) Verify the work genuinely split, three independent ways:
+#    a) instance 1's own closing line:
+#         "MUL_MAT OPU TSI_KERNEL-RUN breakdown: total=N
+#          (node1/local kernel-runs=X + node2/remote kernel-runs=Y --
+#          REAL count reported directly by node 2 over the wire)"
+#    b) instance 1's standard GGML Perf Summary table -- the MUL_MAT OPU
+#       row's N1_KRUN/N2_KRUN columns should equal X and Y above exactly.
+#    c) instance 2's own worker.log, completely independently, logs its
+#       own real per-request kernel-run counts and a running total that
+#       should match Y exactly.
+#    d) on BOTH instances: ./check_tsictl.sh (loops tsictl oc hw details
+#       0..19 | grep execute) should show a flat, even execute count
+#       across all 20 TXE indices -- the signature of genuinely
+#       evenly-tiled hardware dispatch, not a handful of TXEs doing
+#       all the work.
+#
+# 6) For a fair single-node vs. multi-node comparison: run both back-to-
+#    back on the same host (absolute wall-clock varies with host load on
+#    a shared dev box), and always run one cheap cache-clear invocation
+#    (a tiny model, e.g. 2 tokens) immediately before each timed run.
+# ==============================================================================
 
 log_error(){ echo "ERROR: $*" >&2; }
 log_info(){ echo "INFO: $*"; }
