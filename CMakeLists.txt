@@ -77,6 +77,15 @@ if (GGML_TSAVORITE)
     include_directories(${TSAVORITE_INCLUDE_DIR})
     include_directories(${MLIR_COMPILER_DIR}/include/tsi-rt/shim)
     include_directories(${RUNTIME_DIR}/include)
+    # HostShimCAPI.h (and other tsi-rt/shim headers) live one level deeper,
+    # at ${RUNTIME_DIR}/include/tsi-rt/shim. Some SDKs also duplicate a copy
+    # under ${MLIR_COMPILER_DIR}/include/tsi-rt/shim (added above), which is
+    # what made the bare `#include "HostShimCAPI.h"` in
+    # ggml-tsavorite/include/TestModel.h resolve previously -- but that
+    # duplication isn't guaranteed (e.g. dropped by the private
+    # sdk-r.0.0.0-ss1698-3 build), so add the runtime package's own shim dir
+    # directly rather than relying on the compiler package to re-export it.
+    include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
     include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/include)
     message("tsavorite backend is enabled")
 endif()
