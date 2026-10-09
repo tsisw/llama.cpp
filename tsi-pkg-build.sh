@@ -886,12 +886,32 @@ fpga_host_objs_present() {
   return 0
 }
 
+# Since mlir-compiler #662 (SDK 0.6.4), the compiler no longer bundles TXE-FFM or the runtime: the
+# tsavorite package reads their library paths (FFM_CAPI_LIB, FFM_CAPI_LIB_FAU, TSI_RUNTIME_LIB) from
+# mlir_compiler_config.toml, which it looks for under platformdirs' user config dir
+# ($XDG_CONFIG_HOME/taos, else ~/.config/taos, on Linux) and then /etc/taos. Without it every blob
+# compile fails with "FFM_CAPI_LIB has not been specified". The SDK ships a matching file at
+# ${MLIR_SDK_VERSION}/.config/taos/, so point XDG_CONFIG_HOME there when it exists. The variable is
+# set for create-all-kernels.sh only: this script is usually sourced, and exporting it would also
+# move the caller's pip, git and other XDG config lookups. SDKs older than 0.6.4 ship no such file
+# and need none, so they run unchanged, as does a compiler dir outside an SDK.
+run_create_all_kernels() {
+  local sdk_config_home="${MLIR_SDK_VERSION}/.config"
+  if [ -f "${sdk_config_home}/taos/mlir_compiler_config.toml" ]; then
+    log_info "Using SDK compiler config: ${sdk_config_home}/taos/mlir_compiler_config.toml"
+    run env XDG_CONFIG_HOME="${sdk_config_home}" ./create-all-kernels.sh
+  else
+    log_info "No SDK compiler config at ${sdk_config_home}/taos; using the compiler's default lookup"
+    run ./create-all-kernels.sh
+  fi
+}
+
 build_fpga_blobs() {
   log_info "BLOB: building FPGA kernels/blobs"
   resolve_toolbox_dir_for_target fpga || return 1
   cd fpga-kernel || return 1
   run cmake -B build-fpga -DTOOLBOX_DIR="${TOOLBOX_DIR}" -DCOMPILER_INSTALL_DIR="${MLIR_COMPILER_DIR}" || return 1
-  run ./create-all-kernels.sh || return 1
+  run_create_all_kernels || return 1
   cd .. || return 1
   return 0
 }
@@ -906,7 +926,7 @@ build_posix_blobs() {
   # step, so nothing here ever depends on which step happened to run before it.
   resolve_toolbox_dir_for_target posix || return 1
   cd posix-kernel || return 1
-  run ./create-all-kernels.sh || return 1
+  run_create_all_kernels || return 1
   cd .. || return 1
   return 0
 }
