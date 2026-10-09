@@ -901,6 +901,7 @@ run_create_all_kernels() {
     log_info "Using SDK compiler config: ${sdk_config_home}/taos/mlir_compiler_config.toml"
     run env XDG_CONFIG_HOME="${sdk_config_home}" ./create-all-kernels.sh
   else
+    log_info "No SDK compiler config at ${sdk_config_home}/taos; using the compiler's default lookup"
     run ./create-all-kernels.sh
   fi
 }
