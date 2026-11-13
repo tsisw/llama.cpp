@@ -10,84 +10,104 @@ if (GGML_TSAVORITE)
     if  (NOT DEFINED GGML_TSAVORITE_TARGET)
         set(GGML_TSAVORITE_TARGET "posix")
     endif()
-    if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    if (NOT ${GGML_TSAVORITE_TARGET} STREQUAL fpga AND NOT ${GGML_TSAVORITE_TARGET} STREQUAL nanosim)
         set(GGML_TSAVORITE_TARGET "posix")
     endif()
 
-    # --- Host-arch aware MLIR SDK selection (CMake equivalent of uname -m case) ---
-    execute_process(
-        COMMAND uname -m
-        OUTPUT_VARIABLE HOST_M
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-
-    if (HOST_M STREQUAL "x86_64" OR HOST_M STREQUAL "amd64")
-        set(MLIR_SDK_ARCH "x86_64")
-    elseif (HOST_M STREQUAL "aarch64" OR HOST_M STREQUAL "arm64")
-        set(MLIR_SDK_ARCH "aarch64")
+    if (${GGML_TSAVORITE_TARGET} STREQUAL nanosim)
+        # nanosim: the Xtensa ISS device of a nanosim release, through its runtime's session API, with hand-written
+        # kernels only. No SDK, no SDK-compiled kernels, no TXE count (ggml-tsavorite-nanosim.cpp).
+        if (NOT DEFINED NANOSIM_ROOT AND DEFINED ENV{NANOSIM_ROOT})
+            set(NANOSIM_ROOT "$ENV{NANOSIM_ROOT}")
+        endif()
+        if (NOT DEFINED NANOSIM_ROOT)
+            message(FATAL_ERROR "GGML_TSAVORITE_TARGET=nanosim needs NANOSIM_ROOT, the nanosim release (runtime/, device/)")
+        endif()
+        set(RUNTIME_DIR ${NANOSIM_ROOT}/runtime)
+        set(TLIBS ${RUNTIME_DIR}/lib/libTsavRTShimCAPI.so)
+        set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
+        set(TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
+        include_directories(${TSAVORITE_INCLUDE_DIR})
+        include_directories(${RUNTIME_DIR}/include)
+        include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
+        message("tsavorite backend is enabled for nanosim (${NANOSIM_ROOT})")
     else()
-        message(FATAL_ERROR "Unsupported host arch from uname -m: ${HOST_M}")
-    endif()
 
-    # SDK_VERSION is passed from tsi-pkg-build.sh (e.g. source tsi-pkg-build.sh SDK_VERSION=0.4.0)
-    if (NOT DEFINED SDK_VERSION AND DEFINED ENV{SDK_VERSION})
-        set(SDK_VERSION "$ENV{SDK_VERSION}")
-    endif()
-    if (NOT DEFINED SDK_VERSION)
-       message(FATAL_ERROR "SDK_VERSION must be provided (e.g. source tsi-pkg-build.sh SDK_VERSION=0.4.1)")
-    endif()
+        # --- Host-arch aware MLIR SDK selection (CMake equivalent of uname -m case) ---
+        execute_process(
+            COMMAND uname -m
+            OUTPUT_VARIABLE HOST_M
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
 
-    if (NOT DEFINED MLIR_COMPILER_DIR)
-        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
-            set (MLIR_COMPILER_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/compiler)
-            message("MLIR_SDK_VERSION not set defaulting to ${MLIR_COMPILER_DIR}")
+        if (HOST_M STREQUAL "x86_64" OR HOST_M STREQUAL "amd64")
+            set(MLIR_SDK_ARCH "x86_64")
+        elseif (HOST_M STREQUAL "aarch64" OR HOST_M STREQUAL "arm64")
+            set(MLIR_SDK_ARCH "aarch64")
         else()
-            set (MLIR_COMPILER_DIR $ENV{MLIR_SDK_VERSION}/compiler)
+            message(FATAL_ERROR "Unsupported host arch from uname -m: ${HOST_M}")
         endif()
-    endif()
 
-    if (NOT DEFINED RUNTIME_DIR)
-        if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
-            set (RUNTIME_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/${GGML_TSAVORITE_TARGET}/runtime)
-            message("MLIR_SDK_VERSION not set defaulting to ${RUNTIME_DIR}")
-        else()
-            set (RUNTIME_DIR $ENV{MLIR_SDK_VERSION}/${GGML_TSAVORITE_TARGET}/runtime)
+        # SDK_VERSION is passed from tsi-pkg-build.sh (e.g. source tsi-pkg-build.sh SDK_VERSION=0.4.0)
+        if (NOT DEFINED SDK_VERSION AND DEFINED ENV{SDK_VERSION})
+            set(SDK_VERSION "$ENV{SDK_VERSION}")
         endif()
+        if (NOT DEFINED SDK_VERSION)
+           message(FATAL_ERROR "SDK_VERSION must be provided (e.g. source tsi-pkg-build.sh SDK_VERSION=0.4.1)")
+        endif()
+
+        if (NOT DEFINED MLIR_COMPILER_DIR)
+            if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
+                set (MLIR_COMPILER_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/compiler)
+                message("MLIR_SDK_VERSION not set defaulting to ${MLIR_COMPILER_DIR}")
+            else()
+                set (MLIR_COMPILER_DIR $ENV{MLIR_SDK_VERSION}/compiler)
+            endif()
+        endif()
+
+        if (NOT DEFINED RUNTIME_DIR)
+            if (NOT DEFINED $ENV{MLIR_SDK_VERSION})
+                set (RUNTIME_DIR /proj/rel/sw/tsi-sw/staging/sdk/sdk-r.${SDK_VERSION}/${MLIR_SDK_ARCH}/${GGML_TSAVORITE_TARGET}/runtime)
+                message("MLIR_SDK_VERSION not set defaulting to ${RUNTIME_DIR}")
+            else()
+                set (RUNTIME_DIR $ENV{MLIR_SDK_VERSION}/${GGML_TSAVORITE_TARGET}/runtime)
+            endif()
+        endif()
+
+        if (NOT DEFINED GGML_TSI_KERNEL_DIR)
+           set (GGML_TSI_KERNEL_DIR ${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/${GGML_TSAVORITE_TARGET})
+        endif()
+
+
+        if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+            set(CMAKE_CROSSCOMPILING ON)
+            set(ARCH_FLAGS -march=armv8-a)
+            file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${RUNTIME_DIR}/../utils/lib/TsavRTShimCAPI.cpp.o")
+            message("Setting target as fpga")
+        elseif (${GGML_TSAVORITE_TARGET} STREQUAL "posix")
+            file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "${MLIR_COMPILER_DIR}/lib/libTsavRTPosixShimCAPI.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-c-native.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-cpp.so" "${MLIR_COMPILER_DIR}/lib/libtvu_fau_full.so")
+            message("Setting target as posix for tsavorite")
+        endif()
+
+        set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
+        set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
+
+        include_directories($ENV{TSAVORITE_SYSROOT_INCLUDE_DIR})
+        include_directories(${TSAVORITE_INCLUDE_DIR})
+        include_directories(${MLIR_COMPILER_DIR}/include/tsi-rt/shim)
+        include_directories(${RUNTIME_DIR}/include)
+        # HostShimCAPI.h (and other tsi-rt/shim headers) live one level deeper,
+        # at ${RUNTIME_DIR}/include/tsi-rt/shim. Some SDKs also duplicate a copy
+        # under ${MLIR_COMPILER_DIR}/include/tsi-rt/shim (added above), which is
+        # what made the bare `#include "HostShimCAPI.h"` in
+        # ggml-tsavorite/include/TestModel.h resolve previously -- but that
+        # duplication isn't guaranteed (dropped starting with SDK 0.6.4's
+        # compiler package layout), so add the runtime package's own shim dir
+        # directly rather than relying on the compiler package to re-export it.
+        include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
+        include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/include)
+        message("tsavorite backend is enabled")
     endif()
-
-    if (NOT DEFINED GGML_TSI_KERNEL_DIR)
-       set (GGML_TSI_KERNEL_DIR ${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/${GGML_TSAVORITE_TARGET})
-    endif()
-
-
-    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
-        set(CMAKE_CROSSCOMPILING ON)
-        set(ARCH_FLAGS -march=armv8-a)
-        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${RUNTIME_DIR}/../utils/lib/TsavRTShimCAPI.cpp.o")
-        message("Setting target as fpga")
-    elseif (${GGML_TSAVORITE_TARGET} STREQUAL "posix")
-        file(GLOB TLIBS  "${RUNTIME_DIR}/lib/*.so" "${GGML_TSI_KERNEL_DIR}/host/*.o" "${MLIR_COMPILER_DIR}/lib/libFFMDeviceShim.so" "${MLIR_COMPILER_DIR}/lib/libTsavRTPosixShimCAPI.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-c-native.so" "${MLIR_COMPILER_DIR}/lib/libtxe-ffm-cpp.so" "${MLIR_COMPILER_DIR}/lib/libtvu_fau_full.so")
-        message("Setting target as posix for tsavorite")
-    endif()
-
-    set(GGML_TSAVORITE_TARGET "${GGML_TSAVORITE_TARGET}" CACHE STRING "Target for tsavorite")
-    set (TSAVORITE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/ggml/src/ggml-tsavorite/include)
-
-    include_directories($ENV{TSAVORITE_SYSROOT_INCLUDE_DIR})
-    include_directories(${TSAVORITE_INCLUDE_DIR})
-    include_directories(${MLIR_COMPILER_DIR}/include/tsi-rt/shim)
-    include_directories(${RUNTIME_DIR}/include)
-    # HostShimCAPI.h (and other tsi-rt/shim headers) live one level deeper,
-    # at ${RUNTIME_DIR}/include/tsi-rt/shim. Some SDKs also duplicate a copy
-    # under ${MLIR_COMPILER_DIR}/include/tsi-rt/shim (added above), which is
-    # what made the bare `#include "HostShimCAPI.h"` in
-    # ggml-tsavorite/include/TestModel.h resolve previously -- but that
-    # duplication isn't guaranteed (dropped starting with SDK 0.6.4's
-    # compiler package layout), so add the runtime package's own shim dir
-    # directly rather than relying on the compiler package to re-export it.
-    include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
-    include_directories(${MLIR_COMPILER_DIR}/../toolbox/build/install-${GGML_TSAVORITE_TARGET}/include)
-    message("tsavorite backend is enabled")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
