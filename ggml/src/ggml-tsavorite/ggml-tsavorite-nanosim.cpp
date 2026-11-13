@@ -19,6 +19,7 @@
 #include "ggml-impl.h"
 
 #include "tsi-rt/shim/TsiSessionCAPI.h"
+#include "tsi_ggml_kargs.h"   // ggml-tsi-kernel/nanosim/include: the kernels' argument block
 
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,24 @@ struct tsi_nanosim_runtime {
 static tsi_nanosim_runtime & tsi_nanosim_rt() {
     static tsi_nanosim_runtime rt;
     return rt;
+}
+
+// At exit: unload the blobs and close the queue and the session, so the runtime does not fault a queue left open.
+// The runtime itself is released by its own process-exit cleanup (TsiSessionCAPI.h).
+static void tsi_nanosim_stop() {
+    tsi_nanosim_runtime & rt = tsi_nanosim_rt();
+    std::lock_guard<std::mutex> lock(rt.mutex);
+    if (!rt.session) {
+        return;
+    }
+    for (auto & b : rt.blobs) {
+        tsi_blob_unload(b.second);
+    }
+    rt.blobs.clear();
+    tsi_queue_destroy(rt.queue);
+    tsi_session_destroy(rt.session);
+    rt.queue   = 0;
+    rt.session = 0;
 }
 
 // Open the process's session and its one queue, once. Every caller that touches device memory or launches comes
@@ -79,6 +98,7 @@ static bool tsi_nanosim_start() {
         rt.failed  = true;
         return false;
     }
+    atexit(tsi_nanosim_stop);
     return true;
 }
 
@@ -123,10 +143,79 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
     return true;
 }
 
+// ---- kernel arguments ----
+
+static_assert(sizeof(tsi_ggml_kargs) % 8 == 0, "the grid tail follows the argument block");
+static_assert(GGML_MAX_OP_PARAMS == TSI_GGML_OP_PARAMS * sizeof(int32_t), "op_params size");
+
+// One argument block in shared DRAM, reused: launches are synchronous and graph_compute runs on one thread.
+static tsi_ggml_kargs * tsi_nanosim_args() {
+    static tsi_ggml_kargs * args = nullptr;
+    if (!args) {
+        args = (tsi_ggml_kargs *) tsi_alloc(sizeof(tsi_ggml_kargs), tsi::MemorySpace::SHARED_DRAM);
+    }
+    return args;
+}
+
+static void tsi_nanosim_desc(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
+    d->data = tsi_shmem_handle_from_ptr(t->data);
+    d->type = (int32_t) t->type;
+    d->pad  = 0;
+    for (int i = 0; i < 4; i++) {
+        d->ne[i] = t->ne[i];
+        d->nb[i] = (int64_t) t->nb[i];
+    }
+}
+
+static tsi_ggml_kargs * tsi_nanosim_pack(const struct ggml_tensor * node, int n_src) {
+    tsi_ggml_kargs * a = tsi_nanosim_args();
+    if (!a) {
+        return nullptr;
+    }
+    memset(a, 0, sizeof(*a));
+    a->version = TSI_GGML_KARGS_VERSION;
+    a->op      = (uint32_t) node->op;
+    a->n_src   = (uint32_t) n_src;
+    tsi_nanosim_desc(&a->dst, node);
+    for (int i = 0; i < n_src; i++) {
+        tsi_nanosim_desc(&a->src[i], node->src[i]);
+    }
+    memcpy(a->op_params, node->op_params, sizeof(a->op_params));
+    return a;
+}
+
+// Every row start 128-byte aligned: the data offset (for a view; buffers are 128-byte aligned) and nb[1..3].
+static bool tsi_nanosim_rows_aligned(const struct ggml_tensor * t) {
+    if (t->view_src && t->view_offs % TSI_NANOSIM_ALIGNMENT) {
+        return false;
+    }
+    return t->nb[1] % TSI_NANOSIM_ALIGNMENT == 0 && t->nb[2] % TSI_NANOSIM_ALIGNMENT == 0 &&
+           t->nb[3] % TSI_NANOSIM_ALIGNMENT == 0;
+}
+
 // ---- kernels ----
 
-// A hand-written kernel: which operations it accepts and how it is launched. The table is empty until the first
-// kernel passes its standalone and test-backend-ops checks (taos-mk docs/agent-harness/workflow-llamacpp.md).
+// RMS_NORM, f32 (ggml-tsi-kernel nanosim/rms_norm_f32.c): one grid cell per row.
+static bool tsi_nanosim_rms_norm_supports(const struct ggml_tensor * node) {
+    const struct ggml_tensor * src = node->src[0];
+    return src && src->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_are_same_shape(src, node) &&
+           src->nb[0] == sizeof(float) && node->nb[0] == sizeof(float) && src->ne[0] % 32 == 0 &&
+           src->ne[0] < (1 << 24) && ggml_nrows(src) <= INT32_MAX && tsi_nanosim_rows_aligned(src) &&
+           tsi_nanosim_rows_aligned(node);
+}
+
+static bool tsi_nanosim_rms_norm_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT) {
+        GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+        return false;
+    }
+    tsi_ggml_kargs * a = tsi_nanosim_pack(node, 1);
+    return a && tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(node->src[0]));
+}
+
+
+// A hand-written kernel: which operations it accepts and how it is launched. A kernel enters the table after it
+// passes its standalone check on tdu_xtmp (taos-mk docs/agent-harness/workflow-llamacpp.md).
 struct tsi_nanosim_kernel {
     enum ggml_op op;
     const char * blob;                                  // file name under GGML_TSAVORITE_KERNEL_DIR, without .blob
@@ -135,7 +224,9 @@ struct tsi_nanosim_kernel {
 };
 
 static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
-    static const std::vector<tsi_nanosim_kernel> kernels = {};
+    static const std::vector<tsi_nanosim_kernel> kernels = {
+        { GGML_OP_RMS_NORM, "rms_norm_f32", tsi_nanosim_rms_norm_supports, tsi_nanosim_rms_norm_launch },
+    };
     return kernels;
 }
 
@@ -409,8 +500,9 @@ static ggml_backend_buffer_type_t tsi_nanosim_device_get_buffer_type(ggml_backen
     GGML_UNUSED(dev);
 }
 
+// No-op operations (views, reshapes, leaves) cost nothing and graph_compute skips them; the rest need a kernel.
 static bool tsi_nanosim_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    return tsi_nanosim_find_kernel(op) != nullptr;
+    return tsi_nanosim_is_noop(op) || tsi_nanosim_find_kernel(op) != nullptr;
     GGML_UNUSED(dev);
 }
 

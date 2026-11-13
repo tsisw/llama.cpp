@@ -30,6 +30,7 @@ if (GGML_TSAVORITE)
         include_directories(${TSAVORITE_INCLUDE_DIR})
         include_directories(${RUNTIME_DIR}/include)
         include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
+        include_directories(${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/nanosim/include)
         message("tsavorite backend is enabled for nanosim (${NANOSIM_ROOT})")
     else()
 
