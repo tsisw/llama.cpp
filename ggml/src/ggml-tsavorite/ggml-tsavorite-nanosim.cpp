@@ -131,8 +131,34 @@ static tsi_blob_t tsi_nanosim_blob(const char * name) {
     return blob;
 }
 
-// One launch of a blob as a grid of `cells` cells over shared-DRAM arguments; returns when it has completed.
+// GGML_TSAVORITE_ENQUEUE_GRAPH=1: launches are enqueued and not waited for; graph_compute enqueues a whole graph and
+// waits once at its end. This needs the launches of the one queue to run in queue order, as they do on one TXE (the
+// FPGA configuration: one TXE, four host CPUs): a launch may then read what the launches before it wrote, and a
+// scratch or staging buffer may be reused by the next launch without a wait. The host waits (tsi_nanosim_wait)
+// before it frees, reallocates or reads memory a pending launch may use, and before an argument slot comes round.
+// With more than one TXE the runtime runs consecutive commands concurrently on different TXEs (runtime
+// SchedulerTypes.h), so the order does not hold: the simulated device always has 20 TXEs (runtime TsavRTContext.cpp
+// kXtensaSimTXEs), where Qwen3-0.6B failed with the graph enqueued. Unset (the default): every launch is waited for.
+static uint32_t tsi_nanosim_pending = 0;      // launches enqueued since the last wait
+static uint32_t tsi_nanosim_slots_used = 0;   // argument slots handed out since the last wait
+
+static bool tsi_nanosim_wait() {
+    tsi_nanosim_slots_used = 0;
+    if (!tsi_nanosim_pending) {
+        return true;
+    }
+    tsi_nanosim_pending = 0;
+    TSI_Status st = tsi_wait_queue(tsi_nanosim_rt().queue, TSI_FOREVER);
+    if (st != 0) {
+        GGML_LOG_ERROR("%s: tsi_wait_queue failed, status %d\n", __func__, (int) st);
+        return false;
+    }
+    return true;
+}
+
+// One launch of a blob as a grid of `cells` cells over shared-DRAM arguments (an argument slot, tsi_nanosim_args).
 static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, uint32_t cells) {
+    static const bool sync = !(getenv("GGML_TSAVORITE_ENQUEUE_GRAPH") && atoi(getenv("GGML_TSAVORITE_ENQUEUE_GRAPH")) != 0);
     tsi_nanosim_runtime & rt = tsi_nanosim_rt();
     tsi_spmd_args_t grid = {};
     grid.numGridSizes = 1;
@@ -141,12 +167,8 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
         GGML_LOG_ERROR("%s: tsi_enqueue_blob_launch failed, status %d\n", __func__, (int) tsi_last_status());
         return false;
     }
-    TSI_Status st = tsi_wait_queue(rt.queue, TSI_FOREVER);
-    if (st != 0) {
-        GGML_LOG_ERROR("%s: tsi_wait_queue failed, status %d\n", __func__, (int) st);
-        return false;
-    }
-    return true;
+    tsi_nanosim_pending++;
+    return !sync || tsi_nanosim_wait();
 }
 
 // ---- kernel arguments ----
@@ -154,17 +176,29 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
 static_assert(sizeof(tsi_ggml_kargs) % 8 == 0, "the grid tail follows the argument block");
 static_assert(GGML_MAX_OP_PARAMS == TSI_GGML_OP_PARAMS * sizeof(int32_t), "op_params size");
 
-// One argument block in shared DRAM, reused: launches are synchronous and graph_compute runs on one thread.
+// Argument blocks in shared DRAM, one per launch: a ring of slots (a pending launch reads its block when it runs).
+// When the ring comes round to a slot whose launch may still be pending, wait. graph_compute runs on one thread.
+#define TSI_NANOSIM_ARG_SLOTS 4096u
+#define TSI_NANOSIM_ARG_STRIDE 640u   // sizeof(tsi_ggml_kargs) with room for the grid tail, 128-byte multiple
+static_assert(sizeof(tsi_ggml_kargs) + 32 <= TSI_NANOSIM_ARG_STRIDE, "argument slot size");
+
 static tsi_ggml_kargs * tsi_nanosim_args() {
-    static tsi_ggml_kargs * args = nullptr;
-    if (!args) {
+    static char *   ring = nullptr;
+    static uint32_t next = 0;
+    if (!ring) {
         try {
-            args = (tsi_ggml_kargs *) tsi_alloc(sizeof(tsi_ggml_kargs), tsi::MemorySpace::SHARED_DRAM);
+            ring = (char *) tsi_alloc((int64_t) TSI_NANOSIM_ARG_SLOTS * TSI_NANOSIM_ARG_STRIDE, tsi::MemorySpace::SHARED_DRAM);
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("%s: tsi_alloc failed: %s\n", __func__, e.what());
+            return nullptr;
         }
     }
-    return args;
+    if (tsi_nanosim_slots_used == TSI_NANOSIM_ARG_SLOTS && !tsi_nanosim_wait()) {   // the ring came round
+        return nullptr;
+    }
+    tsi_nanosim_slots_used++;
+    tsi_ggml_kargs * a = (tsi_ggml_kargs *) (ring + (size_t) (next++ % TSI_NANOSIM_ARG_SLOTS) * TSI_NANOSIM_ARG_STRIDE);
+    return a;
 }
 
 static void tsi_nanosim_desc(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
@@ -396,23 +430,46 @@ static void * tsi_nanosim_core_staging(size_t bytes) {
     return buf;
 }
 
-// Copy t (indices or positions) to the staging buffer and point descriptor d at it.
+// Stage t (indices or positions) for the core and point descriptor d at the copy. The copy is a stage_lines launch
+// (ggml-tsi-kernel nanosim/stage_lines.c) enqueued before the launch that reads it, so it copies what the earlier
+// launches of the graph wrote (the MoE router's expert ids come from ARGSORT). The node's staged tensors are packed
+// into the staging buffer from offset 0 (tsi_nanosim_staging_used, reset per node); in queue order the next node's
+// copies run after this node's launches, so the buffer needs no wait between nodes.
+static size_t tsi_nanosim_staging_used = 0;
+
 static bool tsi_nanosim_stage_for_core(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
-    void * buf = tsi_nanosim_core_staging(ggml_nbytes(t));
-    if (!buf) {
+    const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(t->data), off = h & 127;
+    const size_t   bytes = (size_t) ((off + ggml_nbytes(t) + 127) / 128 * 128);
+    if (!tsi_nanosim_staging.buf || tsi_nanosim_staging.size < tsi_nanosim_staging_used + bytes) {
+        // a new buffer: the old one may still be read by pending launches, and this node's earlier copies are lost
+        if (tsi_nanosim_staging_used || !tsi_nanosim_wait()) {
+            GGML_LOG_ERROR("%s: %s: staging buffer too small for this node (%zu + %zu bytes)\n", __func__, t->name,
+                           tsi_nanosim_staging_used, bytes);
+            return false;
+        }
+    }
+    void * buf = tsi_nanosim_core_staging(tsi_nanosim_staging_used + bytes);
+    tsi_blob_t blob = buf ? tsi_nanosim_blob("stage_lines") : 0;
+    tsi_ggml_kargs * a = blob ? tsi_nanosim_args() : nullptr;
+    if (!a) {
         GGML_LOG_ERROR("%s: %s: no staging buffer for %zu bytes inside the core's window [%#x, %#x)\n", __func__,
-                       t->name, ggml_nbytes(t), TSI_NANOSIM_CORE_LO, TSI_NANOSIM_CORE_HI);
+                       t->name, bytes, TSI_NANOSIM_CORE_LO, TSI_NANOSIM_CORE_HI);
         return false;
     }
-    memcpy(buf, t->data, ggml_nbytes(t));
-    d->data = tsi_shmem_handle_from_ptr(buf);
+    const uint64_t dst = (uint64_t) tsi_shmem_handle_from_ptr(buf) + tsi_nanosim_staging_used;
+    memset(a, 0, sizeof(*a));
+    a->version     = TSI_GGML_KARGS_VERSION;
+    a->n_src       = 1;
+    a->dst.data    = (int64_t) dst;
+    a->dst.ne[0]   = (int64_t) (bytes / 128);
+    a->src[0].data = (int64_t) (h - off);
+    tsi_nanosim_staging_used += bytes;
+    d->data = (int64_t) (dst + off);
     if (getenv("GGML_TSAVORITE_DEBUG")) {
-        const int32_t * v = (const int32_t *) buf;
-        fprintf(stderr, "%s: %s: %zu bytes staged at handle %#llx: %d %d %d %d\n", __func__, t->name, ggml_nbytes(t),
-                      (unsigned long long) d->data, v[0], ggml_nbytes(t) > 4 ? v[1] : 0, ggml_nbytes(t) > 8 ? v[2] : 0,
-                      ggml_nbytes(t) > 12 ? v[3] : 0);
+        fprintf(stderr, "%s: %s: %zu bytes staged at handle %#llx\n", __func__, t->name, ggml_nbytes(t),
+                (unsigned long long) d->data);
     }
-    return true;
+    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (bytes / 128));
 }
 
 // ---- row copies (ggml-tsi-kernel nanosim/copy_rows.c) ----
@@ -716,6 +773,9 @@ static bool tsi_nanosim_q8_repack(const struct ggml_tensor * w, tsi_nanosim_q8_w
 }
 
 static void tsi_nanosim_q8_free(tsi_nanosim_q8_weights & r) {
+    if (r.wq || r.dw || r.ds) {
+        tsi_nanosim_wait();   // pending launches may read the repack
+    }
     if (r.wq) tsi_dealloc(r.wq, tsi::MemorySpace::SHARED_DRAM);
     if (r.dw) tsi_dealloc(r.dw, tsi::MemorySpace::SHARED_DRAM);
     if (r.ds) tsi_dealloc(r.ds, tsi::MemorySpace::SHARED_DRAM);
@@ -734,6 +794,9 @@ static void * tsi_nanosim_scratch(int slot, size_t bytes) {
     static void * ptr[2] = { nullptr, nullptr };
     static size_t size[2] = { 0, 0 };
     if (size[slot] < bytes) {
+        if (ptr[slot] && !tsi_nanosim_wait()) {   // pending launches may still use the old buffer
+            return nullptr;
+        }
         if (ptr[slot]) tsi_dealloc(ptr[slot], tsi::MemorySpace::SHARED_DRAM);
         ptr[slot]  = nullptr;
         size[slot] = 0;
@@ -781,8 +844,8 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
         } else {
             wr = it->second;
         }
-    } else {
-        if (!tsi_nanosim_q8_repack(w, tmp)) return false;
+    } else {   // the host reads the tensor: wait for the launches that may write it
+        if (!tsi_nanosim_wait() || !tsi_nanosim_q8_repack(w, tmp)) return false;
         wr = tmp;
     }
     void * xq = tsi_nanosim_scratch(0, (size_t) (mp * k));
@@ -793,6 +856,10 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     }
     // 1. the activations to Q8_0: one grid cell per row
     tsi_ggml_kargs * a = tsi_nanosim_args();
+    if (!a) {
+        if (!cached) tsi_nanosim_q8_free(tmp);
+        return false;
+    }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
     a->op      = (uint32_t) GGML_OP_NONE;
@@ -801,8 +868,8 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     tsi_nanosim_desc(&a->src[0], x);
     tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
     bool ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) m);
-    // 2. the matmul: one grid cell per 128-column tile
-    if (ok) {
+    // 2. the matmul: one grid cell per 128-column tile, with its own argument slot
+    if (ok && (ok = (a = tsi_nanosim_args()) != nullptr)) {
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
         a->op      = (uint32_t) GGML_OP_MUL_MAT;
@@ -846,6 +913,8 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     tsi_nanosim_q8_weights * e = &tmp;
     if (cached) {
         e = &tsi_nanosim_q8_cache()[w->data];
+    } else if (!tsi_nanosim_wait()) {   // the host reads the tensor: wait for the launches that may write it
+        return false;
     }
     if (!e->wq && !tsi_nanosim_q8_repack(w, *e)) {
         return false;
@@ -866,6 +935,10 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     }
     wr = *e;
     tsi_ggml_kargs * a = tsi_nanosim_args();
+    if (!a) {
+        if (!cached) tsi_nanosim_q8_free(tmp);
+        return false;
+    }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
     a->op      = (uint32_t) GGML_OP_GET_ROWS;
@@ -918,14 +991,17 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
     tsi_nanosim_q8_weights wr, tmp;
     const bool cached = w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     tsi_nanosim_q8_weights * e = cached ? &tsi_nanosim_q8_cache()[w->data] : &tmp;
+    if (!cached && !tsi_nanosim_wait()) {   // the host reads the tensor: wait for the launches that may write it
+        return false;
+    }
     if (!e->wq && !tsi_nanosim_q8_repack(&w2, *e)) {
         return false;
     }
     wr = *e;
     void * xq = tsi_nanosim_scratch(0, (size_t) (rp * k));
     void * xd = tsi_nanosim_scratch(1, (size_t) (rp * nbl * 128));
-    bool ok = xq && xd;
-    tsi_ggml_kargs * a = tsi_nanosim_args();
+    tsi_ggml_kargs * a = nullptr;
+    bool ok = xq && xd && (a = tsi_nanosim_args()) != nullptr;
     if (ok) {   // 1. the activation rows to Q8_0
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
@@ -935,7 +1011,7 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
         tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
         ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) rows);
     }
-    if (ok) {   // 2. one grid cell per (slot, token, 128-column tile)
+    if (ok && (ok = (a = tsi_nanosim_args()) != nullptr)) {   // 2. one grid cell per (slot, token, 128-column tile)
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
         a->op      = (uint32_t) GGML_OP_MUL_MAT_ID;
@@ -1183,12 +1259,15 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
     }
 }
 
+// Every node is enqueued, then the graph is waited for once (a no-op unless GGML_TSAVORITE_ENQUEUE_GRAPH, see
+// tsi_nanosim_launch): the CPU backend reads this backend's results in place (host buffers) once graph_compute returns.
 static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (tsi_nanosim_is_noop(node)) {
             continue;
         }
+        tsi_nanosim_staging_used = 0;
         const tsi_nanosim_kernel * k = tsi_nanosim_find_kernel(node);
         if (!k) {
             GGML_LOG_ERROR("%s: no kernel for %s (%s)\n", __func__, ggml_op_desc(node), node->name);
@@ -1199,10 +1278,21 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
             fprintf(stderr, "ggml-tsavorite: %s %s (%s) failed: ne [%lld, %lld, %lld, %lld]\n", k->blob, ggml_op_desc(node),
                     node->name, (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
                     (long long) node->ne[3]);
+            tsi_nanosim_wait();
             return GGML_STATUS_FAILED;
         }
     }
+    if (!tsi_nanosim_wait()) {
+        fprintf(stderr, "ggml-tsavorite: a launch of this graph (%d nodes) failed; without GGML_TSAVORITE_ENQUEUE_GRAPH the failing node is named\n",
+                cgraph->n_nodes);
+        return GGML_STATUS_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
+    GGML_UNUSED(backend);
+}
+
+static void tsi_nanosim_backend_synchronize(ggml_backend_t backend) {
+    tsi_nanosim_wait();
     GGML_UNUSED(backend);
 }
 
@@ -1217,7 +1307,7 @@ static const struct ggml_backend_i tsi_nanosim_backend_i = {
     /* .set_tensor_async   = */ nullptr,
     /* .get_tensor_async   = */ nullptr,
     /* .cpy_tensor_async   = */ nullptr,
-    /* .synchronize        = */ nullptr,   // every launch waits for its completion
+    /* .synchronize        = */ tsi_nanosim_backend_synchronize,
     /* .graph_plan_create  = */ nullptr,
     /* .graph_plan_free    = */ nullptr,
     /* .graph_plan_update  = */ nullptr,
