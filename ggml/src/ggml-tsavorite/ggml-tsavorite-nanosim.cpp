@@ -204,6 +204,71 @@ static bool tsi_nanosim_rms_norm_supports(const struct ggml_tensor * node) {
            tsi_nanosim_rows_aligned(node);
 }
 
+// Row-wise launch: one grid cell per dst row, after checking the actual data addresses.
+static bool tsi_nanosim_launch_rows(tsi_blob_t blob, struct ggml_tensor * node, int n_src) {
+    for (int i = -1; i < n_src; i++) {
+        const struct ggml_tensor * t = i < 0 ? node : node->src[i];
+        if ((uintptr_t) t->data % TSI_NANOSIM_ALIGNMENT) {
+            GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+            return false;
+        }
+    }
+    tsi_ggml_kargs * a = tsi_nanosim_pack(node, n_src);
+    return a && tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(node));
+}
+
+// f32, rows contiguous, ne0 a multiple of 32: the row-wise kernels' common conditions on one tensor. A dimension of
+// size 1 may have any stride (it is never stepped).
+static bool tsi_nanosim_f32_rows(const struct ggml_tensor * t, int64_t ne0) {
+    if (!t || t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->ne[0] != ne0 || ne0 % 32 ||
+        ne0 >= (1 << 24) || ggml_nrows(t) > INT32_MAX) {
+        return false;
+    }
+    if (t->view_src && t->view_offs % TSI_NANOSIM_ALIGNMENT) {
+        return false;
+    }
+    for (int d = 1; d < 4; d++) {
+        if (t->ne[d] > 1 && t->nb[d] % TSI_NANOSIM_ALIGNMENT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ADD, MUL, SCALE, GLU (SWIGLU, two inputs), f32 (ggml-tsi-kernel nanosim/eltwise_f32.c). The second input of ADD
+// and MUL may broadcast along dimensions 1..3.
+static bool tsi_nanosim_eltwise_supports(const struct ggml_tensor * node) {
+    const int64_t ne0 = node->ne[0];
+    const struct ggml_tensor * a = node->src[0], * b = node->src[1];
+    if (!tsi_nanosim_f32_rows(node, ne0) || !tsi_nanosim_f32_rows(a, ne0) || !ggml_are_same_shape(a, node)) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+            if (!tsi_nanosim_f32_rows(b, ne0)) {
+                return false;
+            }
+            for (int d = 1; d < 4; d++) {
+                if (b->ne[d] != node->ne[d] && b->ne[d] != 1) {
+                    return false;
+                }
+            }
+            return true;
+        case GGML_OP_SCALE:
+            return true;
+        case GGML_OP_GLU:
+            return ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && tsi_nanosim_f32_rows(b, ne0) &&
+                   ggml_are_same_shape(b, node);
+        default:
+            return false;
+    }
+}
+
+static bool tsi_nanosim_eltwise_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    return tsi_nanosim_launch_rows(blob, node, node->op == GGML_OP_SCALE ? 1 : 2);
+}
+
 static bool tsi_nanosim_rms_norm_launch(tsi_blob_t blob, struct ggml_tensor * node) {
     if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT) {
         GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
@@ -226,11 +291,27 @@ struct tsi_nanosim_kernel {
 static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
     static const std::vector<tsi_nanosim_kernel> kernels = {
         { GGML_OP_RMS_NORM, "rms_norm_f32", tsi_nanosim_rms_norm_supports, tsi_nanosim_rms_norm_launch },
+        { GGML_OP_ADD,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
+        { GGML_OP_MUL,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
+        { GGML_OP_SCALE,    "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
+        { GGML_OP_GLU,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
     };
     return kernels;
 }
 
+// GGML_TSAVORITE_SKIP_OPS: comma-separated ggml op names (ggml_op_name, e.g. GLU,MUL) kept on the CPU, for triage.
+static bool tsi_nanosim_skipped(enum ggml_op op) {
+    static const std::string skip = [] {
+        const char * v = getenv("GGML_TSAVORITE_SKIP_OPS");
+        return v ? "," + std::string(v) + "," : std::string();
+    }();
+    return !skip.empty() && skip.find("," + std::string(ggml_op_name(op)) + ",") != std::string::npos;
+}
+
 static const tsi_nanosim_kernel * tsi_nanosim_find_kernel(const struct ggml_tensor * node) {
+    if (tsi_nanosim_skipped(node->op)) {
+        return nullptr;
+    }
     for (const tsi_nanosim_kernel & k : tsi_nanosim_kernels()) {
         if (k.op == node->op && k.supports(node)) {
             return &k;
