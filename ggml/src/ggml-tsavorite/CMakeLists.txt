@@ -3,6 +3,15 @@ message(STATUS "Tsavorite framework is found")
 # tsavorite Kernel Library
 add_compile_options(--std=c++20)
 include_directories(../ggml-cpu)
+if (${GGML_TSAVORITE_TARGET} STREQUAL nanosim)
+ggml_add_backend_library(ggml-tsavorite
+                         ggml-tsavorite-nanosim.cpp
+                        )
+target_link_libraries(ggml-tsavorite PRIVATE ${TLIBS} dl rt)
+set_target_properties(ggml-tsavorite PROPERTIES BUILD_RPATH "${RUNTIME_DIR}/lib")
+return()
+endif()
+
 ggml_add_backend_library(ggml-tsavorite
                          ggml-tsavorite.cpp
                         )
