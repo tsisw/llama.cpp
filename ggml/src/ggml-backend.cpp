@@ -990,6 +990,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int i = 0; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
             int * node_backend_id = &tensor_backend_id(node);
+#ifdef GGML_TSAVORITE_NANOSIM
+            // nanosim target: upstream's pass. The workaround below pins every view op and its source to the CPU,
+            // which kept Qwen3's Q/K/V projections, ROPE and the attention products off the device.
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            if (*node_backend_id != -1) {
+                if (*node_backend_id == sched->n_backends - 1) {
+                    // skip cpu (lowest prio backend)
+                    cur_backend_id = -1;
+                } else {
+                    cur_backend_id = *node_backend_id;
+                }
+            } else if (cur_backend_id != -1) {
+                ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
+            }
+#else
             if (ggml_is_view_op(node->op)) {
 		if(node->src[0] && (sched->n_backends >= 1)) {
 	            *node_backend_id = sched->n_backends -1;
@@ -1010,6 +1027,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             } else { 
                 ggml_backend_sched_set_if_supported(sched, node, 0, node_backend_id);
 	    }
+#endif
         }
     }
     // expand gpu up

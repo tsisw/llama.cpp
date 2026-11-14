@@ -31,6 +31,7 @@ if (GGML_TSAVORITE)
         include_directories(${RUNTIME_DIR}/include)
         include_directories(${RUNTIME_DIR}/include/tsi-rt/shim)
         include_directories(${CMAKE_SOURCE_DIR}/ggml-tsi-kernel/nanosim/include)
+        add_compile_definitions(GGML_TSAVORITE_NANOSIM)   # src/llama-kv-cache.cpp: the KV cache on the device
         message("tsavorite backend is enabled for nanosim (${NANOSIM_ROOT})")
     else()
 

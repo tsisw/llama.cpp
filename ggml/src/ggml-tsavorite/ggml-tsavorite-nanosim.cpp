@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -56,6 +57,24 @@ struct tsi_nanosim_cmd_record {
 };
 static tsi_nanosim_cmd_record tsi_nanosim_cmds[8192];
 static const char * tsi_nanosim_cur_node = "";
+static const char * tsi_nanosim_cur_op   = "";
+
+// GGML_TSAVORITE_STATS=1: launches by kernel and ggml op, printed at exit.
+static std::map<std::string, uint64_t> & tsi_nanosim_stats() {
+    static std::map<std::string, uint64_t> m;
+    return m;
+}
+
+static void tsi_nanosim_print_stats() {
+    uint64_t total = 0;
+    for (const auto & kv : tsi_nanosim_stats()) {
+        total += kv.second;
+    }
+    fprintf(stderr, "ggml-tsavorite: %llu launches\n", (unsigned long long) total);
+    for (const auto & kv : tsi_nanosim_stats()) {
+        fprintf(stderr, "ggml-tsavorite:   %8llu  %s\n", (unsigned long long) kv.second, kv.first.c_str());
+    }
+}
 
 static void tsi_nanosim_on_event(const tsi_event_t * ev, void *) {
     if (!ev || ev->status == 0) {
@@ -209,6 +228,16 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
         }
     }
     snprintf(r.node, sizeof(r.node), "%s (%u cells)", tsi_nanosim_cur_node, cells);
+    static const bool stats = getenv("GGML_TSAVORITE_STATS") && atoi(getenv("GGML_TSAVORITE_STATS")) != 0;
+    if (stats) {
+        static bool registered = false;
+        if (!registered) {   // the map first: it must outlive the handler
+            registered = true;
+            tsi_nanosim_stats();
+            atexit(tsi_nanosim_print_stats);
+        }
+        tsi_nanosim_stats()[std::string(r.blob) + " " + tsi_nanosim_cur_op]++;
+    }
     tsi_nanosim_pending++;
     return !sync || tsi_nanosim_wait();
 }
@@ -831,10 +860,15 @@ static std::unordered_map<const void *, tsi_nanosim_q8_weights> & tsi_nanosim_q8
 }
 
 // Shared-DRAM scratch that grows as needed: the quantized activations and their scales.
+// The activations last quantized into scratch slots 0 and 1, so the next Q8_0 MUL_MAT of the same tensor reuses them
+// (Q, K and V share their input, as do gate and up): reset per graph and whenever the slots are written otherwise.
+static const struct ggml_tensor * tsi_nanosim_quantized = nullptr;
+
 static void * tsi_nanosim_scratch(int slot, size_t bytes) {
     static void * ptr[2] = { nullptr, nullptr };
     static size_t size[2] = { 0, 0 };
     if (size[slot] < bytes) {
+        tsi_nanosim_quantized = nullptr;
         if (ptr[slot] && !tsi_nanosim_wait()) {   // pending launches may still use the old buffer
             return nullptr;
         }
@@ -895,20 +929,25 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
         if (!cached) tsi_nanosim_q8_free(tmp);
         return false;
     }
-    // 1. the activations to Q8_0: one grid cell per row
-    tsi_ggml_kargs * a = tsi_nanosim_args();
-    if (!a) {
-        if (!cached) tsi_nanosim_q8_free(tmp);
-        return false;
+    // 1. the activations to Q8_0: one grid cell per row, unless the scratch already holds this tensor's
+    tsi_ggml_kargs * a = nullptr;
+    bool ok = true;
+    if (tsi_nanosim_quantized != x || getenv("GGML_TSAVORITE_NO_FUSE")) {
+        a = tsi_nanosim_args();
+        if (!a) {
+            if (!cached) tsi_nanosim_q8_free(tmp);
+            return false;
+        }
+        memset(a, 0, sizeof(*a));
+        a->version = TSI_GGML_KARGS_VERSION;
+        a->op      = (uint32_t) GGML_OP_NONE;
+        a->n_src   = 2;
+        tsi_nanosim_raw_desc(&a->dst, xq, GGML_TYPE_I8, { k, mp }, { 1, k });
+        tsi_nanosim_desc(&a->src[0], x);
+        tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
+        ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) m);
+        tsi_nanosim_quantized = ok ? x : nullptr;
     }
-    memset(a, 0, sizeof(*a));
-    a->version = TSI_GGML_KARGS_VERSION;
-    a->op      = (uint32_t) GGML_OP_NONE;
-    a->n_src   = 2;
-    tsi_nanosim_raw_desc(&a->dst, xq, GGML_TYPE_I8, { k, mp }, { 1, k });
-    tsi_nanosim_desc(&a->src[0], x);
-    tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
-    bool ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) m);
     // 2. the matmul: one grid cell per 128-column tile, with its own argument slot
     if (ok && (ok = (a = tsi_nanosim_args()) != nullptr)) {
         memset(a, 0, sizeof(*a));
@@ -1043,6 +1082,7 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
     void * xd = tsi_nanosim_scratch(1, (size_t) (rp * nbl * 128));
     tsi_ggml_kargs * a = nullptr;
     bool ok = xq && xd && (a = tsi_nanosim_args()) != nullptr;
+    tsi_nanosim_quantized = nullptr;   // the slots now hold MUL_MAT_ID's rows
     if (ok) {   // 1. the activation rows to Q8_0
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
@@ -1300,9 +1340,99 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
     }
 }
 
+// ---- fusion: several ggml nodes in one launch (GGML_TSAVORITE_NO_FUSE=1 turns it off) ----
+
+// RMS_NORM followed by MUL by the norm weight (every norm of Qwen3 and LFM2): one rms_norm_f32 launch with the weight
+// as src[1]; the kernel rounds as the CPU's pair does. Returns the number of nodes it covered (0: not fused).
+static int tsi_nanosim_fuse_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
+    static const enum ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+    if (!ggml_can_fuse(cgraph, i, ops, 2) || tsi_nanosim_skipped(GGML_OP_RMS_NORM) || tsi_nanosim_skipped(GGML_OP_MUL)) {
+        return 0;
+    }
+    struct ggml_tensor * norm = cgraph->nodes[i], * mul = cgraph->nodes[i + 1];
+    const struct ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (!tsi_nanosim_rms_norm_supports(norm) || !tsi_nanosim_f32_rows(mul, mul->ne[0]) ||
+        !tsi_nanosim_f32_rows(w, norm->ne[0])) {
+        return 0;
+    }
+    for (int d = 1; d < 4; d++) {
+        if (w->ne[d] != norm->ne[d] && w->ne[d] != 1) {
+            return 0;
+        }
+    }
+    if ((uintptr_t) mul->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) norm->src[0]->data % TSI_NANOSIM_ALIGNMENT ||
+        (uintptr_t) w->data % TSI_NANOSIM_ALIGNMENT) {
+        return 0;
+    }
+    tsi_blob_t blob = tsi_nanosim_blob("rms_norm_f32");
+    tsi_ggml_kargs * a = blob ? tsi_nanosim_args() : nullptr;
+    if (!a) {
+        return -1;
+    }
+    memset(a, 0, sizeof(*a));
+    a->version = TSI_GGML_KARGS_VERSION;
+    a->op      = (uint32_t) GGML_OP_RMS_NORM;
+    a->n_src   = 2;
+    tsi_nanosim_desc(&a->dst, mul);
+    tsi_nanosim_desc(&a->src[0], norm->src[0]);
+    tsi_nanosim_desc(&a->src[1], w);
+    memcpy(a->op_params, norm->op_params, sizeof(a->op_params));
+    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(norm)) ? 2 : -1;
+}
+
+// ADD (the residual), then RMS_NORM and MUL of its sum (every layer's second and later norms): one rms_norm_f32
+// launch that also stores the sum, which the next residual ADD reads. The ADD may have other users; the norm only the
+// MUL.
+static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes || tsi_nanosim_skipped(GGML_OP_ADD) || tsi_nanosim_skipped(GGML_OP_RMS_NORM) ||
+        tsi_nanosim_skipped(GGML_OP_MUL)) {
+        return 0;
+    }
+    struct ggml_tensor * add = cgraph->nodes[i], * norm = cgraph->nodes[i + 1], * mul = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || norm->src[0] != add ||
+        (mul->src[0] != norm && mul->src[1] != norm) || !ggml_node_has_n_uses(cgraph, i + 1, 1) || add->view_src) {
+        return 0;
+    }
+    const struct ggml_tensor * x = add->src[0], * b = add->src[1];
+    const struct ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (!tsi_nanosim_rms_norm_supports(norm) || !ggml_are_same_shape(x, add) || !ggml_are_same_shape(b, add) ||
+        !ggml_are_same_shape(mul, add) || !tsi_nanosim_f32_rows(x, add->ne[0]) || !tsi_nanosim_f32_rows(b, add->ne[0]) ||
+        !tsi_nanosim_f32_rows(add, add->ne[0]) || !tsi_nanosim_f32_rows(mul, add->ne[0]) ||
+        !tsi_nanosim_f32_rows(w, add->ne[0])) {
+        return 0;
+    }
+    for (int d = 1; d < 4; d++) {
+        if (w->ne[d] != add->ne[d] && w->ne[d] != 1) {
+            return 0;
+        }
+    }
+    for (const struct ggml_tensor * t : { x, b, (const struct ggml_tensor *) add, (const struct ggml_tensor *) mul, w }) {
+        if ((uintptr_t) t->data % TSI_NANOSIM_ALIGNMENT) {
+            return 0;
+        }
+    }
+    tsi_blob_t blob = tsi_nanosim_blob("rms_norm_f32");
+    tsi_ggml_kargs * a = blob ? tsi_nanosim_args() : nullptr;
+    if (!a) {
+        return -1;
+    }
+    memset(a, 0, sizeof(*a));
+    a->version = TSI_GGML_KARGS_VERSION;
+    a->op      = (uint32_t) GGML_OP_RMS_NORM;
+    a->n_src   = 4;
+    tsi_nanosim_desc(&a->dst, mul);
+    tsi_nanosim_desc(&a->src[0], x);
+    tsi_nanosim_desc(&a->src[1], w);
+    tsi_nanosim_desc(&a->src[2], b);
+    tsi_nanosim_desc(&a->src[3], add);
+    memcpy(a->op_params, norm->op_params, sizeof(a->op_params));
+    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(add)) ? 3 : -1;
+}
+
 // Every node is enqueued, then the graph is waited for once (a no-op unless GGML_TSAVORITE_ENQUEUE_GRAPH, see
 // tsi_nanosim_launch): the CPU backend reads this backend's results in place (host buffers) once graph_compute returns.
 static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    tsi_nanosim_quantized = nullptr;   // tensors of an earlier graph may share addresses with this one's
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (tsi_nanosim_is_noop(node)) {
@@ -1310,6 +1440,23 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
         }
         tsi_nanosim_staging_used = 0;
         tsi_nanosim_cur_node     = node->name;
+        tsi_nanosim_cur_op       = ggml_op_desc(node);
+        static const bool no_fuse = getenv("GGML_TSAVORITE_NO_FUSE") && atoi(getenv("GGML_TSAVORITE_NO_FUSE")) != 0;
+        if (!no_fuse && (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD)) {
+            const bool add = node->op == GGML_OP_ADD;
+            tsi_nanosim_cur_op = add ? "ADD+RMS_NORM+MUL" : "RMS_NORM+MUL";
+            const int fused = add ? tsi_nanosim_fuse_add_rms_norm_mul(cgraph, i) : tsi_nanosim_fuse_rms_norm_mul(cgraph, i);
+            if (fused < 0) {
+                fprintf(stderr, "ggml-tsavorite: rms_norm_f32 %s (%s) failed\n", tsi_nanosim_cur_op, node->name);
+                tsi_nanosim_wait();
+                return GGML_STATUS_FAILED;
+            }
+            if (fused > 0) {
+                i += fused - 1;
+                continue;
+            }
+            tsi_nanosim_cur_op = ggml_op_desc(node);
+        }
         const tsi_nanosim_kernel * k = tsi_nanosim_find_kernel(node);
         if (!k) {
             GGML_LOG_ERROR("%s: no kernel for %s (%s)\n", __func__, ggml_op_desc(node), node->name);
@@ -1442,7 +1589,20 @@ static ggml_backend_buffer_type_t tsi_nanosim_device_get_buffer_type(ggml_backen
 
 // No-op operations (views, reshapes, leaves) cost nothing and graph_compute skips them; the rest need a kernel.
 static bool tsi_nanosim_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    return tsi_nanosim_is_noop(op) || tsi_nanosim_find_kernel(op) != nullptr;
+    const bool ok = tsi_nanosim_is_noop(op) || tsi_nanosim_find_kernel(op) != nullptr;
+    if (!ok && getenv("GGML_TSAVORITE_DEBUG")) {   // what stays on the CPU, and why it does not fit
+        fprintf(stderr, "ggml-tsavorite: not supported: %s %s %s [%lld,%lld,%lld,%lld]", ggml_op_desc(op), op->name,
+                ggml_type_name(op->type), (long long) op->ne[0], (long long) op->ne[1], (long long) op->ne[2],
+                (long long) op->ne[3]);
+        for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
+            const struct ggml_tensor * t = op->src[i];
+            fprintf(stderr, " src%d %s [%lld,%lld,%lld,%lld] nb [%zu,%zu,%zu,%zu]%s", i, ggml_type_name(t->type),
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0],
+                    t->nb[1], t->nb[2], t->nb[3], t->view_src ? " view" : "");
+        }
+        fprintf(stderr, "\n");
+    }
+    return ok;
     GGML_UNUSED(dev);
 }
 
