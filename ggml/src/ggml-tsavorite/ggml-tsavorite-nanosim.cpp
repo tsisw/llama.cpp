@@ -298,7 +298,7 @@ static void * tsi_nanosim_core_staging(size_t bytes) {
     // USER_DRAM_SIZE 4096, measured 2026-11-13), and larger ones below it: ask for at least 1 MiB.
     const size_t want = bytes < (1u << 20) ? (1u << 20) : bytes;
     std::vector<void *> held;
-    for (int i = 0; i < 16 && !buf; i++) {
+    for (int i = 0; i < 64 && !buf; i++) {
         void * p = nullptr;
         try {
             p = tsi_alloc((int64_t) want, tsi::MemorySpace::SHARED_DRAM);
@@ -306,11 +306,37 @@ static void * tsi_nanosim_core_staging(size_t bytes) {
             break;
         }
         const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(p);
+        if (getenv("GGML_TSAVORITE_DEBUG")) {
+            fprintf(stderr, "staging try %d: handle %#llx\n", i, (unsigned long long) h);
+        }
         if (h >= TSI_NANOSIM_CORE_LO && h + want <= TSI_NANOSIM_CORE_HI) {
             buf  = p;
             size = want;
-        } else {
-            held.push_back(p);
+            break;
+        }
+        held.push_back(p);
+        // Allocation goes top-down; with more than 4 GiB of DRAM (USER_DRAM_SIZE > 4096) the space above the window
+        // is large. Hold a filler as large as the runtime gives (DRAM blocks are 1 GiB - 64 KiB) to step down fast.
+        // Small blocks keep coming from the top DRAM block; whole blocks land anywhere, some inside the window
+        // (blocks start at n * 1 GiB + 0x500000, measured with USER_DRAM_SIZE 8192): keep the first such block.
+        for (int64_t f = (1ll << 30) - (64 << 10); f >= (16ll << 20) && !buf; f /= 2) {
+            void * q = nullptr;
+            try {
+                q = tsi_alloc(f, tsi::MemorySpace::SHARED_DRAM);
+            } catch (const std::exception &) {
+                continue;
+            }
+            const uint64_t hq = (uint64_t) tsi_shmem_handle_from_ptr(q);
+            if (getenv("GGML_TSAVORITE_DEBUG")) {
+                fprintf(stderr, "staging filler %lld: handle %#llx\n", (long long) f, (unsigned long long) hq);
+            }
+            if (hq >= TSI_NANOSIM_CORE_LO && hq + (uint64_t) f <= TSI_NANOSIM_CORE_HI && (size_t) f >= want) {
+                buf  = q;
+                size = (size_t) f;
+            } else {
+                held.push_back(q);
+            }
+            break;
         }
     }
     for (void * p : held) {
@@ -930,6 +956,9 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
         }
         tsi_blob_t blob = tsi_nanosim_blob(k->blob);
         if (!blob || !k->launch(blob, node)) {
+            fprintf(stderr, "ggml-tsavorite: %s %s (%s) failed: ne [%lld, %lld, %lld, %lld]\n", k->blob, ggml_op_desc(node),
+                    node->name, (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                    (long long) node->ne[3]);
             return GGML_STATUS_FAILED;
         }
     }
