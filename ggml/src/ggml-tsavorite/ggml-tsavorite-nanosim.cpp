@@ -286,7 +286,7 @@ static bool tsi_nanosim_rms_norm_supports(const struct ggml_tensor * node) {
     const struct ggml_tensor * src = node->src[0];
     return src && src->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && ggml_are_same_shape(src, node) &&
            src->nb[0] == sizeof(float) && node->nb[0] == sizeof(float) && src->ne[0] % 32 == 0 &&
-           src->ne[0] < (1 << 24) && ggml_nrows(src) <= INT32_MAX && tsi_nanosim_rows_aligned(src) &&
+           src->ne[0] < (1 << 23) && ggml_nrows(src) <= INT32_MAX && tsi_nanosim_rows_aligned(src) &&
            tsi_nanosim_rows_aligned(node);
 }
 
@@ -659,13 +659,12 @@ static bool tsi_nanosim_rope_supports(const struct ggml_tensor * node) {
 }
 
 static bool tsi_nanosim_rope_launch(tsi_blob_t blob, struct ggml_tensor * node) {
-    const struct ggml_tensor * p = node->src[1];
     if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT) {
         GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
         return false;
     }
-    tsi_ggml_kargs * a = tsi_nanosim_pack(node, 2);
-    if (!a || !tsi_nanosim_stage_for_core(&a->src[1], p)) {
+    tsi_ggml_kargs * a = tsi_nanosim_pack(node, 2);   // positions: read by the TDU and converted on the TVU, not staged
+    if (!a) {
         return false;
     }
     float freq_base;
