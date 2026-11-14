@@ -526,6 +526,51 @@ static bool tsi_nanosim_rope_launch(tsi_blob_t blob, struct ggml_tensor * node) 
     return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (node->ne[2] * node->ne[3]));
 }
 
+// ---- element gathers (ggml-tsi-kernel nanosim/gather_f32.c): LFM2's short convolution ----
+
+static bool tsi_nanosim_f32_any(const struct ggml_tensor * t) {
+    if (!t || t->type != GGML_TYPE_F32 || ggml_nbytes(t) >= (1ull << 31)) {
+        return false;
+    }
+    for (int d = 0; d < 4; d++) {
+        if (t->nb[d] % sizeof(float)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// CONCAT along dim 0 (3-D), SSM_CONV, and CPY/CONT of any f32 source into a contiguous f32 dst; dst element count a
+// multiple of 32 and dst 128-byte aligned (checked at launch).
+static bool tsi_nanosim_gather_supports(const struct ggml_tensor * node) {
+    const struct ggml_tensor * s0 = node->src[0], * s1 = node->src[1];
+    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || ggml_nelements(node) % 32 || node->ne[3] != 1) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_CONCAT:
+            return ggml_get_op_params_i32(node, 0) == 0 && tsi_nanosim_f32_any(s0) && tsi_nanosim_f32_any(s1) &&
+                   s0->ne[3] == 1 && s1->ne[3] == 1;
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+            return tsi_nanosim_f32_any(s0) && s0->ne[3] == 1 && ggml_nelements(s0) == ggml_nelements(node);
+        case GGML_OP_SSM_CONV:
+            return tsi_nanosim_f32_any(s0) && tsi_nanosim_f32_any(s1) && node->ne[0] % 32 == 0 && s1->ne[0] <= 8 &&
+                   s0->ne[3] == 1 && node->ne[2] * node->ne[1] * (node->ne[0] / 32) < (1 << 30);
+        default:
+            return false;
+    }
+}
+
+static bool tsi_nanosim_gather_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT) {
+        GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+        return false;
+    }
+    tsi_ggml_kargs * a = tsi_nanosim_pack(node, node->src[1] ? 2 : 1);
+    return a && tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (ggml_nelements(node) / 32));
+}
+
 // ---- MUL_MAT, Q8_0 weights ----
 
 // A raw descriptor for a buffer the backend owns (repacked weights, activation scratch).
@@ -779,6 +824,10 @@ static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
         { GGML_OP_SET_ROWS, "copy_rows",    tsi_nanosim_copy_supports,     tsi_nanosim_copy_launch },
         { GGML_OP_SOFT_MAX, "soft_max_f32", tsi_nanosim_soft_max_supports, tsi_nanosim_soft_max_launch },
         { GGML_OP_ROPE,     "rope_f32",     tsi_nanosim_rope_supports,     tsi_nanosim_rope_launch },
+        { GGML_OP_CONCAT,   "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },
+        { GGML_OP_SSM_CONV, "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },
+        { GGML_OP_CPY,      "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },   // after copy_rows
+        { GGML_OP_CONT,     "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },
     };
     return kernels;
 }
