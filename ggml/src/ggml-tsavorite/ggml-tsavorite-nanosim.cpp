@@ -153,7 +153,11 @@ static_assert(GGML_MAX_OP_PARAMS == TSI_GGML_OP_PARAMS * sizeof(int32_t), "op_pa
 static tsi_ggml_kargs * tsi_nanosim_args() {
     static tsi_ggml_kargs * args = nullptr;
     if (!args) {
-        args = (tsi_ggml_kargs *) tsi_alloc(sizeof(tsi_ggml_kargs), tsi::MemorySpace::SHARED_DRAM);
+        try {
+            args = (tsi_ggml_kargs *) tsi_alloc(sizeof(tsi_ggml_kargs), tsi::MemorySpace::SHARED_DRAM);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: tsi_alloc failed: %s\n", __func__, e.what());
+        }
     }
     return args;
 }
@@ -564,7 +568,14 @@ static void * tsi_nanosim_scratch(int slot, size_t bytes) {
     static size_t size[2] = { 0, 0 };
     if (size[slot] < bytes) {
         if (ptr[slot]) tsi_dealloc(ptr[slot], tsi::MemorySpace::SHARED_DRAM);
-        ptr[slot]  = tsi_alloc((int64_t) bytes, tsi::MemorySpace::SHARED_DRAM);
+        ptr[slot]  = nullptr;
+        size[slot] = 0;
+        try {
+            ptr[slot] = tsi_alloc((int64_t) bytes, tsi::MemorySpace::SHARED_DRAM);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed: %s\n", __func__, bytes, e.what());
+            return nullptr;
+        }
         size[slot] = bytes;
     }
     return ptr[slot];
@@ -609,6 +620,10 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     }
     void * xq = tsi_nanosim_scratch(0, (size_t) (mp * k));
     void * xd = tsi_nanosim_scratch(1, (size_t) (mp * nbl * 128));
+    if (!xq || !xd) {
+        if (!cached) tsi_nanosim_q8_free(tmp);
+        return false;
+    }
     // 1. the activations to Q8_0: one grid cell per row
     tsi_ggml_kargs * a = tsi_nanosim_args();
     memset(a, 0, sizeof(*a));
