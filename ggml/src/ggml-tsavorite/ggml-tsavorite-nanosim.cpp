@@ -789,6 +789,77 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     return ok;
 }
 
+// ---- MUL_MAT_ID, Q8_0 experts (ggml-tsi-kernel nanosim/mul_mat_q8_0.c, MUL_MAT_ID path) ----
+
+// experts [K, N, n_expert] Q8_0 (rows contiguous, experts consecutive), activations f32 [K, ne11, n_tok] with ne11 1
+// or n_used, ids i32 [n_used, n_tok], dst f32 [N, n_used, n_tok]; K and N multiples of 128.
+static bool tsi_nanosim_mul_mat_id_supports(const struct ggml_tensor * node) {
+    const struct ggml_tensor * w = node->src[0], * x = node->src[1], * ids = node->src[2];
+    return w && x && ids && w->type == GGML_TYPE_Q8_0 && x->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+           ids->type == GGML_TYPE_I32 && w->ne[3] == 1 && x->ne[3] == 1 && w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 &&
+           x->ne[0] == w->ne[0] && ggml_is_contiguous(w) && (x->ne[1] == 1 || x->ne[1] == ids->ne[0]) &&
+           x->ne[2] == ids->ne[1] && node->ne[0] == w->ne[1] && node->ne[1] == ids->ne[0] && node->ne[2] == ids->ne[1] &&
+           (uint64_t) w->ne[0] * (uint64_t) w->ne[1] * (uint64_t) w->ne[2] < (1ull << 32) &&
+           tsi_nanosim_f32_rows(x, x->ne[0]) && tsi_nanosim_f32_rows(node, node->ne[0]);
+}
+
+static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    const struct ggml_tensor * w = node->src[0], * x = node->src[1], * ids = node->src[2];
+    const int64_t k = w->ne[0], ncols = w->ne[1] * w->ne[2], rows = x->ne[1] * x->ne[2], rp = rows + 16, nbl = k / 32;
+    if ((uintptr_t) x->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT) {
+        GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+        return false;
+    }
+    tsi_blob_t qblob = tsi_nanosim_blob("quantize_q8_0_f32");
+    if (!qblob) {
+        return false;
+    }
+    // the experts as one [K, N * n_expert] matrix: cached for a weights buffer
+    struct ggml_tensor w2 = *w;
+    w2.ne[1] = ncols;
+    w2.ne[2] = 1;
+    w2.nb[2] = w2.nb[3] = w->nb[1] * ncols;
+    tsi_nanosim_q8_weights wr, tmp;
+    const bool cached = w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    tsi_nanosim_q8_weights * e = cached ? &tsi_nanosim_q8_cache()[w->data] : &tmp;
+    if (!e->wq && !tsi_nanosim_q8_repack(&w2, *e)) {
+        return false;
+    }
+    wr = *e;
+    void * xq = tsi_nanosim_scratch(0, (size_t) (rp * k));
+    void * xd = tsi_nanosim_scratch(1, (size_t) (rp * nbl * 128));
+    bool ok = xq && xd;
+    tsi_ggml_kargs * a = tsi_nanosim_args();
+    if (ok) {   // 1. the activation rows to Q8_0
+        memset(a, 0, sizeof(*a));
+        a->version = TSI_GGML_KARGS_VERSION;
+        a->n_src   = 2;
+        tsi_nanosim_raw_desc(&a->dst, xq, GGML_TYPE_I8, { k, rp }, { 1, k });
+        tsi_nanosim_desc(&a->src[0], x);
+        tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
+        ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) rows);
+    }
+    if (ok) {   // 2. one grid cell per (slot, token, 128-column tile)
+        memset(a, 0, sizeof(*a));
+        a->version = TSI_GGML_KARGS_VERSION;
+        a->op      = (uint32_t) GGML_OP_MUL_MAT_ID;
+        a->n_src   = 5;
+        tsi_nanosim_desc(&a->dst, node);
+        tsi_nanosim_raw_desc(&a->src[0], wr.wq, GGML_TYPE_I8, { k, ncols }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[1], wr.dw, GGML_TYPE_F32, { ncols, nbl }, { 4, ncols * 4 });
+        tsi_nanosim_raw_desc(&a->src[2], xq, GGML_TYPE_I8, { k, rp }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[3], xd, GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
+        tsi_nanosim_desc(&a->src[4], ids);
+        a->op_params[0] = (int32_t) x->ne[1];
+        ok = tsi_nanosim_stage_for_core(&a->src[4], ids) &&
+             tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (node->ne[1] * node->ne[2] * (node->ne[0] / 128)));
+    }
+    if (!cached) {
+        tsi_nanosim_q8_free(tmp);
+    }
+    return ok;
+}
+
 static bool tsi_nanosim_rms_norm_launch(tsi_blob_t blob, struct ggml_tensor * node) {
     if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT) {
         GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
@@ -817,6 +888,7 @@ static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
         { GGML_OP_GLU,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
         { GGML_OP_MUL_MAT,  "mul_mat_q8_0", tsi_nanosim_mul_mat_q8_0_supports, tsi_nanosim_mul_mat_q8_0_launch },
         { GGML_OP_MUL_MAT,  "mul_mat_f16",  tsi_nanosim_mul_mat_f16_supports,  tsi_nanosim_mul_mat_f16_launch },
+        { GGML_OP_MUL_MAT_ID, "mul_mat_q8_0", tsi_nanosim_mul_mat_id_supports, tsi_nanosim_mul_mat_id_launch },
         { GGML_OP_CONT,     "copy_rows",    tsi_nanosim_copy_supports,     tsi_nanosim_copy_launch },
         { GGML_OP_CPY,      "copy_rows",    tsi_nanosim_copy_supports,     tsi_nanosim_copy_launch },
         { GGML_OP_GET_ROWS, "get_rows_q8_0", tsi_nanosim_get_rows_q8_0_supports, tsi_nanosim_get_rows_q8_0_launch },

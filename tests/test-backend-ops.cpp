@@ -6667,6 +6667,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], s[1], s[2], {1, 1}, {1, 1}));
         }
     }
+    {
+        // MoE expert products with LFM2-8B-A1B-like shapes (Q8_0 experts, 4 used per token): broadcast activations
+        // (gate/up) and one row per slot (down); N and K multiples of 128
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 256, 2, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 256, 2, 384));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 4, true, 128, 1, 2048));
+    }
 
 #if 0
     {
