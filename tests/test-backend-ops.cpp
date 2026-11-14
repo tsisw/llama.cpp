@@ -7194,6 +7194,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_moe({ 8, 22, 1, 1 }, 4, /*with_norm*/ false, /*delayed_softmax*/ true));
     test_cases.emplace_back(new test_topk_moe({ 32, 22, 1, 1 }, 8, /*with_norm*/ false, /*delayed_softmax*/ true));
 
+    // MoE router and expert weighting with LFM2-8B-A1B shapes (32 experts, 4 used): top-k (ARGSORT of rows of 32),
+    // GET_ROWS of the weights, SUM_ROWS, CLAMP, DIV; the expert outputs times their weights (MUL, b with ne0 = 1)
+    for (int64_t n_tokens : {1, 6, 40}) {
+        test_cases.emplace_back(new test_topk_moe({ 32, n_tokens, 1, 1 }, 4, /*with_norm*/ true));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, { 32, n_tokens, 1, 1 }, GGML_SORT_ORDER_DESC));
+        test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { 1, 4, n_tokens, 1 }, { 2048, 1, 1, 1 }));
+        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F32, { 1, n_tokens, 1, 1 }, { 4, 1, 1, 1 }));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

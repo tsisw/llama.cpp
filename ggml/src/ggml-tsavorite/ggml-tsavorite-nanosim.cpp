@@ -240,8 +240,21 @@ static bool tsi_nanosim_f32_rows(const struct ggml_tensor * t, int64_t ne0) {
     return true;
 }
 
-// ADD, MUL, SCALE, GLU (SWIGLU, two inputs), f32 (ggml-tsi-kernel nanosim/eltwise_f32.c). The second input of ADD
-// and MUL may broadcast along dimensions 1..3.
+// f32 with byte strides a multiple of 4 (the element gathers; MUL's b with ne0 = 1).
+static bool tsi_nanosim_f32_any(const struct ggml_tensor * t) {
+    if (!t || t->type != GGML_TYPE_F32 || ggml_nbytes(t) >= (1ull << 31)) {
+        return false;
+    }
+    for (int d = 0; d < 4; d++) {
+        if (t->nb[d] % sizeof(float)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ADD, MUL, SCALE, GLU (SWIGLU, two inputs), UNARY SIGMOID, f32 (ggml-tsi-kernel nanosim/eltwise_f32.c). The second
+// input of ADD and MUL may broadcast along dimensions 1..3, and MUL's along dimension 0 too.
 static bool tsi_nanosim_eltwise_supports(const struct ggml_tensor * node) {
     const int64_t ne0 = node->ne[0];
     const struct ggml_tensor * a = node->src[0], * b = node->src[1];
@@ -251,7 +264,9 @@ static bool tsi_nanosim_eltwise_supports(const struct ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_ADD:
         case GGML_OP_MUL:
-            if (!tsi_nanosim_f32_rows(b, ne0)) {
+            // MUL also takes b with ne0 = 1 at any 4-byte aligned address (the MoE expert weights)
+            if (!(node->op == GGML_OP_MUL && b && b->ne[0] == 1 && tsi_nanosim_f32_any(b) && ne0 > 1) &&
+                !tsi_nanosim_f32_rows(b, ne0)) {
                 return false;
             }
             for (int d = 1; d < 4; d++) {
@@ -262,6 +277,8 @@ static bool tsi_nanosim_eltwise_supports(const struct ggml_tensor * node) {
             return true;
         case GGML_OP_SCALE:
             return true;
+        case GGML_OP_UNARY:
+            return ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID;
         case GGML_OP_GLU:
             return ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && tsi_nanosim_f32_rows(b, ne0) &&
                    ggml_are_same_shape(b, node);
@@ -271,7 +288,16 @@ static bool tsi_nanosim_eltwise_supports(const struct ggml_tensor * node) {
 }
 
 static bool tsi_nanosim_eltwise_launch(tsi_blob_t blob, struct ggml_tensor * node) {
-    return tsi_nanosim_launch_rows(blob, node, node->op == GGML_OP_SCALE ? 1 : 2);
+    const int n_src = node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY ? 1 : 2;
+    if (n_src == 2 && node->src[1]->ne[0] == 1 && node->ne[0] > 1) {   // b's element is read from its line
+        if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT) {
+            GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+            return false;
+        }
+        tsi_ggml_kargs * a = tsi_nanosim_pack(node, 2);
+        return a && tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(node));
+    }
+    return tsi_nanosim_launch_rows(blob, node, n_src);
 }
 
 // ---- small tensors the TXE's scalar core reads (indices, positions) ----
@@ -526,19 +552,7 @@ static bool tsi_nanosim_rope_launch(tsi_blob_t blob, struct ggml_tensor * node) 
     return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (node->ne[2] * node->ne[3]));
 }
 
-// ---- element gathers (ggml-tsi-kernel nanosim/gather_f32.c): LFM2's short convolution ----
-
-static bool tsi_nanosim_f32_any(const struct ggml_tensor * t) {
-    if (!t || t->type != GGML_TYPE_F32 || ggml_nbytes(t) >= (1ull << 31)) {
-        return false;
-    }
-    for (int d = 0; d < 4; d++) {
-        if (t->nb[d] % sizeof(float)) {
-            return false;
-        }
-    }
-    return true;
-}
+// ---- element gathers (ggml-tsi-kernel nanosim/gather_f32.c): LFM2's short convolution, the MoE router ----
 
 // CONCAT along dim 0 (3-D), SSM_CONV, and CPY/CONT of any f32 source into a contiguous f32 dst; dst element count a
 // multiple of 32 and dst 128-byte aligned (checked at launch).
@@ -560,6 +574,64 @@ static bool tsi_nanosim_gather_supports(const struct ggml_tensor * node) {
         default:
             return false;
     }
+}
+
+// The MoE router's small ops (any element count; a partial last line is merged): GET_ROWS of f32 by i32 indices
+// with any strides, SUM_ROWS, CLAMP, DIV (b broadcast where its ne is 1).
+static bool tsi_nanosim_gather_small_supports(const struct ggml_tensor * node) {
+    const struct ggml_tensor * s0 = node->src[0], * s1 = node->src[1];
+    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || node->ne[3] != 1 || !tsi_nanosim_f32_any(s0) ||
+        s0->ne[3] != 1 || ggml_nelements(node) >= (1 << 30)) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_GET_ROWS:
+            return s1 && s1->type == GGML_TYPE_I32 && s1->ne[2] == 1 && s1->ne[3] == 1 && s1->nb[0] % 4 == 0 &&
+                   s1->nb[1] % 4 == 0 && node->ne[0] == s0->ne[0] && node->ne[1] == s1->ne[0] &&
+                   node->ne[2] == s1->ne[1] && s0->ne[2] == s1->ne[1] && ggml_nbytes(s1) < (1 << 20);
+        case GGML_OP_SUM_ROWS:
+            return node->ne[0] == 1 && node->ne[1] == s0->ne[1] && node->ne[2] == s0->ne[2] && s0->ne[0] <= 4096;
+        case GGML_OP_CLAMP:
+            return ggml_are_same_shape(node, s0);
+        case GGML_OP_DIV:
+            if (!ggml_are_same_shape(node, s0) || !tsi_nanosim_f32_any(s1) || s1->ne[3] != 1) {
+                return false;
+            }
+            for (int d = 0; d < 3; d++) {
+                if (s1->ne[d] != node->ne[d] && s1->ne[d] != 1) {
+                    return false;
+                }
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool tsi_nanosim_gather_small_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT) {
+        GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
+        return false;
+    }
+    const int n_src = node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_DIV ? 2 : 1;
+    tsi_ggml_kargs * a = tsi_nanosim_pack(node, n_src);
+    if (a && node->op == GGML_OP_GET_ROWS && !tsi_nanosim_stage_for_core(&a->src[1], node->src[1])) {
+        return false;
+    }
+    return a && tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ((ggml_nelements(node) + 31) / 32));
+}
+
+// ARGSORT, descending, of f32 rows of 32 (ggml-tsi-kernel nanosim/argsort_f32.c; the MoE router's top-k): one grid
+// cell per row; rows contiguous and 128-byte aligned in src and dst.
+static bool tsi_nanosim_argsort_supports(const struct ggml_tensor * node) {
+    const struct ggml_tensor * s = node->src[0];
+    return s && ggml_get_op_params_i32(node, 0) == GGML_SORT_ORDER_DESC && node->type == GGML_TYPE_I32 &&
+           ggml_is_contiguous(node) && node->ne[0] == 32 && tsi_nanosim_f32_rows(s, 32) && ggml_is_contiguous(s) &&
+           ggml_are_same_shape(s, node) && ggml_nrows(node) < (1 << 24) && !(node->view_src && node->view_offs % TSI_NANOSIM_ALIGNMENT);
+}
+
+static bool tsi_nanosim_argsort_launch(tsi_blob_t blob, struct ggml_tensor * node) {
+    return tsi_nanosim_launch_rows(blob, node, 1);
 }
 
 static bool tsi_nanosim_gather_launch(tsi_blob_t blob, struct ggml_tensor * node) {
@@ -886,6 +958,7 @@ static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
         { GGML_OP_MUL,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
         { GGML_OP_SCALE,    "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
         { GGML_OP_GLU,      "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
+        { GGML_OP_UNARY,    "eltwise_f32",  tsi_nanosim_eltwise_supports,  tsi_nanosim_eltwise_launch },
         { GGML_OP_MUL_MAT,  "mul_mat_q8_0", tsi_nanosim_mul_mat_q8_0_supports, tsi_nanosim_mul_mat_q8_0_launch },
         { GGML_OP_MUL_MAT,  "mul_mat_f16",  tsi_nanosim_mul_mat_f16_supports,  tsi_nanosim_mul_mat_f16_launch },
         { GGML_OP_MUL_MAT_ID, "mul_mat_q8_0", tsi_nanosim_mul_mat_id_supports, tsi_nanosim_mul_mat_id_launch },
@@ -900,6 +973,11 @@ static const std::vector<tsi_nanosim_kernel> & tsi_nanosim_kernels() {
         { GGML_OP_SSM_CONV, "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },
         { GGML_OP_CPY,      "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },   // after copy_rows
         { GGML_OP_CONT,     "gather_f32",   tsi_nanosim_gather_supports,   tsi_nanosim_gather_launch },
+        { GGML_OP_GET_ROWS, "gather_f32",   tsi_nanosim_gather_small_supports, tsi_nanosim_gather_small_launch },   // after copy_rows
+        { GGML_OP_SUM_ROWS, "gather_f32",   tsi_nanosim_gather_small_supports, tsi_nanosim_gather_small_launch },
+        { GGML_OP_CLAMP,    "gather_f32",   tsi_nanosim_gather_small_supports, tsi_nanosim_gather_small_launch },
+        { GGML_OP_DIV,      "gather_f32",   tsi_nanosim_gather_small_supports, tsi_nanosim_gather_small_launch },
+        { GGML_OP_ARGSORT,  "argsort_f32",  tsi_nanosim_argsort_supports,  tsi_nanosim_argsort_launch },
     };
     return kernels;
 }
