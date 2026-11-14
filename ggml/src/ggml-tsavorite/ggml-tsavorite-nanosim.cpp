@@ -47,6 +47,29 @@ struct tsi_nanosim_runtime {
     std::unordered_map<std::string, tsi_blob_t> blobs;
 };
 
+// What each launch was, by its session command ID, so a fault (reported by command ID on the event callback) can be
+// tied to its node: a ring of the most recent launches.
+struct tsi_nanosim_cmd_record {
+    tsi_cmd_id_t cmd = TSI_CMD_INVALID;
+    const char * blob = "";
+    char         node[64] = {};
+};
+static tsi_nanosim_cmd_record tsi_nanosim_cmds[8192];
+static const char * tsi_nanosim_cur_node = "";
+
+static void tsi_nanosim_on_event(const tsi_event_t * ev, void *) {
+    if (!ev || ev->status == 0) {
+        return;
+    }
+    const tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[ev->cmd_id % 8192];
+    fprintf(stderr, "ggml-tsavorite: queue fault, status %d, command %llu: %s\n", (int) ev->status,
+            (unsigned long long) ev->cmd_id,
+            ev->cmd_id != TSI_CMD_INVALID && r.cmd == ev->cmd_id ? r.node : "(not a recorded launch)");
+    if (ev->cmd_id != TSI_CMD_INVALID && r.cmd == ev->cmd_id) {
+        fprintf(stderr, "ggml-tsavorite: faulting launch: blob %s\n", r.blob);
+    }
+}
+
 static tsi_nanosim_runtime & tsi_nanosim_rt() {
     static tsi_nanosim_runtime rt;
     return rt;
@@ -89,7 +112,8 @@ static bool tsi_nanosim_start() {
         return false;
     }
     tsi_session_desc_t desc = {};
-    desc.size = sizeof(desc);
+    desc.size     = sizeof(desc);
+    desc.on_event = tsi_nanosim_on_event;
     rt.session = tsi_session_create(&desc);
     if (!rt.session) {
         GGML_LOG_ERROR("%s: tsi_session_create failed, status %d\n", __func__, (int) tsi_last_status());
@@ -109,6 +133,11 @@ static bool tsi_nanosim_start() {
 }
 
 // The blob of a kernel, loaded on first use from GGML_TSAVORITE_KERNEL_DIR.
+static bool tsi_nanosim_wait();
+
+// The blob of a kernel, loaded on first use. A blob load is a device command of its own: issued while a launch is in
+// flight it took the place of that launch's response on device 0 and the runtime failed the launch without a message
+// (Qwen3-0.6B with GGML_TSAVORITE_ENQUEUE_GRAPH, 2026-11-14), so the queue is drained first.
 static tsi_blob_t tsi_nanosim_blob(const char * name) {
     tsi_nanosim_runtime & rt = tsi_nanosim_rt();
     std::lock_guard<std::mutex> lock(rt.mutex);
@@ -122,6 +151,9 @@ static tsi_blob_t tsi_nanosim_blob(const char * name) {
         return 0;
     }
     const std::string path = std::string(dir) + "/" + name + ".blob";
+    if (!tsi_nanosim_wait()) {
+        return 0;
+    }
     tsi_blob_t blob = tsi_blob_load(rt.session, name, path.c_str());
     if (!blob) {
         GGML_LOG_ERROR("%s: tsi_blob_load(%s) failed, status %d\n", __func__, path.c_str(), (int) tsi_last_status());
@@ -135,10 +167,10 @@ static tsi_blob_t tsi_nanosim_blob(const char * name) {
 // waits once at its end. This needs the launches of the one queue to run in queue order, as they do on one TXE (the
 // FPGA configuration: one TXE, four host CPUs): a launch may then read what the launches before it wrote, and a
 // scratch or staging buffer may be reused by the next launch without a wait. The host waits (tsi_nanosim_wait)
-// before it frees, reallocates or reads memory a pending launch may use, and before an argument slot comes round.
-// With more than one TXE the runtime runs consecutive commands concurrently on different TXEs (runtime
-// SchedulerTypes.h), so the order does not hold: the simulated device always has 20 TXEs (runtime TsavRTContext.cpp
-// kXtensaSimTXEs), where Qwen3-0.6B failed with the graph enqueued. Unset (the default): every launch is waited for.
+// before it frees, reallocates or reads memory a pending launch may use, before an argument slot comes round, and
+// before it loads a blob (tsi_nanosim_blob). The runtime keeps a queue's commands in order across TXEs too (it
+// dispatches a command once the previous one has responded: runtime TsavRTContext.cpp). Unset (the default): every
+// launch is waited for.
 static uint32_t tsi_nanosim_pending = 0;      // launches enqueued since the last wait
 static uint32_t tsi_nanosim_slots_used = 0;   // argument slots handed out since the last wait
 
@@ -163,10 +195,20 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
     tsi_spmd_args_t grid = {};
     grid.numGridSizes = 1;
     grid.gridSize[0]  = cells;
-    if (tsi_enqueue_blob_launch(rt.queue, blob, tsi_shmem_handle_from_ptr(args), args_size, &grid) == TSI_CMD_INVALID) {
+    const tsi_cmd_id_t cmd = tsi_enqueue_blob_launch(rt.queue, blob, tsi_shmem_handle_from_ptr(args), args_size, &grid);
+    if (cmd == TSI_CMD_INVALID) {
         GGML_LOG_ERROR("%s: tsi_enqueue_blob_launch failed, status %d\n", __func__, (int) tsi_last_status());
         return false;
     }
+    tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[cmd % 8192];
+    r.cmd  = cmd;
+    r.blob = "?";
+    for (const auto & kv : rt.blobs) {
+        if (kv.second == blob) {
+            r.blob = kv.first.c_str();
+        }
+    }
+    snprintf(r.node, sizeof(r.node), "%s (%u cells)", tsi_nanosim_cur_node, cells);
     tsi_nanosim_pending++;
     return !sync || tsi_nanosim_wait();
 }
@@ -1268,6 +1310,7 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
             continue;
         }
         tsi_nanosim_staging_used = 0;
+        tsi_nanosim_cur_node     = node->name;
         const tsi_nanosim_kernel * k = tsi_nanosim_find_kernel(node);
         if (!k) {
             GGML_LOG_ERROR("%s: no kernel for %s (%s)\n", __func__, ggml_op_desc(node), node->name);
