@@ -6658,6 +6658,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    {
+        // Model shapes (Qwen3-0.6B, LFM2-1.2B decode and short prompts): Q8_0 weights [k, m], f32 activations [k, n];
+        // the shapes the Tsavorite nanosim backend's Q8_0 kernel takes (m and k multiples of 128)
+        const int64_t shapes[][3] = { {1024, 1, 1024}, {1024, 5, 1024}, {2048, 17, 1024}, {1024, 5, 2048},
+                                      {1024, 3, 3072}, {3072, 1, 1024}, {512, 6, 2048}, {128, 1, 128} };
+        for (const auto & s : shapes) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], s[1], s[2], {1, 1}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
