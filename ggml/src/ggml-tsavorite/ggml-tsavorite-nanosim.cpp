@@ -21,6 +21,11 @@
 #include "tsi-rt/shim/TsiSessionCAPI.h"
 #include "tsi_ggml_kargs.h"   // ggml-tsi-kernel/nanosim/include: the kernels' argument block
 
+// This tree's ggml_log_internal (ggml/src/ggml.c) passes only GGML_LOG_LEVEL_TSAVORITE messages to the log callback
+// and drops the rest, so the backend's errors (allocation failures, launch failures) go to stderr directly.
+#undef GGML_LOG_ERROR
+#define GGML_LOG_ERROR(...) fprintf(stderr, __VA_ARGS__)
+
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -309,16 +314,33 @@ static bool tsi_nanosim_eltwise_launch(tsi_blob_t blob, struct ggml_tensor * nod
 #define TSI_NANOSIM_CORE_LO 0x500000u
 #define TSI_NANOSIM_CORE_HI 0xff800000u
 
+// The staging buffer: its own allocation, or (carved) the first TSI_NANOSIM_CARVE bytes of a backend buffer that
+// landed inside the window (tsi_nanosim_buft_alloc_buffer), which that buffer's free gives up.
+#define TSI_NANOSIM_CARVE (1u << 20)
+static struct {
+    void * buf    = nullptr;
+    size_t size   = 0;
+    bool   carved = false;
+} tsi_nanosim_staging;
+
+static bool tsi_nanosim_in_core_window(const void * p, size_t bytes) {
+    const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(const_cast<void *>(p));
+    return h >= TSI_NANOSIM_CORE_LO && h + bytes <= TSI_NANOSIM_CORE_HI;
+}
+
 static void * tsi_nanosim_core_staging(size_t bytes) {
-    static void * buf = nullptr;
-    static size_t size = 0;
+    void * & buf = tsi_nanosim_staging.buf;
+    size_t & size = tsi_nanosim_staging.size;
     if (buf && size >= bytes) {
         return buf;
     }
     if (buf) {
-        tsi_dealloc(buf, tsi::MemorySpace::SHARED_DRAM);
+        if (!tsi_nanosim_staging.carved) {
+            tsi_dealloc(buf, tsi::MemorySpace::SHARED_DRAM);
+        }
         buf  = nullptr;
         size = 0;
+        tsi_nanosim_staging.carved = false;
     }
     // The runtime serves small blocks from the top of DRAM, above the core's window (handles near 0xfff00000 with
     // USER_DRAM_SIZE 4096, measured 2026-11-13), and larger ones below it: ask for at least 1 MiB.
@@ -378,6 +400,8 @@ static void * tsi_nanosim_core_staging(size_t bytes) {
 static bool tsi_nanosim_stage_for_core(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
     void * buf = tsi_nanosim_core_staging(ggml_nbytes(t));
     if (!buf) {
+        GGML_LOG_ERROR("%s: %s: no staging buffer for %zu bytes inside the core's window [%#x, %#x)\n", __func__,
+                       t->name, ggml_nbytes(t), TSI_NANOSIM_CORE_LO, TSI_NANOSIM_CORE_HI);
         return false;
     }
     memcpy(buf, t->data, ggml_nbytes(t));
@@ -925,6 +949,9 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
         a->op_params[0] = (int32_t) x->ne[1];
         ok = tsi_nanosim_stage_for_core(&a->src[4], ids) &&
              tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (node->ne[1] * node->ne[2] * (node->ne[0] / 128)));
+    } else if (!(xq && xd)) {
+        GGML_LOG_ERROR("%s: %s: no activation scratch (%lld rows of %lld)\n", __func__, node->name, (long long) rp,
+                       (long long) k);
     }
     if (!cached) {
         tsi_nanosim_q8_free(tmp);
@@ -1008,11 +1035,15 @@ static const tsi_nanosim_kernel * tsi_nanosim_find_kernel(const struct ggml_tens
 struct tsi_nanosim_buffer_context {
     void * base;
     size_t size;
+    void * alloc;   // what tsi_alloc returned: base, or base - TSI_NANOSIM_CARVE when the staging buffer is carved
 };
 
 static void tsi_nanosim_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (tsi_nanosim_buffer_context *) buffer->context;
-    tsi_dealloc(ctx->base, tsi::MemorySpace::SHARED_DRAM);
+    if (tsi_nanosim_staging.carved && tsi_nanosim_staging.buf == ctx->alloc) {
+        tsi_nanosim_staging = {};
+    }
+    tsi_dealloc(ctx->alloc, tsi::MemorySpace::SHARED_DRAM);
     delete ctx;
 }
 
@@ -1077,18 +1108,28 @@ static ggml_backend_buffer_t tsi_nanosim_buft_alloc_buffer(ggml_backend_buffer_t
         return nullptr;
     }
     size = size ? size : TSI_NANOSIM_ALIGNMENT;   // tsi_alloc does not reject 0 in release builds
-    void * base = nullptr;
+    // Until the core has a staging buffer, ask for TSI_NANOSIM_CARVE more: if the block lands inside the core's
+    // window, its first bytes become the staging buffer. Large buffers (the weights) are placed from the bottom of
+    // DRAM and cover the window, after which no separate allocation lands there (LFM2-8B-A1B, USER_DRAM_SIZE 24576);
+    // reserving a block up front instead leaves the weights no room to be placed.
+    const size_t extra = tsi_nanosim_staging.buf ? 0 : TSI_NANOSIM_CARVE;
+    void * alloc = nullptr;
     try {
-        base = tsi_alloc((int64_t) size, tsi::MemorySpace::SHARED_DRAM);
+        alloc = tsi_alloc((int64_t) (size + extra), tsi::MemorySpace::SHARED_DRAM);
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed: %s\n", __func__, size, e.what());
+        GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed: %s\n", __func__, size + extra, e.what());
         return nullptr;
     }
-    if (!base) {
-        GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed\n", __func__, size);
+    if (!alloc) {
+        GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed\n", __func__, size + extra);
         return nullptr;
     }
-    auto * ctx = new tsi_nanosim_buffer_context{ base, size };
+    void * base = alloc;
+    if (extra && tsi_nanosim_in_core_window(alloc, extra)) {
+        tsi_nanosim_staging = { alloc, extra, true };
+        base = (char *) alloc + extra;
+    }
+    auto * ctx = new tsi_nanosim_buffer_context{ base, size, alloc };
     return ggml_backend_buffer_init(buft, tsi_nanosim_buffer_i, ctx, size);
 }
 
