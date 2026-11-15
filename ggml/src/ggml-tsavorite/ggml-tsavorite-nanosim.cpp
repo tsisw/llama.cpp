@@ -1366,7 +1366,7 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
 
 // ---- fusion: several ggml nodes in one launch (GGML_TSAVORITE_NO_FUSE=1 turns it off) ----
 
-// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant,normquant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
+// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant,normquant,gluquant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
 static bool tsi_nanosim_fuse_on(const char * name) {
     static const std::string off = [] {
         const char * v = getenv("GGML_TSAVORITE_FUSE_OFF");
@@ -1380,8 +1380,8 @@ static bool tsi_nanosim_fuse_on(const char * name) {
 // activations into the matmul's scratch (rms_norm_f32 quantizes each output line as quantize_q8_0_f32 does), and the
 // MUL_MAT finds them there (tsi_nanosim_quantized) and skips its quantize launch.
 static bool tsi_nanosim_norm_quant_args(struct ggml_cgraph * cgraph, int next, const struct ggml_tensor * y,
-                                        tsi_ggml_kargs * a) {
-    if (!tsi_nanosim_fuse_on("normquant") || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+                                        tsi_ggml_kargs * a, const char * fusion = "normquant") {
+    if (!tsi_nanosim_fuse_on(fusion) || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
         y->ne[0] % 128) {
         return false;
     }
@@ -1561,6 +1561,35 @@ static int tsi_nanosim_fuse_mul_mat_f16_cont(struct ggml_cgraph * cgraph, int i)
     return blob && tsi_nanosim_mul_mat_f16_launch(blob, &m2) ? 3 : -1;
 }
 
+// SWIGLU whose output feeds a Q8_0 MUL_MAT (the FFN down projection): eltwise_f32 also writes the matmul's Q8_0
+// activations, as the fused norms do.
+static int tsi_nanosim_fuse_swiglu_quant(struct ggml_cgraph * cgraph, int i) {
+    struct ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_GLU || tsi_nanosim_skipped(GGML_OP_GLU) || !tsi_nanosim_eltwise_supports(node) ||
+        ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) {
+        return 0;
+    }
+    const struct ggml_tensor * ts[3] = { node, node->src[0], node->src[1] };
+    for (const struct ggml_tensor * t : ts) {
+        if ((uintptr_t) t->data % TSI_NANOSIM_ALIGNMENT) {
+            return 0;
+        }
+    }
+    tsi_blob_t blob = tsi_nanosim_blob("eltwise_f32");
+    tsi_ggml_kargs * a = blob ? tsi_nanosim_pack(node, 2) : nullptr;
+    if (!a) {
+        return -1;
+    }
+    if (!tsi_nanosim_norm_quant_args(cgraph, i + 1, node, a, "gluquant")) {
+        return 0;   // the slot is left unused; the node goes the ordinary way
+    }
+    if (!tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(node))) {
+        return -1;
+    }
+    tsi_nanosim_quantized = node;
+    return 1;
+}
+
 // Every node is enqueued, then the graph is waited for once (a no-op unless GGML_TSAVORITE_ENQUEUE_GRAPH, see
 // tsi_nanosim_launch): the CPU backend reads this backend's results in place (host buffers) once graph_compute returns.
 static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1585,6 +1614,19 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
             }
             if (fused > 0) {
                 i += fused - 1;
+                continue;
+            }
+            tsi_nanosim_cur_op = ggml_op_desc(node);
+        }
+        if (node->op == GGML_OP_GLU) {
+            tsi_nanosim_cur_op = "SWIGLU+quant";
+            const int fused = tsi_nanosim_fuse_swiglu_quant(cgraph, i);
+            if (fused < 0) {
+                fprintf(stderr, "ggml-tsavorite: eltwise_f32 SWIGLU+quant (%s) failed\n", node->name);
+                tsi_nanosim_wait();
+                return GGML_STATUS_FAILED;
+            }
+            if (fused > 0) {
                 continue;
             }
             tsi_nanosim_cur_op = ggml_op_desc(node);
