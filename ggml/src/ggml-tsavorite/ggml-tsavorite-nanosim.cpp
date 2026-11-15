@@ -1366,7 +1366,7 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
 
 // ---- fusion: several ggml nodes in one launch (GGML_TSAVORITE_NO_FUSE=1 turns it off) ----
 
-// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant,normquant,gluquant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
+// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant,normquant,gluquant,normrope turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
 static bool tsi_nanosim_fuse_on(const char * name) {
     static const std::string off = [] {
         const char * v = getenv("GGML_TSAVORITE_FUSE_OFF");
@@ -1561,6 +1561,46 @@ static int tsi_nanosim_fuse_mul_mat_f16_cont(struct ggml_cgraph * cgraph, int i)
     return blob && tsi_nanosim_mul_mat_f16_launch(blob, &m2) ? 3 : -1;
 }
 
+// RMS_NORM, MUL by its weight, then ROPE (Qwen3's and LFM2's Q/K norms): one rope_f32 launch that normalizes each head
+// row before rotating it (op_params[13] = 1, [14] = eps, src[2] = w); cos/sin stay once per token.
+static int tsi_nanosim_fuse_norm_rope(struct ggml_cgraph * cgraph, int i) {
+    if (!tsi_nanosim_fuse_on("normrope") || i + 2 >= cgraph->n_nodes || tsi_nanosim_skipped(GGML_OP_RMS_NORM) ||
+        tsi_nanosim_skipped(GGML_OP_MUL) || tsi_nanosim_skipped(GGML_OP_ROPE)) {
+        return 0;
+    }
+    struct ggml_tensor * norm = cgraph->nodes[i], * mul = cgraph->nodes[i + 1], * rope = cgraph->nodes[i + 2];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE ||
+        (mul->src[0] != norm && mul->src[1] != norm) || rope->src[0] != mul || !ggml_node_has_n_uses(cgraph, i, 1) ||
+        !ggml_node_has_n_uses(cgraph, i + 1, 1) || !tsi_nanosim_rms_norm_supports(norm) ||
+        !tsi_nanosim_rope_supports(rope) || norm->src[0]->ne[0] != rope->op_params[1]) {
+        return 0;
+    }
+    const struct ggml_tensor * x = norm->src[0], * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (!tsi_nanosim_f32_rows(w, x->ne[0]) || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
+        !ggml_are_same_shape(x, rope) || !tsi_nanosim_f32_rows(x, x->ne[0]) || (uintptr_t) w->data % TSI_NANOSIM_ALIGNMENT) {
+        return 0;
+    }
+    // the ROPE launch with x in place of its input
+    struct ggml_tensor r2 = *rope;
+    r2.src[0] = const_cast<struct ggml_tensor *>(x);
+    r2.src[2] = const_cast<struct ggml_tensor *>(w);
+    tsi_blob_t blob = tsi_nanosim_blob("rope_f32");
+    if (!blob || (uintptr_t) r2.data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) x->data % TSI_NANOSIM_ALIGNMENT) {
+        return blob ? 0 : -1;
+    }
+    tsi_ggml_kargs * a = tsi_nanosim_pack(&r2, 3);
+    if (!a) {
+        return -1;
+    }
+    float freq_base;
+    memcpy(&freq_base, (const int32_t *) rope->op_params + 5, sizeof(float));
+    const float theta_scale = powf(freq_base, -2.0f/rope->op_params[1]);   // as ggml_compute_forward_rope_flt
+    memcpy(&a->op_params[15], &theta_scale, sizeof(float));
+    a->op_params[13] = 1;
+    a->op_params[14] = norm->op_params[0];   // eps
+    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (rope->ne[2] * rope->ne[3])) ? 3 : -1;
+}
+
 // SWIGLU whose output feeds a Q8_0 MUL_MAT (the FFN down projection): eltwise_f32 also writes the matmul's Q8_0
 // activations, as the fused norms do.
 static int tsi_nanosim_fuse_swiglu_quant(struct ggml_cgraph * cgraph, int i) {
@@ -1627,6 +1667,20 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
                 return GGML_STATUS_FAILED;
             }
             if (fused > 0) {
+                continue;
+            }
+            tsi_nanosim_cur_op = ggml_op_desc(node);
+        }
+        if (node->op == GGML_OP_RMS_NORM) {
+            tsi_nanosim_cur_op = "RMS_NORM+MUL+ROPE";
+            const int fused = tsi_nanosim_fuse_norm_rope(cgraph, i);
+            if (fused < 0) {
+                fprintf(stderr, "ggml-tsavorite: rope_f32 RMS_NORM+MUL+ROPE (%s) failed\n", node->name);
+                tsi_nanosim_wait();
+                return GGML_STATUS_FAILED;
+            }
+            if (fused > 0) {
+                i += fused - 1;
                 continue;
             }
             tsi_nanosim_cur_op = ggml_op_desc(node);
