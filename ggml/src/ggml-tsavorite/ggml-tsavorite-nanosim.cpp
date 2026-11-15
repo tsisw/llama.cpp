@@ -506,14 +506,37 @@ static void * tsi_nanosim_core_staging(size_t bytes) {
 // launches of the graph wrote (the MoE router's expert ids come from ARGSORT). The node's staged tensors are packed
 // into the staging buffer from offset 0 (tsi_nanosim_staging_used, reset per node); in queue order the next node's
 // copies run after this node's launches, so the buffer needs no wait between nodes.
+// Leaves (op NONE, not views: graph inputs and the scheduler's copies of them, such as the KV-cache row indices and
+// token ids) are never written by the graph's own launches, so the host copies them instead, once per graph, into the staging buffer's top (tsi_nanosim_input_used bytes, reset per graph), which no
+// launch of the graph overwrites: no stage_lines launch for them.
 static size_t tsi_nanosim_staging_used = 0;
+static size_t tsi_nanosim_input_used   = 0;
+static std::unordered_map<const struct ggml_tensor *, int64_t> & tsi_nanosim_staged_inputs() {
+    static std::unordered_map<const struct ggml_tensor *, int64_t> m;
+    return m;
+}
 
 static bool tsi_nanosim_stage_for_core(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
     const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(t->data), off = h & 127;
     const size_t   bytes = (size_t) ((off + ggml_nbytes(t) + 127) / 128 * 128);
-    if (!tsi_nanosim_staging.buf || tsi_nanosim_staging.size < tsi_nanosim_staging_used + bytes) {
+    if (t->op == GGML_OP_NONE && !t->view_src && tsi_nanosim_staging.buf) {
+        auto it = tsi_nanosim_staged_inputs().find(t);
+        if (it != tsi_nanosim_staged_inputs().end()) {
+            d->data = it->second;
+            return true;
+        }
+        if (tsi_nanosim_staging.size >= tsi_nanosim_staging_used + tsi_nanosim_input_used + bytes) {
+            const size_t top = tsi_nanosim_staging.size - tsi_nanosim_input_used - bytes;   // 128-byte multiple
+            memcpy((char *) tsi_nanosim_staging.buf + top + off, t->data, ggml_nbytes(t));
+            tsi_nanosim_input_used += bytes;
+            d->data = (int64_t) ((uint64_t) tsi_shmem_handle_from_ptr(tsi_nanosim_staging.buf) + top + off);
+            tsi_nanosim_staged_inputs()[t] = d->data;
+            return true;
+        }
+    }
+    if (!tsi_nanosim_staging.buf || tsi_nanosim_staging.size < tsi_nanosim_staging_used + tsi_nanosim_input_used + bytes) {
         // a new buffer: the old one may still be read by pending launches, and this node's earlier copies are lost
-        if (tsi_nanosim_staging_used || !tsi_nanosim_wait()) {
+        if (tsi_nanosim_staging_used || tsi_nanosim_input_used || !tsi_nanosim_wait()) {
             GGML_LOG_ERROR("%s: %s: staging buffer too small for this node (%zu + %zu bytes)\n", __func__, t->name,
                            tsi_nanosim_staging_used, bytes);
             return false;
@@ -863,6 +886,7 @@ static std::unordered_map<const void *, tsi_nanosim_q8_weights> & tsi_nanosim_q8
 // The activations last quantized into scratch slots 0 and 1, so the next Q8_0 MUL_MAT of the same tensor reuses them
 // (Q, K and V share their input, as do gate and up): reset per graph and whenever the slots are written otherwise.
 static const struct ggml_tensor * tsi_nanosim_quantized = nullptr;
+static bool tsi_nanosim_fuse_on(const char * name);
 
 static void * tsi_nanosim_scratch(int slot, size_t bytes) {
     static void * ptr[2] = { nullptr, nullptr };
@@ -932,7 +956,7 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     // 1. the activations to Q8_0: one grid cell per row, unless the scratch already holds this tensor's
     tsi_ggml_kargs * a = nullptr;
     bool ok = true;
-    if (tsi_nanosim_quantized != x || getenv("GGML_TSAVORITE_NO_FUSE")) {
+    if (tsi_nanosim_quantized != x || !tsi_nanosim_fuse_on("quant")) {
         a = tsi_nanosim_args();
         if (!a) {
             if (!cached) tsi_nanosim_q8_free(tmp);
@@ -1342,6 +1366,16 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
 
 // ---- fusion: several ggml nodes in one launch (GGML_TSAVORITE_NO_FUSE=1 turns it off) ----
 
+// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
+static bool tsi_nanosim_fuse_on(const char * name) {
+    static const std::string off = [] {
+        const char * v = getenv("GGML_TSAVORITE_FUSE_OFF");
+        return v ? "," + std::string(v) + "," : std::string();
+    }();
+    static const bool none = getenv("GGML_TSAVORITE_NO_FUSE") && atoi(getenv("GGML_TSAVORITE_NO_FUSE")) != 0;
+    return !none && off.find("," + std::string(name) + ",") == std::string::npos;
+}
+
 // RMS_NORM followed by MUL by the norm weight (every norm of Qwen3 and LFM2): one rms_norm_f32 launch with the weight
 // as src[1]; the kernel rounds as the CPU's pair does. Returns the number of nodes it covered (0: not fused).
 static int tsi_nanosim_fuse_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
@@ -1429,10 +1463,62 @@ static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i)
     return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(add)) ? 3 : -1;
 }
 
+// MUL_MAT f16 (attention KQV) whose result is PERMUTEd and made CONTiguous (kqv_out): mul_mat_f16 stores each row at
+// its destination's strides, so it writes the CONT's tensor directly through the permutation and the copy goes.
+static int tsi_nanosim_fuse_mul_mat_f16_cont(struct ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes || tsi_nanosim_skipped(GGML_OP_MUL_MAT) || tsi_nanosim_skipped(GGML_OP_CONT)) {
+        return 0;
+    }
+    struct ggml_tensor * mm = cgraph->nodes[i], * perm = cgraph->nodes[i + 1], * cont = cgraph->nodes[i + 2];
+    if (mm->op != GGML_OP_MUL_MAT || perm->op != GGML_OP_PERMUTE || cont->op != GGML_OP_CONT || perm->src[0] != mm ||
+        cont->src[0] != perm || !ggml_node_has_n_uses(cgraph, i, 1) || mm->type != GGML_TYPE_F32 ||
+        cont->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont) || !tsi_nanosim_mul_mat_f16_supports(mm)) {
+        return 0;
+    }
+    // ggml_permute: dimension d of mm becomes dimension op_params[d] of the view. The CONT stores the view's elements
+    // contiguously in the view's order, whatever shape it is given (llama uses ggml_cont_2d), so the strides come from
+    // the view's sizes.
+    if (ggml_nelements(cont) != ggml_nelements(perm)) {
+        return 0;
+    }
+    size_t vs[4];
+    vs[0] = sizeof(float);
+    for (int k = 1; k < 4; k++) {
+        vs[k] = vs[k - 1] * (size_t) perm->ne[k - 1];
+    }
+    struct ggml_tensor m2 = *mm;
+    m2.data     = cont->data;
+    m2.view_src = nullptr;
+    for (int d = 0; d < 4; d++) {
+        const int axis = ggml_get_op_params_i32(perm, d);
+        if (axis < 0 || axis > 3) {
+            return 0;
+        }
+        m2.nb[d] = vs[axis];
+    }
+    if (m2.nb[0] != sizeof(float) || !tsi_nanosim_f32_rows(&m2, m2.ne[0]) || (uintptr_t) cont->data % TSI_NANOSIM_ALIGNMENT) {
+        return 0;
+    }
+    // The allocator may give the CONT the memory of the KQ softmax (dead after the MUL_MAT, unfused): writing the
+    // CONT's tensor while the MUL_MAT still reads its inputs would corrupt them (LFM2-1.2B, 2026-11-14).
+    const char * c0 = (const char *) cont->data, * c1 = c0 + ggml_nbytes(cont);
+    for (int k = 0; k < 2; k++) {
+        const struct ggml_tensor * src = mm->src[k];
+        const char * s0 = (const char *) src->data, * s1 = s0 + ggml_nbytes(src);
+        if (c0 < s1 && s0 < c1) {
+            return 0;
+        }
+    }
+    tsi_blob_t blob = tsi_nanosim_blob("mul_mat_f16");
+    return blob && tsi_nanosim_mul_mat_f16_launch(blob, &m2) ? 3 : -1;
+}
+
 // Every node is enqueued, then the graph is waited for once (a no-op unless GGML_TSAVORITE_ENQUEUE_GRAPH, see
 // tsi_nanosim_launch): the CPU backend reads this backend's results in place (host buffers) once graph_compute returns.
 static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     tsi_nanosim_quantized = nullptr;   // tensors of an earlier graph may share addresses with this one's
+    tsi_nanosim_input_used = 0;        // the previous graph has completed (graph_compute waits at its end)
+    tsi_nanosim_staged_inputs().clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (tsi_nanosim_is_noop(node)) {
@@ -1441,8 +1527,21 @@ static enum ggml_status tsi_nanosim_backend_graph_compute(ggml_backend_t backend
         tsi_nanosim_staging_used = 0;
         tsi_nanosim_cur_node     = node->name;
         tsi_nanosim_cur_op       = ggml_op_desc(node);
-        static const bool no_fuse = getenv("GGML_TSAVORITE_NO_FUSE") && atoi(getenv("GGML_TSAVORITE_NO_FUSE")) != 0;
-        if (!no_fuse && (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD)) {
+        if (tsi_nanosim_fuse_on("kqv") && node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
+            tsi_nanosim_cur_op = "MUL_MAT+CONT";
+            const int fused = tsi_nanosim_fuse_mul_mat_f16_cont(cgraph, i);
+            if (fused < 0) {
+                fprintf(stderr, "ggml-tsavorite: mul_mat_f16 MUL_MAT+CONT (%s) failed\n", node->name);
+                tsi_nanosim_wait();
+                return GGML_STATUS_FAILED;
+            }
+            if (fused > 0) {
+                i += fused - 1;
+                continue;
+            }
+            tsi_nanosim_cur_op = ggml_op_desc(node);
+        }
+        if ((node->op == GGML_OP_RMS_NORM && tsi_nanosim_fuse_on("rms")) || (node->op == GGML_OP_ADD && tsi_nanosim_fuse_on("add"))) {
             const bool add = node->op == GGML_OP_ADD;
             tsi_nanosim_cur_op = add ? "ADD+RMS_NORM+MUL" : "RMS_NORM+MUL";
             const int fused = add ? tsi_nanosim_fuse_add_rms_norm_mul(cgraph, i) : tsi_nanosim_fuse_rms_norm_mul(cgraph, i);
