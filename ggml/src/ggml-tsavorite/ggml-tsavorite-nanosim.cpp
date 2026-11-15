@@ -1366,7 +1366,7 @@ static bool tsi_nanosim_is_noop(const struct ggml_tensor * node) {
 
 // ---- fusion: several ggml nodes in one launch (GGML_TSAVORITE_NO_FUSE=1 turns it off) ----
 
-// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
+// GGML_TSAVORITE_FUSE_OFF=rms,add,kqv,quant,normquant turns single fusions off (triage); GGML_TSAVORITE_NO_FUSE=1 all of them.
 static bool tsi_nanosim_fuse_on(const char * name) {
     static const std::string off = [] {
         const char * v = getenv("GGML_TSAVORITE_FUSE_OFF");
@@ -1374,6 +1374,40 @@ static bool tsi_nanosim_fuse_on(const char * name) {
     }();
     static const bool none = getenv("GGML_TSAVORITE_NO_FUSE") && atoi(getenv("GGML_TSAVORITE_NO_FUSE")) != 0;
     return !none && off.find("," + std::string(name) + ",") == std::string::npos;
+}
+
+// The norm's output y feeds a Q8_0 MUL_MAT soon after (Q/K/V, gate/up): the fused norm launch also writes y's Q8_0
+// activations into the matmul's scratch (rms_norm_f32 quantizes each output line as quantize_q8_0_f32 does), and the
+// MUL_MAT finds them there (tsi_nanosim_quantized) and skips its quantize launch.
+static bool tsi_nanosim_norm_quant_args(struct ggml_cgraph * cgraph, int next, const struct ggml_tensor * y,
+                                        tsi_ggml_kargs * a) {
+    if (!tsi_nanosim_fuse_on("normquant") || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+        y->ne[0] % 128) {
+        return false;
+    }
+    bool used = false;
+    for (int j = next; j < cgraph->n_nodes && j < next + 16 && !used; j++) {
+        const struct ggml_tensor * n = cgraph->nodes[j];
+        used = n->op == GGML_OP_MUL_MAT && n->src[1] == y && n->src[0]->type == GGML_TYPE_Q8_0 &&
+               tsi_nanosim_mul_mat_q8_0_supports(n);
+    }
+    if (!used) {
+        return false;
+    }
+    const int64_t k = y->ne[0], m = y->ne[1], mp = (m + 15) / 16 * 16, nbl = k / 32;
+    void * xq = tsi_nanosim_scratch(0, (size_t) (mp * k));   // the sizes the MUL_MAT asks for: no reallocation there
+    void * xd = tsi_nanosim_scratch(1, (size_t) (mp * nbl * 128));
+    if (!xq || !xd) {
+        return false;
+    }
+    tsi_nanosim_raw_desc(&a->src[4], xq, GGML_TYPE_I8, { k, mp }, { 1, k });
+    const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(xd);
+    a->n_src         = 5;
+    a->op_params[8]  = 1;
+    a->op_params[10] = (int32_t) (uint32_t) h;
+    a->op_params[11] = (int32_t) (uint32_t) (h >> 32);
+    a->op_params[12] = (int32_t) (nbl * 128);
+    return true;
 }
 
 // RMS_NORM followed by MUL by the norm weight (every norm of Qwen3 and LFM2): one rms_norm_f32 launch with the weight
@@ -1411,7 +1445,14 @@ static int tsi_nanosim_fuse_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
     tsi_nanosim_desc(&a->src[0], norm->src[0]);
     tsi_nanosim_desc(&a->src[1], w);
     memcpy(a->op_params, norm->op_params, sizeof(a->op_params));
-    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(norm)) ? 2 : -1;
+    const bool quant = tsi_nanosim_norm_quant_args(cgraph, i + 2, mul, a);
+    if (!tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(norm))) {
+        return -1;
+    }
+    if (quant) {
+        tsi_nanosim_quantized = mul;
+    }
+    return 2;
 }
 
 // ADD (the residual), then RMS_NORM and MUL of its sum (every layer's second and later norms): one rms_norm_f32
@@ -1460,7 +1501,14 @@ static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i)
     tsi_nanosim_desc(&a->src[2], b);
     tsi_nanosim_desc(&a->src[3], add);
     memcpy(a->op_params, norm->op_params, sizeof(a->op_params));
-    return tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(add)) ? 3 : -1;
+    const bool quant = tsi_nanosim_norm_quant_args(cgraph, i + 3, mul, a);
+    if (!tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ggml_nrows(add))) {
+        return -1;
+    }
+    if (quant) {
+        tsi_nanosim_quantized = mul;
+    }
+    return 3;
 }
 
 // MUL_MAT f16 (attention KQV) whose result is PERMUTEd and made CONTiguous (kqv_out): mul_mat_f16 stores each row at
