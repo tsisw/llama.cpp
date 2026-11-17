@@ -1195,6 +1195,42 @@ static bool tsi_nanosim_fuse_on(const char * name) {
     return !none && off.find("," + std::string(name) + ",") == std::string::npos;
 }
 
+// A fused launch reads its inputs while it writes outputs that, unfused, are written only after those inputs are dead.
+// The allocator may then have placed an output over an input's memory at another offset (it reuses dead memory), and
+// writing output row r overwrites input rows still to be read (LFM2-8B-A1B with a compute buffer sized for 64 tokens,
+// 2026-11-16; the KQV fusion has the same hazard). Exact aliasing (same data, same shape and strides) is safe for the
+// row-wise kernels here: each line is read before it is written. Any other overlap, among outputs too, is not.
+static bool tsi_nanosim_fused_disjoint(std::initializer_list<const struct ggml_tensor *> outs,
+                                       std::initializer_list<const struct ggml_tensor *> ins) {
+    const auto overlap = [](const struct ggml_tensor * a, const struct ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+        if (!(a0 < b1 && b0 < a1)) {
+            return false;
+        }
+        return !(a->data == b->data && ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b));
+    };
+    for (auto o = outs.begin(); o != outs.end(); ++o) {
+        for (const struct ggml_tensor * in : ins) {
+            if (overlap(*o, in)) {
+                if (getenv("GGML_TSAVORITE_DEBUG")) {
+                    fprintf(stderr, "ggml-tsavorite: not fused: %s overlaps input %s\n", (*o)->name, in->name);
+                }
+                return false;
+            }
+        }
+        for (auto o2 = o + 1; o2 != outs.end(); ++o2) {
+            if (overlap(*o, *o2)) {
+                if (getenv("GGML_TSAVORITE_DEBUG")) {
+                    fprintf(stderr, "ggml-tsavorite: not fused: %s overlaps output %s\n", (*o)->name, (*o2)->name);
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The norm's output y feeds a Q8_0 MUL_MAT soon after (Q/K/V, gate/up): the fused norm launch also writes y's Q8_0
 // activations into the matmul's scratch (rms_norm_f32 quantizes each output line as quantize_q8_0_f32 does), and the
 // MUL_MAT finds them there (tsi_nanosim_quantized) and skips its quantize launch.
@@ -1248,7 +1284,7 @@ static int tsi_nanosim_fuse_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
         }
     }
     if ((uintptr_t) mul->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) norm->src[0]->data % TSI_NANOSIM_ALIGNMENT ||
-        (uintptr_t) w->data % TSI_NANOSIM_ALIGNMENT) {
+        (uintptr_t) w->data % TSI_NANOSIM_ALIGNMENT || !tsi_nanosim_fused_disjoint({ mul }, { norm->src[0], w })) {
         return 0;
     }
     tsi_blob_t blob = tsi_nanosim_blob("rms_norm_f32");
@@ -1304,6 +1340,9 @@ static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i)
         if ((uintptr_t) t->data % TSI_NANOSIM_ALIGNMENT) {
             return 0;
         }
+    }
+    if (!tsi_nanosim_fused_disjoint({ add, mul }, { x, b, w })) {
+        return 0;
     }
     tsi_blob_t blob = tsi_nanosim_blob("rms_norm_f32");
     tsi_ggml_kargs * a = blob ? tsi_nanosim_args() : nullptr;
@@ -1404,7 +1443,8 @@ static int tsi_nanosim_fuse_norm_rope(struct ggml_cgraph * cgraph, int i) {
     r2.src[0] = const_cast<struct ggml_tensor *>(x);
     r2.src[2] = const_cast<struct ggml_tensor *>(w);
     tsi_blob_t blob = tsi_nanosim_blob("rope_f32");
-    if (!blob || (uintptr_t) r2.data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) x->data % TSI_NANOSIM_ALIGNMENT) {
+    if (!blob || (uintptr_t) r2.data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) x->data % TSI_NANOSIM_ALIGNMENT ||
+        !tsi_nanosim_fused_disjoint({ rope }, { x, w })) {
         return blob ? 0 : -1;
     }
     tsi_ggml_kargs * a = tsi_nanosim_pack(&r2, 3);
