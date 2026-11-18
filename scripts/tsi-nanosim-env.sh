@@ -7,8 +7,14 @@ if [ -z "$NANOSIM_ROOT" ] || [ ! -x "$NANOSIM_ROOT/device/bin/TXEXtensaSimDevice
     echo "tsi-nanosim-env.sh: set NANOSIM_ROOT to a nanosim release (runtime/, device/bin/TXEXtensaSimDevice)" >&2
     return 1 2>/dev/null || exit 1
 fi
+TSI_XTENSA_SIM_DEVICE="${TSI_XTENSA_SIM_DEVICE:-$NANOSIM_ROOT/device/bin/TXEXtensaSimDevice}"
+if [ ! -x "$TSI_XTENSA_SIM_DEVICE" ]; then
+    echo "tsi-nanosim-env.sh: TSI_XTENSA_SIM_DEVICE=$TSI_XTENSA_SIM_DEVICE is not an executable" >&2
+    return 1 2>/dev/null || exit 1
+fi
+export NANOSIM_ROOT   # CMake reads it (GGML_TSAVORITE_TARGET=nanosim)
 export LD_LIBRARY_PATH="$NANOSIM_ROOT/runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TSI_RUNTIME_BINARY_DIR_OVERRIDE="$NANOSIM_ROOT/runtime"
-export TSI_XTENSA_SIM_DEVICE="${TSI_XTENSA_SIM_DEVICE:-$NANOSIM_ROOT/device/bin/TXEXtensaSimDevice}"
+export TSI_XTENSA_SIM_DEVICE
 export TSI_TXE_DEVICE=xtensa_sim
 export USER_DRAM_SIZE="${USER_DRAM_SIZE:-4096}"
