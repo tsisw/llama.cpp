@@ -1418,14 +1418,16 @@ static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i)
 }
 
 // MUL_MAT f16 (attention KQV) whose result is PERMUTEd and made CONTiguous (kqv_out): mul_mat_f16 stores each row at
-// its destination's strides, so it writes the CONT's tensor directly through the permutation and the copy goes.
+// its destination's strides, so it writes the CONT's tensor directly through the permutation and the copy goes. The
+// MUL_MAT's result is then never written, so neither it nor the PERMUTE view may have another user or be an output.
 static int tsi_nanosim_fuse_mul_mat_f16_cont(struct ggml_cgraph * cgraph, int i) {
     if (i + 2 >= cgraph->n_nodes || tsi_nanosim_skipped(GGML_OP_MUL_MAT) || tsi_nanosim_skipped(GGML_OP_CONT)) {
         return 0;
     }
     struct ggml_tensor * mm = cgraph->nodes[i], * perm = cgraph->nodes[i + 1], * cont = cgraph->nodes[i + 2];
     if (mm->op != GGML_OP_MUL_MAT || perm->op != GGML_OP_PERMUTE || cont->op != GGML_OP_CONT || perm->src[0] != mm ||
-        cont->src[0] != perm || !ggml_node_has_n_uses(cgraph, i, 1) || mm->type != GGML_TYPE_F32 ||
+        cont->src[0] != perm || !ggml_node_has_n_uses(cgraph, i, 1) || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        (perm->flags & GGML_TENSOR_FLAG_OUTPUT) || mm->type != GGML_TYPE_F32 ||
         cont->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont) || !tsi_nanosim_mul_mat_f16_supports(mm)) {
         return 0;
     }
