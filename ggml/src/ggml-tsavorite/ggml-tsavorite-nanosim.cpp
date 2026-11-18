@@ -1697,10 +1697,12 @@ static const char * tsi_nanosim_device_get_description(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
 }
 
-// Shared DRAM as USER_DRAM_SIZE (MiB) asks for; the runtime does not report free memory, so free = total.
+// Shared DRAM as USER_DRAM_SIZE (MiB) asks for, else the runtime's default for the Xtensa ISS device (256 MiB:
+// runtime include/device/posix/PosixSimDeviceConfig.h kDefaultPosixSimUserDramBytes, which XtensaSimDeviceConfig
+// inherits); the runtime does not report free memory, so free = total.
 static void tsi_nanosim_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     const char * mib = getenv("USER_DRAM_SIZE");
-    *total = mib ? (size_t) strtoull(mib, nullptr, 10) << 20 : 0;
+    *total = (size_t) (mib ? strtoull(mib, nullptr, 10) : 256) << 20;
     *free  = *total;
     GGML_UNUSED(dev);
 }
