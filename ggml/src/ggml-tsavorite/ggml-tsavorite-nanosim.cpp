@@ -76,17 +76,32 @@ static void tsi_nanosim_print_stats() {
     }
 }
 
+// The event callback runs on a runtime thread, and a launch can fault before tsi_nanosim_launch has recorded it: the
+// records are published and read under this mutex, and a fault on a command not yet recorded is kept until it is.
+static std::mutex   tsi_nanosim_cmds_mutex;
+static tsi_cmd_id_t tsi_nanosim_early_fault = TSI_CMD_INVALID;
+static int          tsi_nanosim_early_status = 0;
+
+static void tsi_nanosim_print_fault(int status, tsi_cmd_id_t cmd, const tsi_nanosim_cmd_record * r) {
+    fprintf(stderr, "ggml-tsavorite: queue fault, status %d, command %llu: %s\n", status, (unsigned long long) cmd,
+            r ? r->node : "(not a recorded launch)");
+    if (r) {
+        fprintf(stderr, "ggml-tsavorite: faulting launch: blob %s\n", r->blob);
+    }
+}
+
 static void tsi_nanosim_on_event(const tsi_event_t * ev, void *) {
     if (!ev || ev->status == 0) {
         return;
     }
+    std::lock_guard<std::mutex> lock(tsi_nanosim_cmds_mutex);
     const tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[ev->cmd_id % 8192];
-    fprintf(stderr, "ggml-tsavorite: queue fault, status %d, command %llu: %s\n", (int) ev->status,
-            (unsigned long long) ev->cmd_id,
-            ev->cmd_id != TSI_CMD_INVALID && r.cmd == ev->cmd_id ? r.node : "(not a recorded launch)");
-    if (ev->cmd_id != TSI_CMD_INVALID && r.cmd == ev->cmd_id) {
-        fprintf(stderr, "ggml-tsavorite: faulting launch: blob %s\n", r.blob);
+    if (ev->cmd_id != TSI_CMD_INVALID && r.cmd != ev->cmd_id) {   // recorded by tsi_nanosim_launch shortly
+        tsi_nanosim_early_fault  = ev->cmd_id;
+        tsi_nanosim_early_status = (int) ev->status;
+        return;
     }
+    tsi_nanosim_print_fault((int) ev->status, ev->cmd_id, ev->cmd_id != TSI_CMD_INVALID ? &r : nullptr);
 }
 
 static tsi_nanosim_runtime & tsi_nanosim_rt() {
@@ -193,17 +208,18 @@ static tsi_blob_t tsi_nanosim_blob(const char * name) {
 static uint32_t tsi_nanosim_pending = 0;      // launches enqueued since the last wait
 static uint32_t tsi_nanosim_slots_used = 0;   // argument slots handed out since the last wait
 
+// The counts are cleared only once the wait succeeds: after a failed wait the launches are unresolved, so every later
+// wait fails too and no caller reuses or frees memory they may use.
 static bool tsi_nanosim_wait() {
+    if (tsi_nanosim_pending) {
+        TSI_Status st = tsi_wait_queue(tsi_nanosim_rt().queue, TSI_FOREVER);
+        if (st != 0) {
+            GGML_LOG_ERROR("%s: tsi_wait_queue failed, status %d\n", __func__, (int) st);
+            return false;
+        }
+    }
+    tsi_nanosim_pending    = 0;
     tsi_nanosim_slots_used = 0;
-    if (!tsi_nanosim_pending) {
-        return true;
-    }
-    tsi_nanosim_pending = 0;
-    TSI_Status st = tsi_wait_queue(tsi_nanosim_rt().queue, TSI_FOREVER);
-    if (st != 0) {
-        GGML_LOG_ERROR("%s: tsi_wait_queue failed, status %d\n", __func__, (int) st);
-        return false;
-    }
     return true;
 }
 
@@ -219,15 +235,23 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
         GGML_LOG_ERROR("%s: tsi_enqueue_blob_launch failed, status %d\n", __func__, (int) tsi_last_status());
         return false;
     }
-    tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[cmd % 8192];
-    r.cmd  = cmd;
-    r.blob = "?";
+    const char * blob_name = "?";
     for (const auto & kv : rt.blobs) {
         if (kv.second == blob) {
-            r.blob = kv.first.c_str();
+            blob_name = kv.first.c_str();
         }
     }
-    snprintf(r.node, sizeof(r.node), "%s (%u cells)", tsi_nanosim_cur_node, cells);
+    {
+        std::lock_guard<std::mutex> lock(tsi_nanosim_cmds_mutex);
+        tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[cmd % 8192];
+        r.cmd  = cmd;
+        r.blob = blob_name;
+        snprintf(r.node, sizeof(r.node), "%s (%u cells)", tsi_nanosim_cur_node, cells);
+        if (tsi_nanosim_early_fault == cmd) {
+            tsi_nanosim_print_fault(tsi_nanosim_early_status, cmd, &r);
+            tsi_nanosim_early_fault = TSI_CMD_INVALID;
+        }
+    }
     static const bool stats = getenv("GGML_TSAVORITE_STATS") && atoi(getenv("GGML_TSAVORITE_STATS")) != 0;
     if (stats) {
         static bool registered = false;
@@ -236,7 +260,7 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
             tsi_nanosim_stats();
             atexit(tsi_nanosim_print_stats);
         }
-        tsi_nanosim_stats()[std::string(r.blob) + " " + tsi_nanosim_cur_op]++;
+        tsi_nanosim_stats()[std::string(blob_name) + " " + tsi_nanosim_cur_op]++;
     }
     tsi_nanosim_pending++;
     return !sync || tsi_nanosim_wait();
@@ -687,6 +711,8 @@ static bool tsi_nanosim_q8_repack(const struct ggml_tensor * w, tsi_nanosim_q8_w
         r.dw = tsi_alloc(nbl * n * (int64_t) sizeof(float), tsi::MemorySpace::SHARED_DRAM);
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: %s: tsi_alloc failed: %s\n", __func__, w->name, e.what());
+        if (r.wq) tsi_dealloc(r.wq, tsi::MemorySpace::SHARED_DRAM);   // nothing launched reads it yet
+        r = {};
         return false;
     }
     int8_t * wq = (int8_t *) r.wq;
@@ -703,9 +729,12 @@ static bool tsi_nanosim_q8_repack(const struct ggml_tensor * w, tsi_nanosim_q8_w
     return true;
 }
 
+// Pending launches may read the repack: if the wait for them fails, it is kept (leaked), not freed under them.
 static void tsi_nanosim_q8_free(tsi_nanosim_q8_weights & r) {
-    if (r.wq || r.dw || r.ds) {
-        tsi_nanosim_wait();   // pending launches may read the repack
+    if ((r.wq || r.dw || r.ds) && !tsi_nanosim_wait()) {
+        GGML_LOG_ERROR("%s: the queue did not drain; the Q8_0 repack is not freed\n", __func__);
+        r = {};
+        return;
     }
     if (r.wq) tsi_dealloc(r.wq, tsi::MemorySpace::SHARED_DRAM);
     if (r.dw) tsi_dealloc(r.dw, tsi::MemorySpace::SHARED_DRAM);
@@ -713,8 +742,8 @@ static void tsi_nanosim_q8_free(tsi_nanosim_q8_weights & r) {
     r = {};
 }
 
-// Repacks of weights-buffer tensors, by data address; other tensors are repacked for each launch (their contents
-// may change between launches).
+// Repacks of weights-buffer tensors, by data address, freed with their weights buffer (tsi_nanosim_buffer_free);
+// other tensors are repacked for each launch (their contents may change between launches).
 static std::unordered_map<const void *, tsi_nanosim_q8_weights> & tsi_nanosim_q8_cache() {
     static std::unordered_map<const void *, tsi_nanosim_q8_weights> cache;
     return cache;
@@ -865,6 +894,8 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
         try {
             e->ds = tsi_alloc(n * srow, tsi::MemorySpace::SHARED_DRAM);
         } catch (const std::exception &) {
+            e->ds = nullptr;
+            if (!cached) tsi_nanosim_q8_free(tmp);
             return false;
         }
         const float * dw = (const float *) e->dw;
@@ -1051,8 +1082,25 @@ struct tsi_nanosim_buffer_context {
     size_t size;
 };
 
+// Pending launches may use the buffer, and the Q8_0 repacks of its weights: wait for them, then free both. If the
+// wait fails they are kept (leaked) rather than freed under a launch.
 static void tsi_nanosim_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (tsi_nanosim_buffer_context *) buffer->context;
+    const char * b0 = (const char *) ctx->base, * b1 = b0 + ctx->size;
+    if (!tsi_nanosim_wait()) {
+        GGML_LOG_ERROR("%s: the queue did not drain; the buffer is not freed\n", __func__);
+        delete ctx;
+        return;
+    }
+    auto & cache = tsi_nanosim_q8_cache();
+    for (auto it = cache.begin(); it != cache.end();) {
+        if ((const char *) it->first >= b0 && (const char *) it->first < b1) {
+            tsi_nanosim_q8_free(it->second);
+            it = cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
     tsi_dealloc(ctx->base, tsi::MemorySpace::SHARED_DRAM);
     delete ctx;
 }
