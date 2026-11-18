@@ -77,8 +77,11 @@ static void tsi_nanosim_print_stats() {
 }
 
 // The event callback runs on a runtime thread, and a launch can fault before tsi_nanosim_launch has recorded it: the
-// records are published and read under this mutex, and a fault on a command not yet recorded is kept until it is.
+// records are published and read under this mutex. A fault on a command not yet recorded while a launch is being
+// enqueued is kept until that launch is recorded (and printed then either way); other commands (blob loads) are not
+// recorded and their faults print at once.
 static std::mutex   tsi_nanosim_cmds_mutex;
+static bool         tsi_nanosim_enqueuing = false;
 static tsi_cmd_id_t tsi_nanosim_early_fault = TSI_CMD_INVALID;
 static int          tsi_nanosim_early_status = 0;
 
@@ -96,12 +99,14 @@ static void tsi_nanosim_on_event(const tsi_event_t * ev, void *) {
     }
     std::lock_guard<std::mutex> lock(tsi_nanosim_cmds_mutex);
     const tsi_nanosim_cmd_record & r = tsi_nanosim_cmds[ev->cmd_id % 8192];
-    if (ev->cmd_id != TSI_CMD_INVALID && r.cmd != ev->cmd_id) {   // recorded by tsi_nanosim_launch shortly
+    if (tsi_nanosim_enqueuing && ev->cmd_id != TSI_CMD_INVALID && r.cmd != ev->cmd_id &&
+        tsi_nanosim_early_fault == TSI_CMD_INVALID) {   // possibly the launch being enqueued: recorded shortly
         tsi_nanosim_early_fault  = ev->cmd_id;
         tsi_nanosim_early_status = (int) ev->status;
         return;
     }
-    tsi_nanosim_print_fault((int) ev->status, ev->cmd_id, ev->cmd_id != TSI_CMD_INVALID ? &r : nullptr);
+    const bool recorded = ev->cmd_id != TSI_CMD_INVALID && r.cmd == ev->cmd_id;
+    tsi_nanosim_print_fault((int) ev->status, ev->cmd_id, recorded ? &r : nullptr);
 }
 
 static tsi_nanosim_runtime & tsi_nanosim_rt() {
@@ -230,8 +235,18 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
     tsi_spmd_args_t grid = {};
     grid.numGridSizes = 1;
     grid.gridSize[0]  = cells;
+    {
+        std::lock_guard<std::mutex> lock(tsi_nanosim_cmds_mutex);
+        tsi_nanosim_enqueuing = true;
+    }
     const tsi_cmd_id_t cmd = tsi_enqueue_blob_launch(rt.queue, blob, tsi_shmem_handle_from_ptr(args), args_size, &grid);
     if (cmd == TSI_CMD_INVALID) {
+        std::lock_guard<std::mutex> lock(tsi_nanosim_cmds_mutex);
+        tsi_nanosim_enqueuing = false;
+        if (tsi_nanosim_early_fault != TSI_CMD_INVALID) {
+            tsi_nanosim_print_fault(tsi_nanosim_early_status, tsi_nanosim_early_fault, nullptr);
+            tsi_nanosim_early_fault = TSI_CMD_INVALID;
+        }
         GGML_LOG_ERROR("%s: tsi_enqueue_blob_launch failed, status %d\n", __func__, (int) tsi_last_status());
         return false;
     }
@@ -247,8 +262,10 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
         r.cmd  = cmd;
         r.blob = blob_name;
         snprintf(r.node, sizeof(r.node), "%s (%u cells)", tsi_nanosim_cur_node, cells);
-        if (tsi_nanosim_early_fault == cmd) {
-            tsi_nanosim_print_fault(tsi_nanosim_early_status, cmd, &r);
+        tsi_nanosim_enqueuing = false;
+        if (tsi_nanosim_early_fault != TSI_CMD_INVALID) {
+            tsi_nanosim_print_fault(tsi_nanosim_early_status, tsi_nanosim_early_fault,
+                                    tsi_nanosim_early_fault == cmd ? &r : nullptr);
             tsi_nanosim_early_fault = TSI_CMD_INVALID;
         }
     }
