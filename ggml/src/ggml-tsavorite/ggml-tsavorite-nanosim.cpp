@@ -32,6 +32,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -773,10 +774,14 @@ static void tsi_nanosim_q8_free(tsi_nanosim_q8_weights & r) {
     r = {};
 }
 
-// Repacks of weights-buffer tensors, by data address, freed with their weights buffer (tsi_nanosim_buffer_free);
-// other tensors are repacked for each launch (their contents may change between launches).
-static std::unordered_map<const void *, tsi_nanosim_q8_weights> & tsi_nanosim_q8_cache() {
-    static std::unordered_map<const void *, tsi_nanosim_q8_weights> cache;
+// Repacks of weights-buffer tensors, by data address and the repacked shape [K, N] (MUL_MAT_ID repacks its experts as
+// one [K, N * n_expert] matrix, whose scale stride differs from a [K, N] repack of the same address), freed with their
+// weights buffer (tsi_nanosim_buffer_free); other tensors are repacked for each launch (their contents may change
+// between launches).
+typedef std::tuple<const void *, int64_t, int64_t> tsi_nanosim_q8_key;   // data, K, N
+
+static std::map<tsi_nanosim_q8_key, tsi_nanosim_q8_weights> & tsi_nanosim_q8_cache() {
+    static std::map<tsi_nanosim_q8_key, tsi_nanosim_q8_weights> cache;
     return cache;
 }
 
@@ -834,10 +839,11 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     tsi_nanosim_q8_weights wr, tmp;
     const bool cached = w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     if (cached) {
-        auto it = tsi_nanosim_q8_cache().find(w->data);
+        const tsi_nanosim_q8_key key(w->data, k, n);
+        auto it = tsi_nanosim_q8_cache().find(key);
         if (it == tsi_nanosim_q8_cache().end()) {
             if (!tsi_nanosim_q8_repack(w, wr)) return false;
-            tsi_nanosim_q8_cache()[w->data] = wr;
+            tsi_nanosim_q8_cache()[key] = wr;
         } else {
             wr = it->second;
         }
@@ -914,7 +920,7 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     const bool cached = w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     tsi_nanosim_q8_weights * e = &tmp;
     if (cached) {
-        e = &tsi_nanosim_q8_cache()[w->data];
+        e = &tsi_nanosim_q8_cache()[tsi_nanosim_q8_key(w->data, k, n)];
     } else if (!tsi_nanosim_wait()) {   // the host reads the tensor: wait for the launches that may write it
         return false;
     }
@@ -990,7 +996,7 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
     w2.nb[2] = w2.nb[3] = w->nb[1] * ncols;
     tsi_nanosim_q8_weights wr, tmp;
     const bool cached = w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-    tsi_nanosim_q8_weights * e = cached ? &tsi_nanosim_q8_cache()[w->data] : &tmp;
+    tsi_nanosim_q8_weights * e = cached ? &tsi_nanosim_q8_cache()[tsi_nanosim_q8_key(w->data, k, ncols)] : &tmp;
     if (!cached && !tsi_nanosim_wait()) {   // the host reads the tensor: wait for the launches that may write it
         return false;
     }
@@ -1125,7 +1131,8 @@ static void tsi_nanosim_buffer_free(ggml_backend_buffer_t buffer) {
     }
     auto & cache = tsi_nanosim_q8_cache();
     for (auto it = cache.begin(); it != cache.end();) {
-        if ((const char *) it->first >= b0 && (const char *) it->first < b1) {
+        const char * p = (const char *) std::get<0>(it->first);
+        if (p >= b0 && p < b1) {
             tsi_nanosim_q8_free(it->second);
             it = cache.erase(it);
         } else {
