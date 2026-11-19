@@ -284,6 +284,36 @@ static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, u
     return !sync || tsi_nanosim_wait();
 }
 
+// ---- shared DRAM ----
+
+// Every block this backend holds (buffers, Q8_0 repacks, scratch, argument slots), so get_memory can report what is
+// left. Throws as tsi_alloc does.
+static std::mutex tsi_nanosim_dram_mutex;
+static std::unordered_map<void *, size_t> tsi_nanosim_dram_blocks;
+static size_t tsi_nanosim_dram_used = 0;
+
+static void * tsi_nanosim_alloc(int64_t bytes) {
+    void * p = tsi_alloc(bytes, tsi::MemorySpace::SHARED_DRAM);
+    if (p) {
+        std::lock_guard<std::mutex> lock(tsi_nanosim_dram_mutex);
+        tsi_nanosim_dram_blocks[p] = (size_t) bytes;
+        tsi_nanosim_dram_used += (size_t) bytes;
+    }
+    return p;
+}
+
+static void tsi_nanosim_dealloc(void * p) {
+    {
+        std::lock_guard<std::mutex> lock(tsi_nanosim_dram_mutex);
+        auto it = tsi_nanosim_dram_blocks.find(p);
+        if (it != tsi_nanosim_dram_blocks.end()) {
+            tsi_nanosim_dram_used -= it->second;
+            tsi_nanosim_dram_blocks.erase(it);
+        }
+    }
+    tsi_dealloc(p, tsi::MemorySpace::SHARED_DRAM);
+}
+
 // ---- kernel arguments ----
 
 static_assert(sizeof(tsi_ggml_kargs) % 8 == 0, "the grid tail follows the argument block");
@@ -300,7 +330,7 @@ static tsi_ggml_kargs * tsi_nanosim_args() {
     static uint32_t next = 0;
     if (!ring) {
         try {
-            ring = (char *) tsi_alloc((int64_t) TSI_NANOSIM_ARG_SLOTS * TSI_NANOSIM_ARG_STRIDE, tsi::MemorySpace::SHARED_DRAM);
+            ring = (char *) tsi_nanosim_alloc((int64_t) TSI_NANOSIM_ARG_SLOTS * TSI_NANOSIM_ARG_STRIDE);
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("%s: tsi_alloc failed: %s\n", __func__, e.what());
             return nullptr;
@@ -739,11 +769,11 @@ struct tsi_nanosim_q8_weights {
 static bool tsi_nanosim_q8_repack(const struct ggml_tensor * w, tsi_nanosim_q8_weights & r) {
     const int64_t k = w->ne[0], n = w->ne[1], nbl = k / 32;
     try {
-        r.wq = tsi_alloc(n * k, tsi::MemorySpace::SHARED_DRAM);
-        r.dw = tsi_alloc(nbl * n * (int64_t) sizeof(float), tsi::MemorySpace::SHARED_DRAM);
+        r.wq = tsi_nanosim_alloc(n * k);
+        r.dw = tsi_nanosim_alloc(nbl * n * (int64_t) sizeof(float));
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: %s: tsi_alloc failed: %s\n", __func__, w->name, e.what());
-        if (r.wq) tsi_dealloc(r.wq, tsi::MemorySpace::SHARED_DRAM);   // nothing launched reads it yet
+        if (r.wq) tsi_nanosim_dealloc(r.wq);   // nothing launched reads it yet
         r = {};
         return false;
     }
@@ -768,9 +798,9 @@ static void tsi_nanosim_q8_free(tsi_nanosim_q8_weights & r) {
         r = {};
         return;
     }
-    if (r.wq) tsi_dealloc(r.wq, tsi::MemorySpace::SHARED_DRAM);
-    if (r.dw) tsi_dealloc(r.dw, tsi::MemorySpace::SHARED_DRAM);
-    if (r.ds) tsi_dealloc(r.ds, tsi::MemorySpace::SHARED_DRAM);
+    if (r.wq) tsi_nanosim_dealloc(r.wq);
+    if (r.dw) tsi_nanosim_dealloc(r.dw);
+    if (r.ds) tsi_nanosim_dealloc(r.ds);
     r = {};
 }
 
@@ -799,11 +829,11 @@ static void * tsi_nanosim_scratch(int slot, size_t bytes) {
         if (ptr[slot] && !tsi_nanosim_wait()) {   // pending launches may still use the old buffer
             return nullptr;
         }
-        if (ptr[slot]) tsi_dealloc(ptr[slot], tsi::MemorySpace::SHARED_DRAM);
+        if (ptr[slot]) tsi_nanosim_dealloc(ptr[slot]);
         ptr[slot]  = nullptr;
         size[slot] = 0;
         try {
-            ptr[slot] = tsi_alloc((int64_t) bytes, tsi::MemorySpace::SHARED_DRAM);
+            ptr[slot] = tsi_nanosim_alloc((int64_t) bytes);
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed: %s\n", __func__, bytes, e.what());
             return nullptr;
@@ -929,7 +959,7 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     }
     if (!e->ds) {
         try {
-            e->ds = tsi_alloc(n * srow, tsi::MemorySpace::SHARED_DRAM);
+            e->ds = tsi_nanosim_alloc(n * srow);
         } catch (const std::exception &) {
             e->ds = nullptr;
             if (!cached) tsi_nanosim_q8_free(tmp);
@@ -1139,7 +1169,7 @@ static void tsi_nanosim_buffer_free(ggml_backend_buffer_t buffer) {
             ++it;
         }
     }
-    tsi_dealloc(ctx->base, tsi::MemorySpace::SHARED_DRAM);
+    tsi_nanosim_dealloc(ctx->base);
     delete ctx;
 }
 
@@ -1206,7 +1236,7 @@ static ggml_backend_buffer_t tsi_nanosim_buft_alloc_buffer(ggml_backend_buffer_t
     size = size ? size : TSI_NANOSIM_ALIGNMENT;   // tsi_alloc does not reject 0 in release builds
     void * base = nullptr;
     try {
-        base = tsi_alloc((int64_t) size, tsi::MemorySpace::SHARED_DRAM);
+        base = tsi_nanosim_alloc((int64_t) size);
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: tsi_alloc(%zu) failed: %s\n", __func__, size, e.what());
         return nullptr;
@@ -1737,13 +1767,36 @@ static const char * tsi_nanosim_device_get_description(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
 }
 
-// Shared DRAM as USER_DRAM_SIZE (MiB) asks for, else the runtime's default for the Xtensa ISS device (256 MiB:
-// runtime include/device/posix/PosixSimDeviceConfig.h kDefaultPosixSimUserDramBytes, which XtensaSimDeviceConfig
-// inherits); the runtime does not report free memory, so free = total.
+// Shared DRAM as USER_DRAM_SIZE asks for, read as the runtime reads it (MiB, std::stoull: the leading digits, so "4G"
+// is 4 MiB; runtime include/tsi-rt/TXEDeviceConfig.h setupFromEnvironment), else the runtime's default for the Xtensa
+// ISS device (256 MiB: include/device/posix/PosixSimDeviceConfig.h kDefaultPosixSimUserDramBytes, which
+// XtensaSimDeviceConfig inherits).
+static size_t tsi_nanosim_dram_total() {
+    static const size_t total = [] {
+        const char * v = getenv("USER_DRAM_SIZE");
+        if (!v) {
+            return (size_t) 256 << 20;
+        }
+        char * end = nullptr;
+        const unsigned long long mib = strtoull(v, &end, 10);
+        if (end == v) {
+            GGML_LOG_WARN("%s: USER_DRAM_SIZE=\"%s\" is not a number of MiB; the runtime rejects it\n", __func__, v);
+            return (size_t) 0;
+        }
+        if (*end) {
+            GGML_LOG_WARN("%s: USER_DRAM_SIZE=\"%s\" is in MiB, without a suffix: the runtime reads %llu MiB\n",
+                          __func__, v, mib);
+        }
+        return (size_t) mib << 20;
+    }();
+    return total;
+}
+
+// Free is the total less the blocks this backend holds; the runtime reports neither its own use nor fragmentation.
 static void tsi_nanosim_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    const char * mib = getenv("USER_DRAM_SIZE");
-    *total = (size_t) (mib ? strtoull(mib, nullptr, 10) : 256) << 20;
-    *free  = *total;
+    *total = tsi_nanosim_dram_total();
+    std::lock_guard<std::mutex> lock(tsi_nanosim_dram_mutex);
+    *free = *total > tsi_nanosim_dram_used ? *total - tsi_nanosim_dram_used : 0;
     GGML_UNUSED(dev);
 }
 
