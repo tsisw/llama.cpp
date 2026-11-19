@@ -174,6 +174,38 @@ static bool tsi_nanosim_start() {
 
 // The blob of a kernel, loaded on first use from GGML_TSAVORITE_KERNEL_DIR.
 static bool tsi_nanosim_wait();
+static tsi_ggml_kargs * tsi_nanosim_args();
+
+// The kernels' status line (tsi_ggml_kargs.h, ggml-tsi-kernel include/tsi_txe_status.h): every launch's block points
+// at it; a kernel stores {code, op, detail, kernel version} there only when it rejects a launch (another argument
+// block version, arguments outside its contract) or skips a row (an index out of range), so it stays zero otherwise.
+static uint32_t * tsi_nanosim_status_line = nullptr;
+static int64_t tsi_nanosim_status_handle();
+
+// A blob built for another argument block would return without writing dst: every kernel answers a block of version
+// TSI_GGML_KARGS_PROBE with TSI_GGML_STATUS_BAD_VERSION; one built before the status line (version 5) answers nothing.
+// Run with the queue drained.
+static bool tsi_nanosim_probe(tsi_blob_t blob) {
+    tsi_ggml_kargs * a      = tsi_nanosim_args();
+    const int64_t    status = tsi_nanosim_status_handle();
+    if (!a || !status) {
+        return false;
+    }
+    memset(a, 0, sizeof(*a));
+    a->version = TSI_GGML_KARGS_PROBE;
+    a->status  = status;
+    tsi_spmd_args_t grid = {};
+    grid.numGridSizes = 1;
+    grid.gridSize[0]  = 1;
+    const tsi_cmd_id_t cmd = tsi_enqueue_blob_launch(tsi_nanosim_rt().queue, blob, tsi_shmem_handle_from_ptr(a), sizeof(*a), &grid);
+    if (cmd == TSI_CMD_INVALID || tsi_wait_queue(tsi_nanosim_rt().queue, TSI_FOREVER) != 0) {
+        return false;
+    }
+    uint32_t * line = tsi_nanosim_status_line;
+    const bool ok   = line[0] == TSI_GGML_STATUS_BAD_VERSION && line[2] == TSI_GGML_KARGS_PROBE;
+    memset(line, 0, 4 * sizeof(uint32_t));
+    return ok;
+}
 
 // The blob of a kernel, loaded on first use. A blob load is a device command of its own: issued while a launch is in
 // flight it took the place of that launch's response on device 0 and the runtime failed the launch without a message
@@ -199,6 +231,12 @@ static tsi_blob_t tsi_nanosim_blob(const char * name) {
         GGML_LOG_ERROR("%s: tsi_blob_load(%s) failed, status %d\n", __func__, path.c_str(), (int) tsi_last_status());
         return 0;
     }
+    if (!tsi_nanosim_probe(blob)) {
+        GGML_LOG_ERROR("%s: %s does not answer the argument block probe: built for another version than %d; rebuild "
+                       "the kernels\n", __func__, path.c_str(), TSI_GGML_KARGS_VERSION);
+        tsi_blob_unload(blob);
+        return 0;
+    }
     rt.blobs[name] = blob;
     return blob;
 }
@@ -215,7 +253,8 @@ static uint32_t tsi_nanosim_pending = 0;      // launches enqueued since the las
 static uint32_t tsi_nanosim_slots_used = 0;   // argument slots handed out since the last wait
 
 // The counts are cleared only once the wait succeeds: after a failed wait the launches are unresolved, so every later
-// wait fails too and no caller reuses or frees memory they may use.
+// wait fails too and no caller reuses or frees memory they may use. A report on the status line fails the wait too
+// (the launches are done), once.
 static bool tsi_nanosim_wait() {
     if (tsi_nanosim_pending) {
         TSI_Status st = tsi_wait_queue(tsi_nanosim_rt().queue, TSI_FOREVER);
@@ -226,6 +265,16 @@ static bool tsi_nanosim_wait() {
     }
     tsi_nanosim_pending    = 0;
     tsi_nanosim_slots_used = 0;
+    uint32_t * line = tsi_nanosim_status_line;
+    if (line && line[0]) {
+        static const char * what[] = { "", "an argument block of another version", "arguments outside its contract",
+                                       "an index out of range (that row skipped)" };
+        GGML_LOG_ERROR("%s: a kernel reported %s: TSI op %u, detail %u, kernel version %u (backend %d), last node %s\n",
+                       __func__, line[0] < 4 ? what[line[0]] : "an unknown status", line[1], line[2], line[3],
+                       TSI_GGML_KARGS_VERSION, tsi_nanosim_cur_node);
+        memset(line, 0, 4 * sizeof(uint32_t));
+        return false;
+    }
     return true;
 }
 
@@ -233,6 +282,11 @@ static bool tsi_nanosim_wait() {
 static bool tsi_nanosim_launch(tsi_blob_t blob, void * args, size_t args_size, uint32_t cells) {
     static const bool sync = !(getenv("GGML_TSAVORITE_ENQUEUE_GRAPH") && atoi(getenv("GGML_TSAVORITE_ENQUEUE_GRAPH")) != 0);
     tsi_nanosim_runtime & rt = tsi_nanosim_rt();
+    const int64_t status = tsi_nanosim_status_handle();
+    if (!status) {
+        return false;
+    }
+    ((tsi_ggml_kargs *) args)->status = status;
     tsi_spmd_args_t grid = {};
     grid.numGridSizes = 1;
     grid.gridSize[0]  = cells;
@@ -312,6 +366,20 @@ static void tsi_nanosim_dealloc(void * p) {
         }
     }
     tsi_dealloc(p, tsi::MemorySpace::SHARED_DRAM);
+}
+
+// The status line's handle, allocated (and zeroed) on first use; 0 when that fails.
+static int64_t tsi_nanosim_status_handle() {
+    if (!tsi_nanosim_status_line) {
+        try {
+            tsi_nanosim_status_line = (uint32_t *) tsi_nanosim_alloc(TSI_NANOSIM_ALIGNMENT);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: tsi_alloc failed: %s\n", __func__, e.what());
+            return 0;
+        }
+        memset(tsi_nanosim_status_line, 0, TSI_NANOSIM_ALIGNMENT);
+    }
+    return (int64_t) tsi_shmem_handle_from_ptr(tsi_nanosim_status_line);
 }
 
 // ---- kernel arguments ----
