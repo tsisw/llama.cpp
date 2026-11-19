@@ -344,9 +344,54 @@ static tsi_ggml_kargs * tsi_nanosim_args() {
     return a;
 }
 
+// The kernels' operation and type ids (tsi_ggml_kargs.h TSI_GGML_OP_*, TSI_GGML_TYPE_*): ggml's enum values move when
+// upstream adds an operation or a type, so they never reach a kernel. Only nodes supports_op accepted are mapped.
+static uint32_t tsi_nanosim_op(const struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_ADD:        return TSI_GGML_OP_ADD;
+        case GGML_OP_MUL:        return TSI_GGML_OP_MUL;
+        case GGML_OP_DIV:        return TSI_GGML_OP_DIV;
+        case GGML_OP_SCALE:      return TSI_GGML_OP_SCALE;
+        case GGML_OP_SUM_ROWS:   return TSI_GGML_OP_SUM_ROWS;
+        case GGML_OP_CLAMP:      return TSI_GGML_OP_CLAMP;
+        case GGML_OP_CONCAT:     return TSI_GGML_OP_CONCAT;
+        case GGML_OP_CPY:        return TSI_GGML_OP_CPY;
+        case GGML_OP_CONT:       return TSI_GGML_OP_CONT;
+        case GGML_OP_GET_ROWS:   return TSI_GGML_OP_GET_ROWS;
+        case GGML_OP_SET_ROWS:   return TSI_GGML_OP_SET_ROWS;
+        case GGML_OP_SSM_CONV:   return TSI_GGML_OP_SSM_CONV;
+        case GGML_OP_RMS_NORM:   return TSI_GGML_OP_RMS_NORM;
+        case GGML_OP_ROPE:       return TSI_GGML_OP_ROPE;
+        case GGML_OP_SOFT_MAX:   return TSI_GGML_OP_SOFT_MAX;
+        case GGML_OP_ARGSORT:    return TSI_GGML_OP_ARGSORT;
+        case GGML_OP_MUL_MAT:    return TSI_GGML_OP_MUL_MAT;
+        case GGML_OP_MUL_MAT_ID: return TSI_GGML_OP_MUL_MAT_ID;
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) return TSI_GGML_OP_SIGMOID;
+            break;
+        case GGML_OP_GLU:
+            if (ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU) return TSI_GGML_OP_SWIGLU;
+            break;
+        default:
+            break;
+    }
+    GGML_ABORT("%s: %s has no TSI operation id", __func__, ggml_op_desc(node));
+}
+
+static int32_t tsi_nanosim_type(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32: return TSI_GGML_TYPE_F32;
+        case GGML_TYPE_F16: return TSI_GGML_TYPE_F16;
+        case GGML_TYPE_I8:  return TSI_GGML_TYPE_I8;
+        case GGML_TYPE_I32: return TSI_GGML_TYPE_I32;
+        case GGML_TYPE_I64: return TSI_GGML_TYPE_I64;
+        default:            return TSI_GGML_TYPE_OTHER;
+    }
+}
+
 static void tsi_nanosim_desc(tsi_ggml_tensor * d, const struct ggml_tensor * t) {
     d->data = tsi_shmem_handle_from_ptr(t->data);
-    d->type = (int32_t) t->type;
+    d->type = tsi_nanosim_type(t->type);
     d->pad  = 0;
     for (int i = 0; i < 4; i++) {
         d->ne[i] = t->ne[i];
@@ -361,7 +406,7 @@ static tsi_ggml_kargs * tsi_nanosim_pack(const struct ggml_tensor * node, int n_
     }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
-    a->op      = (uint32_t) node->op;
+    a->op      = tsi_nanosim_op(node);
     a->n_src   = (uint32_t) n_src;
     tsi_nanosim_desc(&a->dst, node);
     for (int i = 0; i < n_src; i++) {
@@ -898,11 +943,11 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
         }
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
-        a->op      = (uint32_t) GGML_OP_NONE;
+        a->op      = TSI_GGML_OP_NONE;
         a->n_src   = 2;
-        tsi_nanosim_raw_desc(&a->dst, xq, GGML_TYPE_I8, { k, mp }, { 1, k });
+        tsi_nanosim_raw_desc(&a->dst, xq, TSI_GGML_TYPE_I8, { k, mp }, { 1, k });
         tsi_nanosim_desc(&a->src[0], x);
-        tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
+        tsi_nanosim_raw_desc(&a->src[1], xd, TSI_GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
         ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) m);
         tsi_nanosim_quantized = ok ? x : nullptr;
     }
@@ -910,13 +955,13 @@ static bool tsi_nanosim_mul_mat_q8_0_launch(tsi_blob_t blob, struct ggml_tensor 
     if (ok && (ok = (a = tsi_nanosim_args()) != nullptr)) {
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
-        a->op      = (uint32_t) GGML_OP_MUL_MAT;
+        a->op      = TSI_GGML_OP_MUL_MAT;
         a->n_src   = 4;
         tsi_nanosim_desc(&a->dst, node);
-        tsi_nanosim_raw_desc(&a->src[0], wr.wq, GGML_TYPE_I8, { k, n }, { 1, k });
-        tsi_nanosim_raw_desc(&a->src[1], wr.dw, GGML_TYPE_F32, { n, nbl }, { 4, n * 4 });
-        tsi_nanosim_raw_desc(&a->src[2], xq, GGML_TYPE_I8, { k, mp }, { 1, k });
-        tsi_nanosim_raw_desc(&a->src[3], xd, GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
+        tsi_nanosim_raw_desc(&a->src[0], wr.wq, TSI_GGML_TYPE_I8, { k, n }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[1], wr.dw, TSI_GGML_TYPE_F32, { n, nbl }, { 4, n * 4 });
+        tsi_nanosim_raw_desc(&a->src[2], xq, TSI_GGML_TYPE_I8, { k, mp }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[3], xd, TSI_GGML_TYPE_F32, { nbl * 32, mp }, { 4, nbl * 128 });
         ok = tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (n / 128));
     }
     if (!cached) {
@@ -981,12 +1026,12 @@ static bool tsi_nanosim_get_rows_q8_0_launch(tsi_blob_t blob, struct ggml_tensor
     }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
-    a->op      = (uint32_t) GGML_OP_GET_ROWS;
+    a->op      = TSI_GGML_OP_GET_ROWS;
     a->n_src   = 3;
     tsi_nanosim_desc(&a->dst, node);
-    tsi_nanosim_raw_desc(&a->src[0], wr.wq, GGML_TYPE_I8, { k, n }, { 1, k });
+    tsi_nanosim_raw_desc(&a->src[0], wr.wq, TSI_GGML_TYPE_I8, { k, n }, { 1, k });
     tsi_nanosim_desc(&a->src[1], ix);
-    tsi_nanosim_raw_desc(&a->src[2], wr.ds, GGML_TYPE_F32, { k / 32, n }, { 4, srow });
+    tsi_nanosim_raw_desc(&a->src[2], wr.ds, TSI_GGML_TYPE_F32, { k / 32, n }, { 4, srow });
     const bool ok = tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) ix->ne[0]);
     if (!cached) {
         tsi_nanosim_q8_free(tmp);
@@ -1043,21 +1088,21 @@ static bool tsi_nanosim_mul_mat_id_launch(tsi_blob_t blob, struct ggml_tensor * 
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
         a->n_src   = 2;
-        tsi_nanosim_raw_desc(&a->dst, xq, GGML_TYPE_I8, { k, rp }, { 1, k });
+        tsi_nanosim_raw_desc(&a->dst, xq, TSI_GGML_TYPE_I8, { k, rp }, { 1, k });
         tsi_nanosim_desc(&a->src[0], x);
-        tsi_nanosim_raw_desc(&a->src[1], xd, GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
+        tsi_nanosim_raw_desc(&a->src[1], xd, TSI_GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
         ok = tsi_nanosim_launch(qblob, a, sizeof(*a), (uint32_t) rows);
     }
     if (ok && (ok = (a = tsi_nanosim_args()) != nullptr)) {   // 2. one grid cell per (slot, token, 128-column tile)
         memset(a, 0, sizeof(*a));
         a->version = TSI_GGML_KARGS_VERSION;
-        a->op      = (uint32_t) GGML_OP_MUL_MAT_ID;
+        a->op      = TSI_GGML_OP_MUL_MAT_ID;
         a->n_src   = 5;
         tsi_nanosim_desc(&a->dst, node);
-        tsi_nanosim_raw_desc(&a->src[0], wr.wq, GGML_TYPE_I8, { k, ncols }, { 1, k });
-        tsi_nanosim_raw_desc(&a->src[1], wr.dw, GGML_TYPE_F32, { ncols, nbl }, { 4, ncols * 4 });
-        tsi_nanosim_raw_desc(&a->src[2], xq, GGML_TYPE_I8, { k, rp }, { 1, k });
-        tsi_nanosim_raw_desc(&a->src[3], xd, GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
+        tsi_nanosim_raw_desc(&a->src[0], wr.wq, TSI_GGML_TYPE_I8, { k, ncols }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[1], wr.dw, TSI_GGML_TYPE_F32, { ncols, nbl }, { 4, ncols * 4 });
+        tsi_nanosim_raw_desc(&a->src[2], xq, TSI_GGML_TYPE_I8, { k, rp }, { 1, k });
+        tsi_nanosim_raw_desc(&a->src[3], xd, TSI_GGML_TYPE_F32, { nbl * 32, rp }, { 4, nbl * 128 });
         tsi_nanosim_desc(&a->src[4], ids);
         a->op_params[0] = (int32_t) x->ne[1];
         ok = tsi_nanosim_launch(blob, a, sizeof(*a), (uint32_t) (node->ne[1] * node->ne[2] * (node->ne[0] / 128)));
@@ -1371,7 +1416,7 @@ static bool tsi_nanosim_norm_quant_args(struct ggml_cgraph * cgraph, int next, c
     if (!xq || !xd) {
         return false;
     }
-    tsi_nanosim_raw_desc(&a->src[4], xq, GGML_TYPE_I8, { k, mp }, { 1, k });
+    tsi_nanosim_raw_desc(&a->src[4], xq, TSI_GGML_TYPE_I8, { k, mp }, { 1, k });
     const uint64_t h = (uint64_t) tsi_shmem_handle_from_ptr(xd);
     a->n_src         = 5;
     a->op_params[8]  = 1;
@@ -1410,7 +1455,7 @@ static int tsi_nanosim_fuse_rms_norm_mul(struct ggml_cgraph * cgraph, int i) {
     }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
-    a->op      = (uint32_t) GGML_OP_RMS_NORM;
+    a->op      = TSI_GGML_OP_RMS_NORM;
     a->n_src   = 2;
     tsi_nanosim_desc(&a->dst, mul);
     tsi_nanosim_desc(&a->src[0], norm->src[0]);
@@ -1467,7 +1512,7 @@ static int tsi_nanosim_fuse_add_rms_norm_mul(struct ggml_cgraph * cgraph, int i)
     }
     memset(a, 0, sizeof(*a));
     a->version = TSI_GGML_KARGS_VERSION;
-    a->op      = (uint32_t) GGML_OP_RMS_NORM;
+    a->op      = TSI_GGML_OP_RMS_NORM;
     a->n_src   = 4;
     tsi_nanosim_desc(&a->dst, mul);
     tsi_nanosim_desc(&a->src[0], x);
