@@ -268,7 +268,7 @@ static bool tsi_nanosim_wait() {
     uint32_t * line = tsi_nanosim_status_line;
     if (line && line[0]) {
         static const char * what[] = { "", "an argument block of another version", "arguments outside its contract",
-                                       "an index out of range (that row skipped)" };
+                                       "an index out of range" };
         GGML_LOG_ERROR("%s: a kernel reported %s: TSI op %u, detail %u, kernel version %u (backend %d), last node %s\n",
                        __func__, line[0] < 4 ? what[line[0]] : "an unknown status", line[1], line[2], line[3],
                        TSI_GGML_KARGS_VERSION, tsi_nanosim_cur_node);
