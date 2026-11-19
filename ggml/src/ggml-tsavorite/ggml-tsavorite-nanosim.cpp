@@ -340,9 +340,15 @@ static tsi_ggml_kargs * tsi_nanosim_pack(const struct ggml_tensor * node, int n_
     return a;
 }
 
+// The data address a launch will see is a multiple of align: buffers are TSI_NANOSIM_ALIGNMENT aligned, so only a
+// view's offset (from its root tensor) can break it. supports_op must accept nothing that a launch rejects.
+static bool tsi_nanosim_offs_aligned(const struct ggml_tensor * t, size_t align = TSI_NANOSIM_ALIGNMENT) {
+    return !(t->view_src && t->view_offs % align);
+}
+
 // Every row start 128-byte aligned: the data offset (for a view; buffers are 128-byte aligned) and nb[1..3].
 static bool tsi_nanosim_rows_aligned(const struct ggml_tensor * t) {
-    if (t->view_src && t->view_offs % TSI_NANOSIM_ALIGNMENT) {
+    if (!tsi_nanosim_offs_aligned(t)) {
         return false;
     }
     return t->nb[1] % TSI_NANOSIM_ALIGNMENT == 0 && t->nb[2] % TSI_NANOSIM_ALIGNMENT == 0 &&
@@ -380,7 +386,7 @@ static bool tsi_nanosim_f32_rows(const struct ggml_tensor * t, int64_t ne0) {
         ne0 >= (1 << 24) || ggml_nrows(t) > INT32_MAX) {
         return false;
     }
-    if (t->view_src && t->view_offs % TSI_NANOSIM_ALIGNMENT) {
+    if (!tsi_nanosim_offs_aligned(t)) {
         return false;
     }
     for (int d = 1; d < 4; d++) {
@@ -453,14 +459,19 @@ static bool tsi_nanosim_eltwise_launch(tsi_blob_t blob, struct ggml_tensor * nod
 
 // ---- row copies (ggml-tsi-kernel nanosim/copy_rows.c) ----
 
+// The copy kernel's (and soft_max's mask) alignment: f32 rows in whole 128-byte lines, f16 rows in half lines.
+static size_t tsi_nanosim_copy_align(enum ggml_type type) {
+    return type == GGML_TYPE_F16 ? TSI_NANOSIM_ALIGNMENT / 2 : TSI_NANOSIM_ALIGNMENT;
+}
+
 // A destination the copy kernel writes whole rows of: f32 (128-byte aligned rows) or f16 (64-byte aligned rows).
 static bool tsi_nanosim_copy_dst(const struct ggml_tensor * t, int64_t ne0) {
     if (!t || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || t->ne[0] != ne0 ||
         t->nb[0] != ggml_type_size(t->type)) {
         return false;
     }
-    const size_t align = t->type == GGML_TYPE_F32 ? TSI_NANOSIM_ALIGNMENT : TSI_NANOSIM_ALIGNMENT / 2;
-    if (t->view_src && t->view_offs % align) {
+    const size_t align = tsi_nanosim_copy_align(t->type);
+    if (!tsi_nanosim_offs_aligned(t, align)) {
         return false;
     }
     for (int d = 1; d < 4; d++) {
@@ -482,7 +493,8 @@ static bool tsi_nanosim_copy_supports(const struct ggml_tensor * node) {
         case GGML_OP_CONT:
         case GGML_OP_CPY:   // source rows back to back into a contiguous f32 or f16 destination
             return (node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16) && ggml_is_contiguous(node) &&
-                   ggml_nelements(node) == ggml_nelements(s) && !(node->view_src && node->view_offs % 64);
+                   ggml_nelements(node) == ggml_nelements(s) &&
+                   tsi_nanosim_offs_aligned(node, tsi_nanosim_copy_align(node->type));
         case GGML_OP_GET_ROWS:
             return node->type == GGML_TYPE_F32 && ix && ix->type == GGML_TYPE_I32 && ggml_is_contiguous(ix) &&
                    s->ne[2] == 1 && s->ne[3] == 1 && ix->ne[1] == 1 && ix->ne[2] == 1 && ix->ne[3] == 1 &&
@@ -499,15 +511,15 @@ static bool tsi_nanosim_copy_supports(const struct ggml_tensor * node) {
 static bool tsi_nanosim_copy_launch(tsi_blob_t blob, struct ggml_tensor * node) {
     const struct ggml_tensor * s = node->src[0], * ix = node->src[1];
     if (getenv("GGML_TSAVORITE_DEBUG")) {
-        fprintf(stderr, "copy_launch %s %s: src %#llx (mod128 %u) dst %#llx (mod128 %u) ix %p\n", ggml_op_name(node->op),
-                node->name, (unsigned long long) tsi_shmem_handle_from_ptr(s->data), (unsigned) ((uintptr_t) s->data % 128),
-                (unsigned long long) tsi_shmem_handle_from_ptr(node->data), (unsigned) ((uintptr_t) node->data % 128),
-                ix ? ix->data : nullptr);
+        fprintf(stderr, "copy_launch %s %s: src %#llx (mod %u: %u) dst %#llx (mod %u: %u) ix %p\n",
+                ggml_op_name(node->op), node->name, (unsigned long long) tsi_shmem_handle_from_ptr(s->data),
+                TSI_NANOSIM_ALIGNMENT, (unsigned) ((uintptr_t) s->data % TSI_NANOSIM_ALIGNMENT),
+                (unsigned long long) tsi_shmem_handle_from_ptr(node->data), TSI_NANOSIM_ALIGNMENT,
+                (unsigned) ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT), ix ? ix->data : nullptr);
     }
     const bool indexed = node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SET_ROWS;
 
-    if ((uintptr_t) s->data % TSI_NANOSIM_ALIGNMENT ||
-        (uintptr_t) node->data % (node->type == GGML_TYPE_F16 ? 64 : TSI_NANOSIM_ALIGNMENT)) {
+    if ((uintptr_t) s->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->data % tsi_nanosim_copy_align(node->type)) {
         GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
         return false;
     }
@@ -539,7 +551,7 @@ static bool tsi_nanosim_soft_max_supports(const struct ggml_tensor * node) {
 static bool tsi_nanosim_soft_max_launch(tsi_blob_t blob, struct ggml_tensor * node) {
     const struct ggml_tensor * m = node->src[1];
     if ((uintptr_t) node->data % TSI_NANOSIM_ALIGNMENT || (uintptr_t) node->src[0]->data % TSI_NANOSIM_ALIGNMENT ||
-        (m && (uintptr_t) m->data % (m->type == GGML_TYPE_F16 ? 64 : TSI_NANOSIM_ALIGNMENT))) {
+        (m && (uintptr_t) m->data % tsi_nanosim_copy_align(m->type))) {
         GGML_LOG_ERROR("%s: %s: unaligned data\n", __func__, node->name);
         return false;
     }
@@ -556,7 +568,7 @@ static bool tsi_nanosim_mul_mat_f16_supports(const struct ggml_tensor * node) {
         x->ne[2] % w->ne[2] || x->ne[3] % w->ne[3] || node->ne[0] != w->ne[1] || node->ne[1] != x->ne[1]) {
         return false;
     }
-    if (w->view_src && w->view_offs % TSI_NANOSIM_ALIGNMENT) {
+    if (!tsi_nanosim_offs_aligned(w)) {
         return false;
     }
     for (int d = 1; d < 4; d++) {
@@ -611,10 +623,11 @@ static bool tsi_nanosim_rope_launch(tsi_blob_t blob, struct ggml_tensor * node) 
 // ---- element gathers (ggml-tsi-kernel nanosim/gather_f32.c): LFM2's short convolution, the MoE router ----
 
 // CONCAT along dim 0 (3-D), SSM_CONV, and CPY/CONT of any f32 source into a contiguous f32 dst; dst element count a
-// multiple of 32 and dst 128-byte aligned (checked at launch).
+// multiple of 32 and dst 128-byte aligned.
 static bool tsi_nanosim_gather_supports(const struct ggml_tensor * node) {
     const struct ggml_tensor * s0 = node->src[0], * s1 = node->src[1];
-    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || ggml_nelements(node) % 32 || node->ne[3] != 1) {
+    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || !tsi_nanosim_offs_aligned(node) ||
+        ggml_nelements(node) % 32 || node->ne[3] != 1) {
         return false;
     }
     switch (node->op) {
@@ -633,11 +646,12 @@ static bool tsi_nanosim_gather_supports(const struct ggml_tensor * node) {
 }
 
 // The MoE router's small ops (any element count; a partial last line is merged): GET_ROWS of f32 by i32 indices
-// with any strides, SUM_ROWS, CLAMP, DIV (b broadcast where its ne is 1).
+// with any strides, SUM_ROWS, CLAMP, DIV (b broadcast where its ne is 1); dst 128-byte aligned (CLAMP is in place:
+// its view keeps its source's offset).
 static bool tsi_nanosim_gather_small_supports(const struct ggml_tensor * node) {
     const struct ggml_tensor * s0 = node->src[0], * s1 = node->src[1];
-    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || node->ne[3] != 1 || !tsi_nanosim_f32_any(s0) ||
-        s0->ne[3] != 1 || ggml_nelements(node) >= (1 << 30)) {
+    if (!tsi_nanosim_f32_any(node) || !ggml_is_contiguous(node) || !tsi_nanosim_offs_aligned(node) ||
+        node->ne[3] != 1 || !tsi_nanosim_f32_any(s0) || s0->ne[3] != 1 || ggml_nelements(node) >= (1 << 30)) {
         return false;
     }
     switch (node->op) {
@@ -680,7 +694,7 @@ static bool tsi_nanosim_argsort_supports(const struct ggml_tensor * node) {
     const struct ggml_tensor * s = node->src[0];
     return s && ggml_get_op_params_i32(node, 0) == GGML_SORT_ORDER_DESC && node->type == GGML_TYPE_I32 &&
            ggml_is_contiguous(node) && node->ne[0] == 32 && tsi_nanosim_f32_rows(s, 32) && ggml_is_contiguous(s) &&
-           ggml_are_same_shape(s, node) && ggml_nrows(node) < (1 << 24) && !(node->view_src && node->view_offs % TSI_NANOSIM_ALIGNMENT);
+           ggml_are_same_shape(s, node) && ggml_nrows(node) < (1 << 24) && tsi_nanosim_offs_aligned(node);
 }
 
 static bool tsi_nanosim_argsort_launch(tsi_blob_t blob, struct ggml_tensor * node) {
