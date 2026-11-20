@@ -3125,6 +3125,135 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// The node sequences of a decoder layer that a backend may fuse into one kernel (the Tsavorite nanosim backend fuses each
+// of these), run as whole graphs so that the fused result is compared with the CPU's node-by-node one:
+//   ADD_RMS_NORM_MUL_MM  ADD (the residual), RMS_NORM of the sum, MUL by the weight, a Q8_0 MUL_MAT of the result added
+//                        back to the sum (the fused norm also stores the sum and the matmul's Q8_0 activations)
+//   RMS_NORM_MUL_ROPE    the Q/K norm: RMS_NORM of head rows, MUL by the weight, ROPE (NeoX)
+//   KQV_PERMUTE_CONT     MUL_MAT of the f16 V cache (grouped-query heads) by the f32 attention weights, PERMUTE to
+//                        [head dim, heads, tokens], CONT
+//   SWIGLU_MM            SWIGLU of gate and up, then the Q8_0 down projection (the fused SWIGLU also writes its Q8_0
+//                        activations)
+struct test_layer_fusion : public test_case {
+    enum kind_t { ADD_RMS_NORM_MUL_MM, RMS_NORM_MUL_ROPE, KQV_PERMUTE_CONT, SWIGLU_MM };
+    const kind_t  kind;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        static const char * names[] = { "ADD_RMS_NORM_MUL_MM", "RMS_NORM_MUL_ROPE", "KQV_PERMUTE_CONT", "SWIGLU_MM" };
+        return names[kind];
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return kind == RMS_NORM_MUL_ROPE ? 1e-6 : 5e-4;   // f16 and Q8_0 products as test_mul_mat
+    }
+
+    test_layer_fusion(kind_t kind = ADD_RMS_NORM_MUL_MM, int64_t n_tokens = 1) : kind(kind), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const float eps = 1e-6f;
+        switch (kind) {
+            case ADD_RMS_NORM_MUL_MM: {
+                const int64_t n = 1024;
+                ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+                ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+                ggml_tensor * p = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, n);
+                ggml_tensor * sum = ggml_add(ctx, x, b);
+                ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
+                ggml_tensor * out = ggml_add(ctx, sum, ggml_mul_mat(ctx, p, y));
+                ggml_set_name(out, "out");
+                return out;
+            }
+            case RMS_NORM_MUL_ROPE: {
+                const int64_t hd = 128, nh = 8;
+                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, n_tokens);
+                ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+                ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+                ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+                ggml_tensor * out = ggml_rope_ext(ctx, y, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, 4096, 1000000.0f, 1.0f,
+                                                  0.0f, 1.0f, 32.0f, 1.0f);
+                ggml_set_name(out, "out");
+                return out;
+            }
+            case KQV_PERMUTE_CONT: {
+                const int64_t hd = 128, nh = 8, nkh = 2, n_kv = 64;
+                ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, hd, nkh);
+                ggml_tensor * kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tokens, nh);
+                ggml_tensor * kqv = ggml_permute(ctx, ggml_mul_mat(ctx, v, kq), 0, 2, 1, 3);
+                ggml_tensor * out = ggml_cont_2d(ctx, kqv, hd * nh, n_tokens);
+                ggml_set_name(out, "out");
+                return out;
+            }
+            case SWIGLU_MM: {
+                const int64_t n = 512, n_ff = 1024;
+                ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_tokens);
+                ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_tokens);
+                ggml_tensor * down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_ff, n);
+                ggml_tensor * out = ggml_mul_mat(ctx, down, ggml_swiglu_split(ctx, gate, up));
+                ggml_set_name(out, "out");
+                return out;
+            }
+        }
+        GGML_ABORT("unknown kind");
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {   // positions
+                std::vector<int> data(ggml_nelements(t));
+                for (int & d : data) {
+                    d = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// A CPY into, or a CLAMP of, a view at a byte offset into a larger tensor: a backend whose kernels need aligned rows
+// must decline the node (the scheduler then gives it to the CPU) rather than accept it and fail when it runs.
+struct test_view_offset : public test_case {
+    const ggml_op   op;               // GGML_OP_CPY or GGML_OP_CLAMP
+    const ggml_type type_dst;
+    const bool      transposed_src;   // CPY from a non-contiguous source
+    const size_t    offset;           // bytes
+
+    std::string vars() override {
+        return std::string("op=") + ggml_op_name(op) + "," + VARS_TO_STR3(type_dst, transposed_src, offset);
+    }
+
+    test_view_offset(ggml_op op = GGML_OP_CPY, ggml_type type_dst = GGML_TYPE_F32, bool transposed_src = false,
+                     size_t offset = 64)
+        : op(op), type_dst(type_dst), transposed_src(transposed_src), offset(offset) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ne0 = 64, ne1 = 4;
+        const size_t  es  = ggml_type_size(type_dst);
+        ggml_tensor * root = ggml_new_tensor_1d(ctx, type_dst, ne0 * ne1 + (int64_t) (offset / es) + 64);
+        ggml_tensor * view = ggml_view_2d(ctx, root, ne0, ne1, ne0 * es, offset);
+        ggml_tensor * out;
+        if (op == GGML_OP_CLAMP) {
+            out = ggml_clamp(ctx, view, -0.5f, 0.5f);
+        } else {
+            ggml_tensor * src = transposed_src ? ggml_transpose(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne1, ne0))
+                                               : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+            out = ggml_cpy(ctx, src, view);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -6658,6 +6787,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    {
+        // Model shapes (Qwen3-0.6B, LFM2-1.2B decode and short prompts): Q8_0 weights [k, m], f32 activations [k, n];
+        // the shapes the Tsavorite nanosim backend's Q8_0 kernel takes (m and k multiples of 128)
+        const int64_t shapes[][3] = { {1024, 1, 1024}, {1024, 5, 1024}, {2048, 17, 1024}, {1024, 5, 2048},
+                                      {1024, 3, 3072}, {3072, 1, 1024}, {512, 6, 2048}, {128, 1, 128} };
+        for (const auto & s : shapes) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], s[1], s[2], {1, 1}, {1, 1}));
+        }
+    }
+    {
+        // MoE expert products with LFM2-8B-A1B-like shapes (Q8_0 experts, 4 used per token): broadcast activations
+        // (gate/up) and one row per slot (down); N and K multiples of 128
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 256, 2, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 256, 2, 384));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 4, true, 128, 1, 2048));
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -7176,6 +7322,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_topk_moe({ 8, 22, 1, 1 }, 4, /*with_norm*/ false, /*delayed_softmax*/ true));
     test_cases.emplace_back(new test_topk_moe({ 32, 22, 1, 1 }, 8, /*with_norm*/ false, /*delayed_softmax*/ true));
+
+    // the decoder-layer fusions, and views at offsets that rows of 128 bytes do not allow (test_view_offset)
+    for (int64_t n_tokens : {1, 5}) {
+        for (auto kind : { test_layer_fusion::ADD_RMS_NORM_MUL_MM, test_layer_fusion::RMS_NORM_MUL_ROPE,
+                           test_layer_fusion::KQV_PERMUTE_CONT, test_layer_fusion::SWIGLU_MM }) {
+            test_cases.emplace_back(new test_layer_fusion(kind, n_tokens));
+        }
+    }
+    for (size_t offset : {64, 128}) {
+        test_cases.emplace_back(new test_view_offset(GGML_OP_CPY, GGML_TYPE_F32, false, offset));
+        test_cases.emplace_back(new test_view_offset(GGML_OP_CPY, GGML_TYPE_F16, false, offset));
+        test_cases.emplace_back(new test_view_offset(GGML_OP_CPY, GGML_TYPE_F32, true, offset));
+        test_cases.emplace_back(new test_view_offset(GGML_OP_CLAMP, GGML_TYPE_F32, false, offset));
+    }
+
+    // MoE router and expert weighting with LFM2-8B-A1B shapes (32 experts, 4 used): top-k (ARGSORT of rows of 32),
+    // GET_ROWS of the weights, SUM_ROWS, CLAMP, DIV; the expert outputs times their weights (MUL, b with ne0 = 1)
+    for (int64_t n_tokens : {1, 6, 40}) {
+        test_cases.emplace_back(new test_topk_moe({ 32, n_tokens, 1, 1 }, 4, /*with_norm*/ true));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, { 32, n_tokens, 1, 1 }, GGML_SORT_ORDER_DESC));
+        test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { 1, 4, n_tokens, 1 }, { 2048, 1, 1, 1 }));
+        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F32, { 1, n_tokens, 1, 1 }, { 4, 1, 1, 1 }));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

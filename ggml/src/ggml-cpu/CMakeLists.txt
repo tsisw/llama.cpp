@@ -71,7 +71,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
-    if (${GGML_TSAVORITE_TARGET} STREQUAL fpga)
+    if ("${GGML_TSAVORITE_TARGET}" STREQUAL "fpga")
         message("Target is FPGA no GOMP linked")
     else()
         if (GGML_OPENMP)

@@ -117,6 +117,17 @@ llama_kv_cache::llama_kv_cache(
         //
         //     dev_name = ggml_backend_dev_name(dev);
         // }
+#ifdef GGML_TSAVORITE_NANOSIM
+        // The nanosim target runs SET_ROWS and the attention products on the TXE, and its buffers are host-visible
+        // shared DRAM, so an op it does not take (the 1-value V-cache SET_ROWS) runs on the CPU in place: the KV
+        // cache goes on the layer's device, as upstream does.
+        if (offload) {
+            auto * dev = model.dev_layer(il);
+            buft = ggml_backend_dev_buffer_type(dev);
+
+            dev_name = ggml_backend_dev_name(dev);
+        }
+#endif
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
